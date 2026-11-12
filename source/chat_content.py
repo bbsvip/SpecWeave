@@ -7,6 +7,7 @@ import re
 from planning import normalize_question
 
 _DECODER = json.JSONDecoder()
+_WHOLE_JSON_FENCE = re.compile(r'\s*```(?:json)?[ \t]*\r?\n\s*(\{[\s\S]+?\})\s*```\s*', re.IGNORECASE)
 
 
 def _options(value):
@@ -41,7 +42,7 @@ def _format_options(options):
     return '\n'.join(result)
 
 
-def parse_model_response(text):
+def parse_model_response(text, *, interactive=False):
     """Return (readable Markdown, optional well-formed interactive brief).
 
     Only recognize complete JSON objects/arrays containing multiple labeled options.
@@ -49,6 +50,10 @@ def parse_model_response(text):
     """
     if not isinstance(text, str) or not text or len(text) > 200_000:
         return text, None
+    fence = _WHOLE_JSON_FENCE.fullmatch(text) if interactive else None
+    if fence:
+        cleaned, brief = parse_model_response(fence.group(1), interactive=True)
+        return (cleaned, brief) if brief else (text, None)
     for match in re.finditer(r'[\[{]', text):
         start = match.start()
         try:
@@ -73,6 +78,8 @@ def parse_model_response(text):
             except (ValueError, TypeError, KeyError):
                 pass
         prefix=text[:start].rstrip()
+        if interactive and brief:
+            return '\n\n'.join(part for part in (prefix, text[end:].strip()) if part), brief
         if isinstance(obj,dict):
             question=str(obj.get('question') or '').strip()[:600]
             context=str(obj.get('context') or '').strip()[:1200]
@@ -84,3 +91,14 @@ def parse_model_response(text):
             readable+='\n\n**Lý do đề xuất:** '+why
         return readable, brief
     return text, None
+
+
+def display_user_message(text):
+    """Keep the answer bubble consistent with the live composer after reload."""
+    header = '[TRẢ LỜI CÂU HỎI LẬP KẾ HOẠCH]\nCâu hỏi: '
+    footer = '\nĐây là câu trả lời xác nhận trong trao đổi, KHÔNG phải quyết định đã được duyệt trong Decision Center.'
+    if text.startswith(header) and text.endswith(footer):
+        _, separator, answer = text[:-len(footer)].partition('\nPhương án người dùng chọn: ')
+        if separator:
+            return 'Tôi chọn: ' + answer
+    return text

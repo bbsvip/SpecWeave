@@ -51,7 +51,7 @@
       if(sw.confirm('Đổi trạng thái archive cho dự án này?')) sw.act(async()=>{await sw.api(`/api/projects/${id}/archive`);location.reload();});
     });
     document.getElementById('deleteProject')?.addEventListener('click',()=>{
-      if(sw.confirm('Xóa mềm dự án? Folder được giữ để operator có thể phục hồi.')) sw.act(async()=>{await sw.api(`/api/projects/${id}/delete`);location.href='/projects';});
+      if(sw.confirm('Chuyển dự án vào thùng rác? Chủ dự án có 30 ngày để khôi phục.')) sw.act(async()=>{await sw.api(`/api/projects/${id}/delete`);location.href='/projects';});
     });
   }
   const decForm=document.getElementById('decisionForm');

@@ -57,7 +57,7 @@
     {% endif %}
     <div class="side-section-label">ACCOUNT</div>
     <nav class="side-nav"><a href="/settings/appearance" class="side-link {% if active|default('') == 'appearance' %}active{% endif %}"><i class="ti ti-palette"></i><span>Appearance</span></a><a href="/profile" class="side-link"><i class="ti ti-user"></i><span>Account & Sessions</span></a></nav>
-    <div class="sidebar-bottom"><span class="dot-online"></span> Self-hosted · Project isolated <small>v0.9.4</small></div>
+    <div class="sidebar-bottom"><span class="dot-online"></span> Self-hosted · Project isolated <small>v{{request.app.version}}</small></div>
   </aside>
   <div class="main-column">
     <header class="app-topbar">

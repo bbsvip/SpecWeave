@@ -72,7 +72,7 @@ def test_fresh_database_migrates_to_head():
         with engine.connect() as conn:
             names = set(sa.inspect(conn).get_table_names())
             assert set(Base.metadata.tables) <= names
-            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0010_detached_chat'
+            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0011_project_trash'
             # Confirm that a real FK references the previously missing table.
             fks = sa.inspect(conn).get_foreign_keys('review_jobs')
             assert any(fk['referred_table'] == 'spec_reviews' for fk in fks)
@@ -93,6 +93,27 @@ def test_legacy_schema_without_alembic_version_is_adopted():
             conn.execute(sa.text("INSERT INTO system_settings (key, value) VALUES ('test', '{}')"))
         engine.dispose()
         _alembic({**os.environ, 'DATABASE_URL': url})
-        with sa.create_engine(url).connect() as conn:
+        with engine.connect() as conn:
             assert conn.execute(sa.text('SELECT count(*) FROM system_settings')).scalar_one() == 1
-            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0010_detached_chat'
+            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0011_project_trash'
+        engine.dispose()
+
+
+def test_existing_trash_uses_last_soft_delete_timestamp(tmp_path):
+    url = f'sqlite:///{tmp_path / "trash.db"}'
+    env = {**os.environ, 'DATABASE_URL':url}
+    _alembic(env)
+    engine = sa.create_engine(url)
+    projects = Base.metadata.tables['projects']
+    with engine.begin() as conn:
+        conn.execute(projects.insert(), {'id':'trash','name':'Trash','slug':'trash','owner_id':'owner','status':'deleted'})
+        conn.execute(sa.text("INSERT INTO audit_events (id, project_id, action, created_at) VALUES "
+                             "('1','trash','project_soft_delete','2026-09-01 12:00:00'), "
+                             "('2','trash','project_soft_delete','2026-10-01 12:00:00')"))
+        conn.execute(sa.text('DROP INDEX ix_projects_deleted_at'))
+        conn.execute(sa.text('ALTER TABLE projects DROP COLUMN deleted_at'))
+        conn.execute(sa.text("UPDATE alembic_version SET version_num = '0010_detached_chat'"))
+    _alembic(env)
+    with engine.connect() as conn:
+        assert conn.execute(sa.select(projects.c.deleted_at)).scalar_one().isoformat() == '2026-10-01T12:00:00'
+    engine.dispose()

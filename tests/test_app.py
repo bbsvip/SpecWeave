@@ -1024,7 +1024,7 @@ def test_0003_migration_creates_review_queue_without_deleting_old_data(tmp_path,
     assert set(inspect(eng).get_table_names())>=missing
     with eng.connect() as conn:
         assert conn.execute(text("SELECT username FROM users WHERE username='legacy'")).scalar()=='legacy'
-        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0010_detached_chat'
+        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0011_project_trash'
         assert 'cancel_requested' in [x['name'] for x in inspect(eng).get_columns('agent_runs')]
     eng.dispose()
 
@@ -1142,7 +1142,7 @@ def test_0004_fresh_database_migration_is_idempotent(tmp_path, monkeypatch):
     command.upgrade(cfg,'head')
     eng=create_engine(url)
     with eng.connect() as conn:
-        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0010_detached_chat'
+        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0011_project_trash'
         assert any(col['name']=='cancel_requested' for col in __import__('sqlalchemy').inspect(eng).get_columns('agent_runs'))
     eng.dispose()
 
@@ -1279,6 +1279,98 @@ def test_project_trash_scope_provider_model_management(client):
     assert client.post(f'/api/projects/{pid}/restore',json={}).status_code==403
     assert client.post(f'/api/projects/{pid}/restore',headers=csrf).status_code==200
     assert client.get(f'/projects/{pid}').status_code==200
+
+
+def test_project_purge_cleans_rows_and_retries_volume_failure(client, monkeypatch):
+    import project_trash
+    from sqlalchemy.orm import sessionmaker
+
+    csrf = auth(client)
+    pid = create_project(client, csrf, 'QA project to purge')
+    keep = create_project(client, csrf, 'Keep this project')
+    path = f'/api/projects/{pid}'
+    assert client.delete(f'{path}/purge', headers=csrf).status_code == 404
+    with SessionLocal() as sess:
+        discussion = sess.query(db.Discussion).filter_by(project_id=pid).one()
+        did = discussion.id
+        run = db.AgentRun(project_id=pid, discussion_id=did, status='queued')
+        review = db.ReviewJob(project_id=pid, requester_id=sess.get(Project,pid).owner_id,
+                              status='completed', fingerprint='fixture')
+        sess.add_all([run, review]); sess.flush()
+        rid, jid = run.id, review.id
+        sess.add_all([db.Message(discussion_id=did, run_id=rid, role='user', content='QA content'),
+                      db.ChatStreamEvent(run_id=rid, event={'type':'queued'}),
+                      db.ReviewJobStep(job_id=jid, role='reviewer')])
+        sess.commit()
+    assert client.post(f'{path}/delete', headers=csrf).status_code == 409
+    with SessionLocal() as sess:
+        sess.get(db.AgentRun, rid).status = 'completed'
+        sess.commit()
+
+    assert client.post(f'{path}/delete', headers=csrf).status_code == 200
+    assert client.delete(f'{path}/purge').status_code == 403
+    assert 'Xóa vĩnh viễn' in client.get('/projects/trash').text
+
+    def fail_volume(_pid):
+        raise OSError('simulated temporary volume failure')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(project_trash, '_remove_project_volume', fail_volume)
+        assert client.delete(f'{path}/purge', headers=csrf).status_code == 503
+    with SessionLocal() as sess:
+        assert sess.get(Project, pid).status == 'purging'
+        assert sess.get(db.AgentRun, rid) is not None
+        assert project_trash.purge_project(sess, pid, owner_id='other-owner') == 'missing'
+    assert client.post(f'{path}/restore', headers=csrf).status_code == 404
+    assert client.get(f'/projects/{pid}').status_code == 404
+
+    with db.engine.connect() as connection, monkeypatch.context() as patch:
+        connection.exec_driver_sql('PRAGMA foreign_keys=ON')
+        connection.commit()
+        patch.setattr(project_trash,'SessionLocal',sessionmaker(bind=connection,autoflush=False))
+        try:
+            project_trash.clean_project_trash()
+            project_trash.clean_project_trash()
+        finally:
+            connection.exec_driver_sql('PRAGMA foreign_keys=OFF')
+            connection.commit()
+    with SessionLocal() as sess:
+        assert sess.get(Project, pid) is None
+        assert sess.get(db.AgentRun, rid) is None
+        assert sess.get(db.Discussion, did) is None
+        assert not sess.query(db.Message).filter_by(discussion_id=did).count()
+        assert not sess.query(db.ChatStreamEvent).filter_by(run_id=rid).count()
+        assert not sess.query(db.ReviewJobStep).filter_by(job_id=jid).count()
+        audit = sess.query(db.Audit).filter_by(project_id=pid).one()
+        assert audit.action == 'project_purge' and audit.actor_id
+        assert sess.get(Project, keep) is not None
+    assert not project_root(pid).exists()
+    assert project_root(keep).is_dir()
+
+
+def test_project_trash_retention_is_measured_from_deletion(client):
+    from datetime import timedelta
+    from project_trash import clean_project_trash
+
+    csrf = auth(client)
+    expired, recent, restored = [create_project(client, csrf, name) for name in ('Expired', 'Recent', 'Restored')]
+    for pid in (expired, recent, restored):
+        assert client.post(f'/api/projects/{pid}/delete', headers=csrf).status_code == 200
+    now = db.utcnow()
+    with SessionLocal() as sess:
+        sess.get(Project, expired).deleted_at = now - timedelta(days=30)
+        sess.get(Project, recent).deleted_at = now - timedelta(days=29)
+        sess.commit()
+    assert client.post(f'/api/projects/{restored}/restore', headers=csrf).status_code == 200
+    assert client.post(f'/api/projects/{expired}/restore', headers=csrf).status_code == 410
+    clean_project_trash(now=now)
+    with SessionLocal() as sess:
+        assert sess.get(Project, expired) is None
+        assert sess.get(Project, recent).status == 'deleted'
+        assert sess.get(Project, restored).deleted_at is None
+    assert client.delete(f'/api/projects/{recent}/purge', headers=csrf).status_code == 200
+    assert not project_root(expired).exists() and not project_root(recent).exists()
+    assert project_root(restored).is_dir()
 
 
 def test_artifact_generator_isolation_between_users(client):
@@ -1805,10 +1897,12 @@ def test_auto_advance_stays_in_same_pi_session_and_never_saves_fake_user(client,
 async def test_finish_discovery_creates_unapproved_drafts_with_answers(client):
     from planning import save_question, answer_question
     from artifact_builder import ARTIFACTS
+    from storage import read_text, write_text
     csrf=auth(client)
     pid=create_project(client,csrf,'Draft Completion')
     with SessionLocal() as s:
         pr=s.get(Project,pid)
+        pr.profile={'documents':['PRD','Architecture']}
         did=s.query(db.Discussion).filter_by(project_id=pid).one().id
         for i in range(3):
             q,_=save_question(s,pid,did,{
@@ -1820,15 +1914,32 @@ async def test_finish_discovery_creates_unapproved_drafts_with_answers(client):
         invalid=await tool_call('finish_discovery',{'summary':'short','evidence':'yes','remaining_unknowns':[]},
                                 project=pr,db=s,discussion_id=did)
         assert invalid['status']=='needs_discovery'
-        valid=await tool_call('finish_discovery',{
+        completion={
             'summary':'The scope includes independent users, transactions, an auditable dashboard, separated credentials, and secure reconciliation. All critical cases and boundaries were discussed with the project owner.',
             'evidence':'Three user-confirmed decisions are recorded in this discussion; open risks are documented in the drafts.',
-            'remaining_unknowns':[]},project=pr,db=s,discussion_id=did)
-        assert valid['status']=='draft_ready' and len(valid['documents_created'])==len(ARTIFACTS)
+            'remaining_unknowns':[]}
+        missing=await tool_call('finish_discovery',completion,project=pr,db=s,discussion_id=did)
+        assert missing['status']=='needs_documents' and missing['missing']==['PRD.md','ARCHITECTURE.md']
+
+        legacy_path='docs/drafts/Architecture.md'
+        write_text(pid,legacy_path,'# Legacy architecture')
+        s.add(Document(project_id=pid,path=legacy_path,title='Architecture'))
+        s.commit()
+        for i, section in enumerate(('# PRD', '## Goals', '## Acceptance tests'), start=1):
+            args={'filename':'prd.md','content':section}
+            if i>1:
+                args['append_to_revision']=i-1
+            result=await tool_call('write_document',args,project=pr,db=s,discussion_id=did)
+            assert result['revision']==i and result['path']=='docs/drafts/PRD.md'
+        stale=await tool_call('write_document',{'filename':'PRD.md','content':'Duplicate','append_to_revision':2},
+                              project=pr,db=s,discussion_id=did)
+        assert 'error' in stale and read_text(pid,'docs/drafts/PRD.md')=='# PRD\n\n## Goals\n\n## Acceptance tests'
+        valid=await tool_call('finish_discovery',completion,project=pr,db=s,discussion_id=did)
+        assert valid['status']=='draft_ready' and len(valid['documents_created'])==len(ARTIFACTS)-2
         docs=s.query(Document).filter_by(project_id=pid).all()
         assert len(docs)==len(ARTIFACTS) and all(x.status=='draft' for x in docs)
+        assert read_text(pid,legacy_path)=='# Legacy architecture'
         assert s.get(Project,pid).profile['_discovery']['status']=='draft_ready'
-        from storage import read_text
         brief=read_text(pid,'docs/drafts/PRODUCT-BRIEF.md')
         assert 'Selected choice 0' in brief and 'Selected choice 2' in brief
         # Repeating completion does not overwrite or duplicate drafts.

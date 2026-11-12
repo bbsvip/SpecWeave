@@ -9,7 +9,7 @@ SpecWeave is a self-hosted workspace for turning project ideas into implementati
 ## Features
 
 - **Accounts and access control:** First-run administrator setup, login, session revocation, CSRF protection, Argon2id password hashing, and project owner/editor/viewer roles.
-- **Project management:** New-project wizard, reusable presets, project CRUD, trash and recovery, and ownership transfer.
+- **Project management:** New-project wizard, reusable presets, project CRUD, ownership transfer, and owner-only recovery or permanent deletion from project trash.
 - **AI discussion:** Detached PostgreSQL-backed chat jobs that continue after tabs close, replayable SSE over EventSource (with reconnect and cursor), thinking when exposed by the model, tool-call activity, usage and time-to-first-token (TTFT) metrics, stop controls, persistent discussion history, and guided questions with recommended options.
 - **Providers and models:** OpenAI-compatible API keys/endpoints, owner-scoped OpenAI OAuth, model discovery, and per-project model selection. Model execution is handled by Pi.
 - **Planning and traceability:** Goals, requirements, acceptance criteria, decisions, coverage checks, a specification graph, and a roadmap.
@@ -26,7 +26,17 @@ The discussion page includes the active run ID and displays a Pi activity card i
 
 Each discussion gets its own Pi SDK `AgentSession`, transcript and active tool capability. Different discussions can run concurrently. `SPECWEAVE_CHAT_CONCURRENCY` defaults to 4 per background worker and accepts values from 1 through 16. A worker or Pi Host restart can interrupt active inference. The interrupted job fails without replaying its prompt or tools.
 
+The worker can make one additional Pi prompt in the same run when Discovery returns neither an interactive question nor a completed handoff. This uses the same session and the saved answer even if the browser has left. Pi can append short sections to drafts using the current document revision. Discovery checks for the requested drafts before registering a handoff for human review.
+
 The `0010_detached_chat` Alembic migration creates the event log and lease fields. Back up PostgreSQL before deploying and keep all existing volumes. Tool call input/output JSON is pretty-printed in UTF-8 in the UI, including legacy escaped Unicode strings; the actual tool arguments are not changed. Full details: [`docs/RELEASE_v1.0.3_DETACHED_PI_CHAT.vi.md`](docs/RELEASE_v1.0.3_DETACHED_PI_CHAT.vi.md) (Vietnamese).
+
+## Project trash
+
+The project owner has 30 days from the time a project enters trash to restore it. The owner can also choose **Xóa vĩnh viễn** in **Thùng rác dự án**. Permanent deletion removes the project's database records and its directory on `projects_data`, including drafts, uploads, versions and Pi sessions. The system retains a purge audit event with the project ID and actor when available.
+
+Alembic revision `0011_project_trash` backfills the deletion time from the most recent soft-delete audit event, then uses the last project update when the event is unavailable. Projects already past 30 days become eligible on upgrade. Deploy the updated `web` and `review-worker` together. The worker scans on startup and every five minutes, and retries interrupted purges. Review existing trash before upgrading if it contains a project you still need.
+
+On the deployed Strata build tested on November 12, 2026, the third confirmed answer produced PRD and Architecture drafts. Two more document tool calls hit the provider's output limit, and the interview remained open. The fixes above are verified locally. Full handoff with Strata on the updated Docker deployment is pending.
 
 ## Architecture
 

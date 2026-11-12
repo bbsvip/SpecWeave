@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from fastapi import HTTPException
+from sqlalchemy import func
 from db import (Project, ProjectGoal, Requirement, Decision, PlanPhase, ResearchItem,
                 TraceLink, Document, PlanningQuestion, utcnow)
 from storage import resolve, write_text, MAX_TEXT, enforce_project_quota
@@ -24,6 +25,41 @@ ARTIFACTS = {
     'adr': ('Architecture Decision Records', 'docs/drafts/ADR-REGISTER.md'),
     'handoff': ('Implementation Handoff', 'docs/drafts/HANDOFF.md'),
 }
+
+WIZARD_DOCUMENTS = {
+    'Product Brief': ARTIFACTS['product-brief'][1],
+    'PRD': ARTIFACTS['prd'][1],
+    'User Stories': 'docs/drafts/USER-STORIES.md',
+    'Architecture': ARTIFACTS['architecture'][1],
+    'API Specification': ARTIFACTS['api'][1],
+    'Data Model': 'docs/drafts/DATA-MODEL.md',
+    'Security': ARTIFACTS['security'][1],
+    'UX / UI Design': ARTIFACTS['ux'][1],
+    'Screen Specs': 'docs/drafts/SCREEN-SPECS.md',
+    'ADR': ARTIFACTS['adr'][1],
+    'Roadmap': ARTIFACTS['roadmap'][1],
+    'Implementation Tasks': 'docs/drafts/IMPLEMENTATION-TASKS.md',
+    'Acceptance Tests': ARTIFACTS['acceptance'][1],
+    'Deployment': 'docs/drafts/DEPLOYMENT.md',
+}
+
+
+def requested_draft_paths(project):
+    selections = (project.profile or {}).get('documents')
+    if not isinstance(selections, list):
+        return []
+    return list(dict.fromkeys(WIZARD_DOCUMENTS[name] for name in selections
+                              if isinstance(name, str) and name in WIZARD_DOCUMENTS))
+
+
+def named_draft_records(db, pid, paths):
+    """Find known deliverables saved with older casing, preferring approved copies."""
+    keys = {path.lower() for path in paths}
+    records = db.query(Document).filter(Document.project_id==pid, func.lower(Document.path).in_(keys))
+    result = {}
+    for record in records.order_by((Document.status=='approved').desc(), Document.path):
+        result.setdefault(record.path.lower(), record)
+    return result
 
 
 def _clean(value, limit=2500):
@@ -170,9 +206,12 @@ def publish_artifacts(db,pid,keys,overwrite=False):
         raise HTTPException(422,'Unknown artifact')
     # Preflight ALL requested files before doing any writes.
     actions=[]
+    records=named_draft_records(db,pid,[available[key]['path'] for key in keys])
     for key in keys:
         draft=available[key]
-        existing=db.query(Document).filter_by(project_id=pid,path=draft['path']).first()
+        existing=records.get(draft['path'].lower())
+        if existing:
+            draft['path']=existing.path
         physical=resolve(pid,draft['path'])
         if existing and existing.status=='approved':
             raise HTTPException(409,f'Approved document cannot be overwritten: {draft["path"]}')

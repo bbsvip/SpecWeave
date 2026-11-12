@@ -45,8 +45,10 @@ from planning_engine import (STEPS, SOURCE_KINDS, VERIFY_STATES, stage_current, 
 from review_queue import create_review_job, job_payload, TERMINAL
 from provider_management import owned_provider, impact as provider_impact, delete_provider as perform_provider_deletion, delete_models as perform_model_deletion
 from chat_coordination import discussion_lease, ChatBusy, ChatStopped, cancellation_requested, clear_chat_continuation
-from chat_content import parse_model_response
+from chat_content import display_user_message, parse_model_response
 from chat_events import with_heartbeat
+from project_trash import (TRASH_RETENTION, TRASH_STATUSES, lock_trash_project, logger as trash_logger,
+                           project_has_active_work, purge_project)
 
 BASE = Path(__file__).parent
 @asynccontextmanager
@@ -62,6 +64,7 @@ app.mount("/static",StaticFiles(directory=BASE / "static"),name="static")
 templates = Jinja2Templates(directory=BASE / "templates")
 templates.env.filters["date_short"] = lambda d: d.strftime("%d/%m/%Y %H:%M") if d else "—"
 templates.env.filters["readable_chat"] = lambda v: parse_model_response(v)[0]
+templates.env.filters["display_user_message"] = display_user_message
 templates.env.filters["pretty_json"] = lambda v: json.dumps(v, indent=2, ensure_ascii=False, default=str)
 
 def pretty_tool_value(value):
@@ -122,7 +125,7 @@ def auth_page(request, db):
 
 def acl(db,project_id,user,write=False,owner=False):
     pr = db.get(Project,project_id)
-    if not pr or pr.status == "deleted": raise HTTPException(404,"Không tìm thấy dự án")
+    if not pr or pr.status in TRASH_STATUSES: raise HTTPException(404,"Không tìm thấy dự án")
     if pr.owner_id == user.id: return pr
     row = db.query(Membership).filter_by(project_id=project_id,user_id=user.id).first()
     if not row or (write and row.role not in ("editor",)) or owner:
@@ -135,7 +138,7 @@ def lock_project_write(db, pid):
     SQLite in single-worker development has no FOR UPDATE; Docker production uses
     PostgreSQL. Keep this guard short; never hold it across model/browser fetches.
     """
-    row = db.query(Project.id).filter(Project.id==pid).with_for_update().first()
+    row = db.query(Project.id).filter(Project.id==pid,Project.status.not_in(TRASH_STATUSES)).with_for_update().first()
     if row is None:
         raise HTTPException(404,'Project not found')
 
@@ -153,7 +156,7 @@ def admin_only(user):
 
 def get_projects(db,user):
     memberships = db.query(Membership.project_id).filter_by(user_id=user.id)
-    return db.query(Project).filter(Project.status!="deleted",or_(Project.owner_id==user.id,Project.id.in_(memberships))).order_by(Project.updated_at.desc()).all()
+    return db.query(Project).filter(Project.status.not_in(TRASH_STATUSES),or_(Project.owner_id==user.id,Project.id.in_(memberships))).order_by(Project.updated_at.desc()).all()
 
 def nonempty(data, key, default=""):
     return str(data.get(key,default)).strip()
@@ -162,7 +165,7 @@ def nonempty(data, key, default=""):
 def health(db:Session=Depends(get_db)):
     from sqlalchemy import text
     db.execute(text("SELECT 1"))
-    return {"status":"ok", "app":"SpecWeave", "version":"1.0.3"}
+    return {"status":"ok", "app":"SpecWeave", "version":app.version}
 
 @app.get("/first-run",response_class=HTMLResponse)
 def bootstrap_page(request:Request,db:Session=Depends(get_db)):
@@ -312,8 +315,9 @@ async def create_project(request:Request,db:Session=Depends(get_db)):
 def projects_trash_page(request:Request,db:Session=Depends(get_db)):
     u,s,redirect=auth_page(request,db)
     if redirect:return redirect
-    trashed=db.query(Project).filter_by(owner_id=u.id,status='deleted').order_by(Project.updated_at.desc()).all()
-    return page(request,'projects_trash.html',db=db,user=u,session=s,trashed=trashed,active='project_trash')
+    trashed=db.query(Project).filter(Project.owner_id==u.id,Project.status.in_(TRASH_STATUSES)).order_by(Project.deleted_at.desc()).all()
+    return page(request,'projects_trash.html',db=db,user=u,session=s,trashed=trashed,
+                now=utcnow(),retention=TRASH_RETENTION,active='project_trash')
 
 
 @app.get("/projects/{pid}",response_class=HTMLResponse)
@@ -380,14 +384,21 @@ async def update_project(pid:str,request:Request,db:Session=Depends(get_db)):
 @app.post("/api/projects/{pid}/archive")
 def archive_project(pid:str,request:Request,db:Session=Depends(get_db)):
     u,s=api_guard(request,db,True);pr=acl(db,pid,u,owner=True)
+    lock_project_write(db,pid)
+    db.refresh(pr)
     pr.status="archived" if pr.status!="archived" else "active"
     audit(db,u,"project_archive",pr);db.commit();return {"ok":True,"status":pr.status}
 
 @app.post("/api/projects/{pid}/delete")
 def delete_project(pid:str,request:Request,db:Session=Depends(get_db)):
     u,s=api_guard(request,db,True);pr=acl(db,pid,u,owner=True)
-    pr.status="deleted";audit(db,u,"project_soft_delete",pr);db.commit()
-    # Preserve project folder for explicit operator recovery/retention policy.
+    lock_project_write(db,pid)
+    if project_has_active_work(db,pid):
+        raise HTTPException(409,'Hãy dừng hoặc chờ các lượt Pi và review kết thúc trước khi chuyển vào thùng rác')
+    pr.status='deleted'
+    pr.deleted_at=utcnow()
+    audit(db,u,'project_soft_delete',pr)
+    db.commit()
     return {"ok":True}
 
 @app.post("/api/presets")
@@ -1109,15 +1120,15 @@ def discovery_progress(pid:str,request:Request,discussion_id:str,db:Session=Depe
     d=db.get(Discussion,discussion_id)
     if not d or d.project_id!=pid:raise HTTPException(404,'Discussion not found')
     questions=db.query(PlanningQuestion).filter_by(project_id=pid,discussion_id=discussion_id).all()
-    from artifact_builder import ARTIFACTS
-    existing={x.path for x in db.query(Document).filter_by(project_id=pid).all()}
+    paths=requested_draft_paths(pr) or [path for _,path in ARTIFACTS.values()]
+    existing=named_draft_records(db,pid,paths)
     state=(pr.profile or {}).get('_discovery',{})
     return {'status':'draft_ready' if state.get('status')=='draft_ready' else 'interviewing',
             'answered':sum(q.status=='answered' for q in questions),
             'pending':sum(q.status=='pending' for q in questions),
             'deferred':sum(q.status=='deferred' for q in questions),
-            'drafts':sum(path in existing for _,path in ARTIFACTS.values()),
-            'total_artifacts':len(ARTIFACTS),
+            'drafts':len(existing),
+            'total_artifacts':len(paths),
             'summary':str(state.get('summary',''))[:1200] if state.get('status')=='draft_ready' else ''}
 
 @app.post("/api/projects/{pid}/planning/questions/{qid}/answer")
@@ -1249,7 +1260,8 @@ async def answer_and_start(pid:str,qid:str,request:Request,db:Session=Depends(ge
     audit(db,u,'planning_answer_background',pr,{'question_id':qid})
     return await _chat_stream_impl(pid,db,u,pr,{
         'discussion_id':q.discussion_id,'continue_question_id':qid,
-        'role':payload.get('role','analyst'),'mode':'discovery'},queue_only=True)
+        'role':payload.get('role','analyst'),'mode':'discovery',
+        'auto_next':payload.get('auto_next') is True},queue_only=True)
 
 
 @app.get("/api/projects/{pid}/discussions/{did}/active-run")
@@ -1289,7 +1301,7 @@ def detached_run_events(pid:str,run_id:str,request:Request,after:int=0,db:Sessio
                     member=(authdb.query(Membership.id).filter_by(project_id=pid,user_id=subscriber_id).first())
                     allowed=(bool(viewer and viewer.enabled and not viewer.must_change_password and auth_session and
                         auth_session.revoked_at is None and auth_session.expires_at>=utcnow() and
-                        target and target.status!='deleted' and
+                        target and target.status not in TRASH_STATUSES and
                         (target.owner_id==subscriber_id or member)))
                 if not allowed:break
                 last_acl=time.monotonic()
@@ -1388,7 +1400,7 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
             raise HTTPException(409,'Hãy trả lời câu hỏi đang chờ trước')
         if (pr.profile or {}).get('_discovery',{}).get('status')=='draft_ready':
             raise HTTPException(409,'Discovery đã hoàn tất; xem tài liệu draft')
-    if queue_only:
+    if not existing_run_id:
         lock_project_write(db,pid)
     if continue_qid:
         if content:
@@ -1510,75 +1522,109 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
                 'Không tự phê duyệt tài liệu. Nếu model không gọi được tool, hãy trả về '
                 'DUY NHẤT một JSON object cho câu hỏi theo schema sau: '
                 + QUESTION_JSON_INSTRUCTIONS
-            ) if advance else None
-            pi_kwargs={'role':role,'mode':mode,'run_id':run_id,'actor_id':actor_id}
-            if advance:
-                pi_kwargs['prompt_override']=advance_prompt
-            stream=pi_stream(p,d,sdb,m,**pi_kwargs)
-            async with aclosing(stream), aclosing(with_heartbeat(stream)) as events:
-                async for typ,payload in events:
-                    if cancellation_requested(run_id):
-                        raise ChatStopped()
-                    if typ in ('delta','thinking'):
-                        part=payload.get('text','')
-                        if typ=='delta':
-                            full.append(part)
-                        elif isinstance(part,str) and part:
-                            if thinking_trace is None and len(trace)<64:
-                                thinking_trace={'type':'thinking','text':'','at_ms':int((time.monotonic()-clock)*1000)}
-                                trace.append(thinking_trace)
-                            if thinking_trace is not None:
-                                remaining=50_000-len(thinking_trace['text'])
-                                if remaining>0: thinking_trace['text']+=part[:remaining]
-                        if first_token_ms is None and part:
-                            first_token_ms=int((time.monotonic()-clock)*1000)
-                            yield emit('timing',{'first_token_ms':first_token_ms})
-                    elif typ=='final':
-                        txt=payload.get('text','')
-                        if txt:full=[txt]
-                    elif typ=='usage':
-                        for k,v in payload.items():
-                            if v is not None:
-                                usage[k]=v
-                    elif typ=='error':
-                        raise RuntimeError(payload.get('message','Lỗi Pi Runner'))
-                    if typ in ('status','tool') and len(trace)<64:
-                        item={'type':typ,'at_ms':int((time.monotonic()-clock)*1000)}
-                        if typ=='status':item['message']=str(payload.get('message',''))[:220]
-                        else:item.update({'name':str(payload.get('name',''))[:80],
-                                          'id':str(payload.get('id',''))[:100],
-                                          'status':str(payload.get('status',''))[:30],
-                                          'summary':str(payload.get('summary',''))[:200],
-                                          'arguments':str(payload.get('arguments',''))[:8000],
-                                          'result':str(payload.get('result',''))[:8000]})
-                        trace.append(item)
-                    yield emit(typ,payload)
-            output=''.join(full).strip() or '(Không có nội dung phản hồi)'
-            output, embedded_brief = parse_model_response(output)
-            if embedded_brief:
+            )
+
+            async def stream_attempt(prompt):
+                nonlocal first_token_ms, thinking_trace, full
+                attempt_usage={}
+                pi_kwargs={'role':role,'mode':mode,'run_id':run_id,'actor_id':actor_id}
+                if prompt is not None:
+                    pi_kwargs['prompt_override']=prompt
+                stream=pi_stream(p,d,sdb,m,**pi_kwargs)
+                async with aclosing(stream), aclosing(with_heartbeat(stream)) as events:
+                    async for typ,payload in events:
+                        if cancellation_requested(run_id):
+                            raise ChatStopped()
+                        if typ in ('delta','thinking'):
+                            part=payload.get('text','')
+                            if typ=='delta':
+                                full.append(part)
+                            elif isinstance(part,str) and part:
+                                if thinking_trace is None and len(trace)<64:
+                                    thinking_trace={'type':'thinking','text':'','at_ms':int((time.monotonic()-clock)*1000)}
+                                    trace.append(thinking_trace)
+                                if thinking_trace is not None:
+                                    remaining=50_000-len(thinking_trace['text'])
+                                    if remaining>0: thinking_trace['text']+=part[:remaining]
+                            if first_token_ms is None and part:
+                                first_token_ms=int((time.monotonic()-clock)*1000)
+                                yield emit('timing',{'first_token_ms':first_token_ms})
+                        elif typ=='final':
+                            txt=payload.get('text','')
+                            if txt:full=[txt]
+                        elif typ=='usage':
+                            for k,v in payload.items():
+                                if v is not None:
+                                    attempt_usage[k]=v
+                        elif typ=='error':
+                            raise RuntimeError(payload.get('message','Lỗi Pi Runner'))
+                        if typ in ('status','tool') and len(trace)<64:
+                            item={'type':typ,'at_ms':int((time.monotonic()-clock)*1000)}
+                            if typ=='status':item['message']=str(payload.get('message',''))[:220]
+                            else:item.update({'name':str(payload.get('name',''))[:80],
+                                              'id':str(payload.get('id',''))[:100],
+                                              'status':str(payload.get('status',''))[:30],
+                                              'summary':str(payload.get('summary',''))[:200],
+                                              'arguments':str(payload.get('arguments',''))[:8000],
+                                              'result':str(payload.get('result',''))[:8000]})
+                            trace.append(item)
+                        if typ != 'final':
+                            yield emit(typ,payload)
+                for key, value in attempt_usage.items():
+                    if isinstance(value,(int,float)) and isinstance(usage.get(key),(int,float)):
+                        usage[key]+=value
+                    else:
+                        usage[key]=value
+
+            def resolve_planning_output():
+                raw=''.join(full).strip()
+                output, brief=parse_model_response(raw,interactive=bool(existing_run_id and mode=='discovery'))
+                sdb.expire_all()
+                pending=sdb.query(PlanningQuestion).filter_by(
+                    project_id=pid,discussion_id=did,status='pending').order_by(PlanningQuestion.created_at.desc()).first()
+                discovery=(sdb.get(Project,pid).profile or {}).get('_discovery',{})
+                if brief and not pending and discovery.get('status')!='draft_ready':
+                    try:
+                        pending,_=save_question(sdb,pid,did,brief)
+                    except (ValueError,TypeError,KeyError):
+                        output=parse_model_response(raw)[0]
+                return output, pending, discovery
+
+            async with aclosing(stream_attempt(advance_prompt if advance else None)) as events:
+                async for event in events:
+                    yield event
+            output,pending,discovery=resolve_planning_output()
+            auto_next=bool(existing_run_id and data.get('auto_next') is True and mode=='discovery' and not advance)
+            if auto_next and not pending and discovery.get('status')!='draft_ready':
+                # Keep the follow-up in this durable run and Pi session.
+                first_output=output
+                yield emit('final',{'text':first_output+'\n\n' if first_output else ''})
+                yield emit('status',{'phase':'request','message':'Pi đang chuẩn bị câu hỏi tiếp theo…'})
+                full=[]
+                thinking_trace=None
                 try:
-                    question, created = save_question(sdb,pid,did,embedded_brief)
-                    # The canonical pending-question event is emitted once, below,
-                    # whether the brief came from a tool call or parsed JSON.
-                except (ValueError,TypeError,KeyError):
-                    pass  # Keep a readable model answer if structured brief validation fails.
-            # Tool calls run in a different gateway transaction. Refresh after Pi settles.
-            # This also exposes questions generated via propose_planning_question, not
-            # merely JSON embedded in assistant prose.
-            sdb.expire_all()
-            pending=sdb.query(PlanningQuestion).filter_by(project_id=pid,discussion_id=did,status='pending').order_by(PlanningQuestion.created_at.desc()).first()
+                    async with aclosing(stream_attempt(advance_prompt)) as events:
+                        async for event in events:
+                            yield event
+                except ChatStopped:
+                    raise
+                except Exception:
+                    # The first prompt already ran. Keep its result instead of
+                    # making the saved answer retryable and repeating tool calls.
+                    full=[]
+                    yield emit('status',{'phase':'request','message':'Chưa thể tạo câu hỏi tiếp theo.'})
+                next_output,pending,discovery=resolve_planning_output()
+                output='\n\n'.join(part for part in (first_output,next_output) if part)
+            if not output:
+                output=('Chọn một phương án để tiếp tục.' if pending else '(Không có nội dung phản hồi)')
+            if (advance or auto_next) and not pending and discovery.get('status')!='draft_ready':
+                yield emit('planning_needs_input')
             if pending:
                 yield emit('planning_question',question_payload(pending))
-                if not ''.join(full).strip():
-                    output='Em đã tổng hợp thông tin và đề xuất câu hỏi quan trọng tiếp theo. Anh chọn một phương án bên dưới, hoặc thảo luận thêm trước khi quyết định.' 
-            p=sdb.get(Project,pid)
-            discovery=(p.profile or {}).get('_discovery',{})
             if discovery.get('status')=='draft_ready':
                 yield emit('planning_complete',{'status':'draft_ready','summary':discovery.get('summary',''),
                                                 'url':f'/projects/{pid}/artifacts'})
-            # Replace raw stream text only when normalization produced a cleaner answer.
-            if output != ''.join(full).strip():
-                yield emit('final', {'text':output})
+            yield emit('final', {'text':output})
             run=locked_run(sdb)
             if not run:
                 return
@@ -1647,6 +1693,8 @@ async def internal_pi_tool(request: Request, db: Session = Depends(get_db)):
     args=payload.get("args", {})
     if name not in PI_TOOL_ALLOWLIST or not isinstance(args,dict):
         raise HTTPException(403, "Tool is not allowed")
+    if name in ('write_document','finish_discovery'):
+        lock_project_write(db,project.id)
     # Tool implementation enforces project-scoped paths, draft-only writes, and SSRF protections.
     try:
         result=await tool_call(name,args,project=project,db=db,discussion_id=run.discussion_id)
@@ -2049,7 +2097,7 @@ def operational_snapshot(db):
     statuses = dict(db.query(AgentRun.status, func.count(AgentRun.id)).group_by(AgentRun.status).all())
     jobs = dict(db.query(ReviewJob.status, func.count(ReviewJob.id)).group_by(ReviewJob.status).all())
     return {
-        "users": db.query(User).count(), "projects": db.query(Project).filter(Project.status != 'deleted').count(),
+        "users": db.query(User).count(), "projects": db.query(Project).filter(Project.status.not_in(TRASH_STATUSES)).count(),
         "providers": db.query(Provider).filter_by(enabled=True).count(),
         "models": db.query(Model).filter_by(enabled=True).count(),
         "chat_runs": statuses, "review_jobs": jobs,
@@ -2302,7 +2350,7 @@ async def quality_workflow_action(pid:str,stage:str,request:Request,db:Session=D
 # --------------------------- Product Completion ---------------------------
 # The following modules use only the existing project-scoped ORM data and filesystem.
 # All mutating JSON endpoints require the session CSRF header and enforce project ACL.
-from artifact_builder import ARTIFACTS, build_artifacts, publish_artifacts
+from artifact_builder import ARTIFACTS, build_artifacts, named_draft_records, publish_artifacts, requested_draft_paths
 
 @app.get('/presets', response_class=HTMLResponse)
 def preset_library_page(request:Request, db:Session=Depends(get_db)):
@@ -2334,13 +2382,28 @@ async def update_preset(preset_id:str,request:Request,db:Session=Depends(get_db)
 @app.post('/api/projects/{pid}/restore')
 def restore_project(pid:str,request:Request,db:Session=Depends(get_db)):
     u,s=api_guard(request,db,True)
-    pr=db.get(Project,pid)
-    if not pr or pr.owner_id!=u.id or pr.status!='deleted':raise HTTPException(404,'Project not found in trash')
+    pr=lock_trash_project(db,pid,owner_id=u.id,statuses=('deleted',))
+    if not pr:raise HTTPException(404,'Project not found in trash')
+    if pr.deleted_at and utcnow() >= pr.deleted_at + TRASH_RETENTION:
+        raise HTTPException(410,'Dự án đã hết hạn khôi phục')
     if not project_root(pid).is_dir():raise HTTPException(409,'Project data directory missing; operator restore required')
-    lock_project_write(db,pid)
-    pr.status='active';pr.updated_at=utcnow()
+    pr.status='active';pr.deleted_at=None
     audit(db,u,'project_restore',pr);db.commit()
     return {'ok':True,'redirect':f'/projects/{pid}'}
+
+
+@app.delete('/api/projects/{pid}/purge')
+def purge_trashed_project(pid:str,request:Request,db:Session=Depends(get_db)):
+    u,s=api_guard(request,db,True)
+    try:
+        result=purge_project(db,pid,owner_id=u.id)
+    except OSError:
+        db.rollback()
+        trash_logger.exception('Project volume purge failed for %s',pid)
+        raise HTTPException(503,'Chưa xóa xong dữ liệu. Hệ thống sẽ tự thử lại.')
+    if result=='missing':raise HTTPException(404,'Không tìm thấy dự án trong thùng rác')
+    if result=='busy':raise HTTPException(409,'Dự án còn tác vụ đang xử lý. Hãy thử lại sau.')
+    return {'ok':True}
 
 @app.post('/api/projects/{pid}/members/{uid}')
 async def update_member(pid:str,uid:str,request:Request,db:Session=Depends(get_db)):
@@ -2446,7 +2509,7 @@ def provider_detail_page(provider_id:str,request:Request,db:Session=Depends(get_
         raise HTTPException(403,'OpenAI OAuth account belongs to another user')
     models=db.query(Model).filter_by(provider_id=provider_id).order_by(Model.name).all()
     projects=db.query(Project).filter(Project.active_model_id.in_([m.id for m in models]),
-                                     Project.status!='deleted').all() if models else []
+                                     Project.status.not_in(TRASH_STATUSES)).all() if models else []
     return page(request,'provider_detail.html',db=db,user=u,session=s,
                 provider=provider,models=models,affected_projects=projects,oauth_local=openai_oauth_enabled(),active='providers')
 
@@ -2485,9 +2548,10 @@ def artifacts_page(pid:str,request:Request,db:Session=Depends(get_db)):
     member=db.query(Membership).filter_by(project_id=pid,user_id=u.id).first()
     editable=u.id==pr.owner_id or bool(member and member.role=='editor')
     items=[]
+    existing=named_draft_records(db,pid,[path for _,path in ARTIFACTS.values()])
     for key,(title,path) in ARTIFACTS.items():
-        doc=db.query(Document).filter_by(project_id=pid,path=path).first()
-        items.append({'key':key,'title':title,'path':path,'exists':bool(doc),'status':doc.status if doc else 'missing',
+        doc=existing.get(path.lower())
+        items.append({'key':key,'title':title,'path':doc.path if doc else path,'exists':bool(doc),'status':doc.status if doc else 'missing',
                       'revision':doc.revision if doc else None})
     return page(request,'artifacts.html',db=db,user=u,session=s,pr=pr,items=items,editable=editable,active='artifacts')
 

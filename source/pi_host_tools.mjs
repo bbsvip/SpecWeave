@@ -11,7 +11,9 @@ export const TOOL_DEFS = [
   ['fetch_url','Retrieve a public page, never private/LAN endpoints',Type.Object({url:short(2000),use_browser:Type.Optional(Type.Boolean())})],
   ['list_project_files','List allowed project folders',Type.Object({folder:optional(300)})],
   ['read_project_file','Read allowed text files in the active project',Type.Object({path:short(400)})],
-  ['write_document','Write DRAFT Markdown only, never approve it',Type.Object({filename:short(120),content:short(50000)})],
+  ['write_document','Write one short DRAFT Markdown section. Append to a draft with its current revision.',Type.Object({
+    filename:short(120),content:short(50000),append_to_revision:Type.Optional(Type.Integer({minimum:1}))
+  })],
   ['propose_decision','Propose an unapproved decision',Type.Object({title:short(250),description:short(6000),rationale:optional(4000)})],
   ['propose_requirement','Propose an unapproved requirement',Type.Object({title:short(250),description:short(6000),criteria:optional(4000),priority:optional(20)})],
   ['finish_discovery','Mark discovery ready ONLY after complete interview and substantive draft docs; human review required',Type.Object({

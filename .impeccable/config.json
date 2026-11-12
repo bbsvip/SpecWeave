@@ -1,0 +1,23 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "side-tab",
+        "value": "*",
+        "files": [
+          "source/static/css/app.css"
+        ],
+        "createdAt": "2026-11-12T11:16:31.744Z",
+        "reason": "Agent: the reported border is a Markdown blockquote marker; the actual issue card stripes were removed."
+      },
+      {
+        "rule": "overused-font",
+        "value": "inter",
+        "createdAt": "2026-11-12T11:16:31.793Z",
+        "reason": "Agent: preserve the established body font in a scoped fix. This rule reports font popularity, while no typography defect was identified."
+      }
+    ]
+  }
+}

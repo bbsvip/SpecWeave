@@ -54,6 +54,18 @@
     if(!confirm('Khôi phục dự án và quyền thành viên?'))return;
     act(async()=>{const r=await api(`/api/projects/${b.dataset.project}/restore`);location.href=r.redirect;},'');
   }));
+  document.querySelectorAll('.project-purge').forEach(button=>button.addEventListener('click',async()=>{
+    if(!confirm(`Xóa vĩnh viễn “${button.dataset.name}” cùng toàn bộ nội dung và tệp? Thao tác này không thể hoàn tác.`))return;
+    const actions=button.closest('.pi-record-actions').querySelectorAll('button');
+    actions.forEach(action=>action.disabled=true);
+    try{
+      await api(`/api/projects/${button.dataset.project}/purge`,{},'DELETE');
+      location.reload();
+    }catch(error){
+      sw.toast(error.message,'error');
+      actions.forEach(action=>action.disabled=false);
+    }
+  }));
   if($('appearanceTheme')){
     $('appearanceTheme').value=localStorage.getItem('sw-theme-preference')||'light';
     $('appearanceDensity').value=localStorage.getItem('sw-density')||'comfortable';

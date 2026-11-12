@@ -125,6 +125,7 @@ recommended_index (0-based), recommendation_reason, impact, assumptions (array),
 You MUST examine confirmed context and recent questions; don't ask a duplicate.
 Prefer the single highest-impact *unanswered* design decision.
 Every option must be viable. Explain realistic benefits, costs and what changes the choice.
+Keep the question and options concise. Keep option labels neutral; indicate the recommendation only through recommended_index and recommendation_reason.
 Recommend exactly one suitable default, but do NOT claim certainty without evidence.
 Use Vietnamese. Only cite research URLs previously provided in the project research context; otherwise use sources: []. Do not invent research citations or imply approval.
 If information is insufficient, mark it explicitly as an assumption.

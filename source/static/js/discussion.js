@@ -23,9 +23,10 @@
     // Do not show raw JSON choices in the chat while the model is writing them.
     // Final server message is parsed/normalized, including persisted session history.
     if(mode!=='discovery'&&mode!=='compare')return raw;
-    const match=/(?:\[\s*)?\{\s*"(?:id|label|question|options)"\s*:/.exec(raw);
-    if(match&&raw.slice(0,match.index).split('```').length%2===1){
-      return raw.slice(0,match.index).trimEnd()+'\n\n*Đang chuẩn hóa các lựa chọn…*';
+    const match=/(?:\[\s*)?\{\s*"(?:id|label|question|context|options|recommended_index|recommendation_reason)"\s*:/.exec(raw);
+    if(match){
+      const before=raw.slice(0,match.index).replace(/```(?:json)?\s*$/i,'').trimEnd();
+      return before+'\n\n*Đang chuẩn hóa các lựa chọn…*';
     }
     return raw;
   }
@@ -114,25 +115,24 @@
     const live=make('div','turn-live-heading');
     const spinner=make('span','turn-loader');spinner.setAttribute('aria-hidden','true');
     const heading=make('span','turn-live-label','Pi Agent đang chuẩn bị phiên…');live.append(spinner,heading);
-    const helper=make('div','turn-live-helper','Pi chạy nền trên server · Có thể rời trang · SSE tự kết nối lại');
-    const details=make('details','turn-activity');details.open=true;
+    const details=make('details','turn-activity');
     const summary=make('summary','','Hoạt động của agent · đang chạy');
     const inner=make('div','turn-activity-body');
     const timeline=make('div','turn-timeline');
-    const thinking=make('details','turn-thinking');thinking.open=true;thinking.hidden=true;
+    const thinking=make('details','turn-thinking');thinking.hidden=true;
     const thinkingTitle=make('summary','','Thinking · model đang phân tích');
     const thinkingText=make('pre','turn-thinking-text');thinking.append(thinkingTitle,thinkingText);
     const tools=make('div','turn-tool-list');
     inner.append(thinking,timeline,tools);details.append(summary,inner);
     const metrics=make('div','turn-metrics turn-metrics-visible','Đang đo thời gian phản hồi…');
-    surface.append(live,helper,details,metrics);turn.body.append(surface);
+    surface.append(live,details,metrics);turn.body.append(surface);
     return {surface,live,spinner,heading,details,summary,timeline,thinking,thinkingTitle,thinkingText,tools,metrics,toolRows:new Map()};
   }
   const actionButton=(label,cls,cb)=>{const b=make('button','btn btn-sm '+cls,label);b.type='button';b.addEventListener('click',cb);return b;};
   function setBusy(active,label){
     send.disabled=active;input.disabled=active;
     stop.classList.toggle('d-none',!runId||!active);
-    state.textContent=label||(active?'Đang trả lời…':'Ready');
+    state.textContent=label||(active?'Đang trả lời…':'Sẵn sàng');
     root.classList.toggle('chat-busy',active);
     suggestButton&&(suggestButton.disabled=active);
   }
@@ -165,8 +165,7 @@
   }
   async function talk({continueQuestionId=null,answerQuestion=null,advancePlanning=false,resumeRunId=null}={}){
     if(controller||!did)return false;
-    // The answer-stream endpoint saves the choice and starts the Pi run in ONE
-    // request. A completed decision must not depend on an unrelated second POST.
+    // The worker owns continuation and can finish it after this tab closes.
     const message=(continueQuestionId||answerQuestion||advancePlanning||resumeRunId)?'':input.value.trim();
     if(!continueQuestionId&&!answerQuestion&&!advancePlanning&&!resumeRunId&&!message)return false;
     let optimistic=null;
@@ -183,7 +182,7 @@
     const turn=addMessage('assistant','');const panel=buildTurnActivity(turn);
     const role=sw.val('agentRole'),mode=sw.val('agentMode');
     let full='',usage={},contextWindow=0,firstTokenMs=null,elapsedMs=0,completed=false,outputTps=null;
-    let thinkingFull='',lastPhase='request',shouldAdvance=false,answerAccepted=false;
+    let thinkingFull='',lastPhase='request',answerAccepted=false,nextQuestionMissing=false;
     let observing=Boolean(resumeRunId), terminalStatus=null;
     const started=performance.now();let renderScheduled=false,renderHandle=null;
     const scheduleRender=()=>{
@@ -211,9 +210,11 @@
       const target=answerQuestion?
         `/api/projects/${pid}/planning/questions/${encodeURIComponent(answerQuestion.question.id)}/answer-start`:
         `/api/projects/${pid}/chat/start`;
+      const automaticNext=Boolean(autoNext?.checked);
       const payload=answerQuestion?
-        {...answerQuestion.data,role,mode:'discovery'}:
-        {discussion_id:did,message,role,mode,...(continueQuestionId?{continue_question_id:continueQuestionId}:{}),
+        {...answerQuestion.data,role,mode:'discovery',auto_next:automaticNext}:
+        {discussion_id:did,message,role,mode:continueQuestionId||advancePlanning?'discovery':mode,auto_next:automaticNext,
+         ...(continueQuestionId?{continue_question_id:continueQuestionId}:{}),
          ...(advancePlanning?{advance_planning:true}: {})};
       let queued;
       if(resumeRunId){
@@ -258,7 +259,7 @@
       runId=queued.run_id;
       setBusy(true,'Đang kết nối với Pi…');
       answerAccepted=Boolean(answerQuestion&&!observing);
-      if(answerAccepted)renderPlanningQuestion(null);
+      if(answerAccepted){renderPlanningQuestion(null);refreshDiscoveryProgress();}
       const historyStatus=document.querySelector(`[data-run-status="${CSS.escape(runId)}"]`);
       const showStatus=(status)=>{
         terminalStatus=['completed','cancelled','error'].includes(status)?status:terminalStatus;
@@ -330,10 +331,15 @@
             item.progress?'Tiến độ\n'+item.progress:null,
             item.result!==null?'Output\n'+item.result:null
           ].filter(Boolean).join('\n\n');
-          addTimeline(panel.timeline,'tool',name+' · '+toolStatus);
-          if(activity.textContent==='Chưa có tool call')activity.replaceChildren();
-          const row=make('div','tool-item',name+' · '+toolStatus);activity.prepend(row);
-          if(activity.children.length>15)activity.lastElementChild?.remove();
+          if(!['update','toolcall_delta'].includes(p.status)){
+            addTimeline(panel.timeline,'tool',name+' · '+toolStatus);
+            if(activity.textContent==='Chưa có tool call')activity.replaceChildren();
+            if(!item.activityRow){
+              item.activityRow=make('div','tool-item');activity.prepend(item.activityRow);
+              if(activity.children.length>15)activity.lastElementChild?.remove();
+            }
+            item.activityRow.textContent=name+' · '+toolStatus;
+          }
         }else if(ev.type==='usage'){
           usage={...usage,...p};
           panel.metrics.textContent=describeUsage(usage,firstTokenMs,elapsedMs,contextWindow,full.length,outputTps);
@@ -343,13 +349,15 @@
         }else if(ev.type==='planning_question'){
           // Tool-created questions are first-class chat events, not a hidden sidebar operation.
           renderPlanningQuestion(p);addTimeline(panel.timeline,'status','AI đã đưa ra câu hỏi để anh xác nhận');
+        }else if(ev.type==='planning_needs_input'){
+          nextQuestionMissing=true;
         }else if(ev.type==='planning_complete'){
           discoveryDone=true;
           renderPlanningQuestion(null);
           const notice=make('section','planning-handoff');
           notice.append(make('strong','','Đã có dữ liệu để soạn tài liệu dự án'));
           notice.append(make('p','',p.summary||'Các bản nháp cần được kiểm tra và phê duyệt.'));
-          const a=make('a','btn btn-primary btn-sm','Xem 10 tài liệu BMAD draft');
+          const a=make('a','btn btn-primary btn-sm','Xem bản nháp');
           a.href=p.url||`/projects/${pid}/artifacts`;notice.append(a);
           turn.body.append(notice);
           addTimeline(panel.timeline,'status','Discovery kết thúc; tài liệu draft sẵn sàng review');
@@ -417,21 +425,16 @@
       if(headerUsage)headerUsage.textContent=panel.metrics.textContent;
       await refreshPlanningQuestion();
       await refreshDiscoveryProgress();
-      if(advancePlanning&&!openQuestion&&!discoveryDone){
-        panel.heading.textContent='Pi đã phản hồi, nhưng chưa tạo thẻ lựa chọn';
+      if((nextQuestionMissing||advancePlanning)&&!openQuestion&&!discoveryDone){
+        panel.heading.textContent='Discovery chưa hoàn tất';
         const note=make('p','turn-error',
-          'AI chưa tạo được câu hỏi tương tác. Anh có thể trả lời trực tiếp trong chat hoặc yêu cầu Pi thử tạo phương án rõ ràng hơn.');
-        const retry=actionButton('Đề xuất lại phương án','btn-outline-primary',()=>{
+          'Anh có thể bổ sung thông tin trong chat hoặc yêu cầu Pi tiếp tục từ dữ liệu đã lưu.');
+        const retry=actionButton('Tiếp tục với Pi','btn-outline-primary',()=>{
           if(controller)return;
           talk({advancePlanning:true});
         });
         turn.body.append(note,retry);
       }
-      // No nested request while the prior AbortController is active. Schedule
-      // exactly ONE follow-up after finally clears the busy state; this avoids
-      // silent `if(controller) return false` and accidental infinite loops.
-      shouldAdvance=Boolean(!observing&&autoNext?.checked&&mode==='discovery'&&
-        !discoveryDone&&!advancePlanning&&!openQuestion&&!turn.body.querySelector('.planning-handoff'));
       return true;
     }catch(error){
       if(error.name==='AbortError'){
@@ -464,19 +467,17 @@
     }finally{
       if(streamingTimer){clearInterval(streamingTimer);streamingTimer=null;}
       if(renderHandle!==null)clearTimeout(renderHandle);
-      controller=null;runId=null;setBusy(false);followIfNearBottom();input.focus();
-      if(shouldAdvance){
-        queueMicrotask(()=>{
-          if(!controller&&!openQuestion)talk({advancePlanning:true});
-        });
-      }
+      controller=null;runId=null;setBusy(false);
+      if(!openQuestion)followIfNearBottom();
     }
   }
   function renderPlanningQuestion(q){
+    if(q&&openQuestion?.id===q.id)return;
+    const follow=list.scrollHeight-list.scrollTop-list.clientHeight<170;
     questionSlot.replaceChildren();questionSlot.hidden=!q;openQuestion=q;selectedIds=new Set();
     if(!q)return;
     const panel=make('div','planning-brief');questionSlot.append(panel);
-    panel.append(make('div','planning-header','✦  CẦN ANH XÁC NHẬN · CHƯA PHÊ DUYỆT'));
+    panel.setAttribute('aria-label','Câu hỏi đang chờ xác nhận');
     panel.append(make('h3','',q.question));
     if(q.context)panel.append(make('p','planning-description',q.context));
     const optHolder=make('div','planning-options');panel.append(optHolder);
@@ -519,14 +520,23 @@
     }
     const custom=make('textarea','planning-custom');custom.placeholder='Điều chỉnh hoặc nhập câu trả lời riêng…';panel.append(custom);
     const notes=make('input','planning-custom');notes.style.minHeight='38px';notes.placeholder='Ghi chú bổ sung (tùy chọn)';panel.append(notes);
+    custom.setAttribute('aria-label',custom.placeholder);
+    notes.setAttribute('aria-label',notes.placeholder);
     const actions=make('div','planning-actions');panel.append(actions);
+    let submitting=false;
     async function submit(action){
-      if(controller)return;
+      if(controller||submitting)return;
+      if(action==='answer'&&!selectedIds.size&&!custom.value.trim()){
+        sw.toast('Hãy chọn phương án hoặc nhập câu trả lời riêng.','error');
+        custom.focus();
+        return;
+      }
+      submitting=true;
       panel.classList.add('planning-loading');
       try{
         const data={action,selected_ids:[...selectedIds],custom_answer:custom.value,note:notes.value};
         if(action==='answer'){
-          // This is ONE SSE request; the server saves the answer and starts Pi.
+          // The server saves the answer and enqueues Pi in the same transaction.
           const ok=await talk({answerQuestion:{question:q,data}});
           if(!ok){
             panel.classList.remove('planning-loading');
@@ -538,7 +548,8 @@
           await sw.api(`/api/projects/${pid}/planning/questions/${q.id}/answer`,data);
           renderPlanningQuestion(null);await refreshDiscoveryProgress();sw.toast('Đã hoãn câu hỏi này.','info');
         }
-      }catch(e){sw.toast(e.message,'error');panel.classList.remove('planning-loading');}
+      }catch(e){sw.toast(e.message,'error');}
+      finally{submitting=false;panel.classList.remove('planning-loading');}
     }
     actions.append(actionButton('Xác nhận & tiếp tục với AI','btn-primary',()=>submit('answer')));
     actions.append(actionButton('Thảo luận thêm','btn-outline-primary',()=>{
@@ -546,7 +557,10 @@
       input.focus();
     }));
     actions.append(actionButton('Tạm hoãn','btn-outline-secondary',()=>submit('defer')));
-    followIfNearBottom(true);
+    if(follow)scrollToQuestion();
+  }
+  function scrollToQuestion(){
+    list.scrollTop+=questionSlot.getBoundingClientRect().top-list.getBoundingClientRect().top-16;
   }
   async function refreshDiscoveryProgress(){
     if(!progressElement||!did)return;
@@ -557,9 +571,10 @@
       progressElement.replaceChildren();
       progressElement.append(make('strong','',finished?'Đủ dữ liệu · đã tạo draft':'Đang làm rõ với Pi'));
       progressElement.append(make('span','',`${progress.answered} đã xác nhận · ${progress.pending} chờ trả lời · ${progress.deferred} hoãn`));
-      progressElement.append(make('span','',`${progress.drafts}/${progress.total_artifacts} tài liệu BMAD hiện có`));
+      progressElement.append(make('span','',`${progress.drafts}/${progress.total_artifacts} bản nháp hiện có`));
       if(finished){
         const a=make('a','', 'Xem tài liệu để review');a.href=`/projects/${pid}/artifacts`;progressElement.append(a);
+        if(suggestButton){suggestButton.textContent='Xem bản nháp';suggestButton.title='Mở danh sách bản nháp';}
       }
     }catch(e){progressElement.textContent='Chưa tải được tiến độ: '+e.message;}
   }
@@ -581,7 +596,7 @@
   // never a stateless Pi completion hidden behind a plain JSON API.
   suggestButton?.addEventListener('click',()=>{
     if(!did||controller)return;
-    if(openQuestion){questionSlot.scrollIntoView({behavior:'smooth',block:'nearest'});return;}
+    if(openQuestion){scrollToQuestion();return;}
     if(discoveryDone){location.href=`/projects/${pid}/artifacts`;return;}
     talk({advancePlanning:true});
   });

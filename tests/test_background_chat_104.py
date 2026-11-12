@@ -139,6 +139,56 @@ def test_reconnect_uses_eventsource_without_issuing_new_prompt():
     assert 'window.addEventListener(\'beforeunload\'' not in code
 
 
+def test_discovery_fallback_runs_on_worker_once_per_saved_answer(client, monkeypatch):
+    import app as application
+    from planning import save_question
+
+    csrf = auth(client)
+    pid, did = _make_discussion_with_model(client, csrf, 'durable-discovery')
+    brief = {
+        'question': 'Phương án lưu trữ nào phù hợp?',
+        'options': [{'label':'PostgreSQL','pros':'Nhất quán','cons':'Cần vận hành'},
+                    {'label':'Tệp cục bộ','pros':'Dễ triển khai','cons':'Khó truy vấn'}],
+        'recommended_index':0, 'recommendation_reason':'Cần đối soát và kiểm toán',
+    }
+    with SessionLocal() as sess:
+        first, _ = save_question(sess, pid, did, brief)
+        question_id = first.id
+
+    attempts = []
+
+    async def pi_stub(project, discussion, sess, model, **kwargs):
+        attempts.append((discussion.id, kwargs['run_id'], 'prompt_override' in kwargs))
+        with SessionLocal() as current:
+            answered = current.query(db.PlanningQuestion).filter_by(discussion_id=did, status='answered').count()
+        if 'prompt_override' not in kwargs:
+            yield 'delta', {'text':'Đã ghi nhận lựa chọn.'}
+        else:
+            next_brief = {**brief, 'question':f'Câu hỏi kế tiếp về giới hạn số {answered}?'}
+            yield 'final', {'text':'```json\n'+json.dumps(next_brief, ensure_ascii=False)+'\n```'}
+        yield 'usage', {'input_tokens':10, 'output_tokens':5}
+
+    monkeypatch.setattr(application, 'pi_stream', pi_stub)
+    for answered in (1, 2):
+        response = client.post(f'/api/projects/{pid}/planning/questions/{question_id}/answer-start',
+                               headers=csrf, json={'selected_ids':['o1'], 'auto_next':True})
+        assert response.status_code == 200, response.text
+        job = response.json()
+        run_id = job['run_id']
+        assert asyncio.run(run_once()) == run_id  # No browser or SSE subscriber.
+        assert attempts[-2:] == [(did, run_id, False), (did, run_id, True)]
+        replay = client.get(job['events_url']).text
+        assert replay.count('"type": "planning_question"') == 1
+        assert '"type": "done"' in replay
+        with SessionLocal() as sess:
+            pending = sess.query(db.PlanningQuestion).filter_by(discussion_id=did, status='pending').one()
+            assert pending.question.endswith(f'số {answered}?')
+            assert sess.query(db.Message).filter_by(discussion_id=did, role='user').count() == answered
+            assert sess.query(db.Message).filter_by(run_id=run_id, role='assistant').one().content == 'Đã ghi nhận lựa chọn.'
+            assert sess.get(db.AgentRun, run_id).usage == {'input_tokens':20, 'output_tokens':10}
+            question_id = pending.id
+
+
 def test_page_keeps_the_run_id_when_it_finishes_before_subscription(client, monkeypatch):
     import app as application
     csrf=auth(client)

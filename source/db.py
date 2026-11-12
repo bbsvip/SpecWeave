@@ -62,6 +62,7 @@ class Project(Base):
     revision = Column(Integer, default=1)
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+    deleted_at = Column(DateTime, index=True)
     owner = relationship("User")
 
 class Membership(Base):
