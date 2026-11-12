@@ -42,6 +42,7 @@ from planning_engine import (STEPS, SOURCE_KINDS, VERIFY_STATES, stage_current, 
                              new_review, assess_evidence, propose_trace_links, resolve_suggestion,
                              quality_export, adversarial_review)
 from review_queue import create_review_job, job_payload, TERMINAL
+from provider_management import owned_provider, impact as provider_impact, delete_provider as perform_provider_deletion, delete_models as perform_model_deletion
 from chat_coordination import discussion_lease, ChatBusy, cancellation_requested
 
 BASE = Path(__file__).parent
@@ -53,7 +54,7 @@ async def lifespan(_app):
     init_db()
     yield
 
-app = FastAPI(title="SpecWeave", version="0.9.4", docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(title="SpecWeave", version="0.9.5", docs_url=None, redoc_url=None, lifespan=lifespan)
 app.mount("/static",StaticFiles(directory=BASE / "static"),name="static")
 templates = Jinja2Templates(directory=BASE / "templates")
 templates.env.filters["date_short"] = lambda d: d.strftime("%d/%m/%Y %H:%M") if d else "—"
@@ -1329,6 +1330,11 @@ async def oauth_status(request:Request,db:Session=Depends(get_db)):
     return {**state,'provider_id':provider.id if provider else None,
             'provider_enabled':provider.enabled if provider else False}
 
+@app.get('/api/openai/oauth/diagnostics')
+async def oauth_diagnostics(request:Request,db:Session=Depends(get_db)):
+    _oauth_admin(request,db)
+    return await openai_oauth_relay('GET','/oauth/openai/diagnostics',timeout=22)
+
 @app.post('/api/openai/oauth/start')
 async def oauth_start(request:Request,db:Session=Depends(get_db)):
     u=_oauth_admin(request,db,True)
@@ -1409,7 +1415,10 @@ async def update_provider(provider_id:str,request:Request,db:Session=Depends(get
         if p.owner_id!=u.id:raise HTTPException(403,'Not your OpenAI connection')
         if any(k in data for k in ('api_key','clear_api_key','kind','base_url')):
             raise HTTPException(422,'OpenAI OAuth credentials and protocol are managed separately')
-    if "name" in data:p.name=str(data["name"])[:120]
+    if "name" in data:
+        name=str(data["name"]).strip()[:120]
+        if not name:raise HTTPException(422,"Tên provider không được trống")
+        p.name=name
     if "base_url" in data:
         base=str(data["base_url"]).strip()
         if not base.startswith(("http://","https://")):raise HTTPException(400,"Invalid URL")
@@ -1425,6 +1434,51 @@ async def update_provider(provider_id:str,request:Request,db:Session=Depends(get
         if not isinstance(data['enabled'],bool):raise HTTPException(422,'Invalid enabled flag')
         p.enabled=data['enabled']
     audit(db,u,"provider_update");db.commit();return {"ok":True}
+
+@app.get('/api/providers/{provider_id}/delete-preview')
+def provider_delete_preview(provider_id:str,request:Request,db:Session=Depends(get_db)):
+    u,s=api_guard(request,db);admin_only(u)
+    provider=owned_provider(db,provider_id,u)
+    return provider_impact(db,provider)
+
+@app.delete('/api/providers/{provider_id}')
+async def remove_provider(provider_id:str,request:Request,db:Session=Depends(get_db)):
+    u,s=api_guard(request,db,True);admin_only(u)
+    provider=owned_provider(db,provider_id,u)
+    body=await request.json()
+    if not isinstance(body,dict):raise HTTPException(422,'Invalid delete confirmation')
+    # Local OAuth secrets are NOT stored in Provider. For OAuth connections,
+    # disconnect first to guarantee no credential remains in the local vault.
+    if provider.kind=='openai-oauth':
+        state=await openai_oauth_relay('GET','/oauth/openai/status')
+        if state.get('connected'):
+            raise HTTPException(409,'Ngắt kết nối OpenAI OAuth trước khi xóa provider')
+    result=perform_provider_deletion(db,provider,u,body.get('confirm_name',''))
+    audit(db,u,'provider_delete',details={'provider_id':provider_id,**result})
+    db.commit()
+    return result
+
+@app.get('/api/providers/{provider_id}/models/{mid}/delete-preview')
+def model_delete_preview(provider_id:str,mid:str,request:Request,db:Session=Depends(get_db)):
+    u,s=api_guard(request,db);admin_only(u)
+    provider=owned_provider(db,provider_id,u)
+    model=db.get(Model,mid)
+    if not model or model.provider_id!=provider_id:raise HTTPException(404,'Model not found')
+    return {**provider_impact(db,provider,[model]),'model_name':model.model_id}
+
+@app.delete('/api/providers/{provider_id}/models/{mid}')
+async def remove_model(provider_id:str,mid:str,request:Request,db:Session=Depends(get_db)):
+    u,s=api_guard(request,db,True);admin_only(u)
+    provider=owned_provider(db,provider_id,u)
+    model=db.get(Model,mid)
+    if not model or model.provider_id!=provider_id:raise HTTPException(404,'Model not found')
+    body=await request.json()
+    if not isinstance(body,dict) or body.get('confirm_model')!=model.model_id:
+        raise HTTPException(422,'Nhập chính xác Model ID để xác nhận xóa')
+    result=perform_model_deletion(db,provider,[model])
+    audit(db,u,'model_delete',details={'provider_id':provider.id,'model_id':mid,**result})
+    db.commit()
+    return result
 
 @app.post("/api/providers/{provider_id}/models")
 async def add_models(provider_id:str,request:Request,db:Session=Depends(get_db)):

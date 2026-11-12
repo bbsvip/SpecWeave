@@ -7,7 +7,7 @@ from pathlib import Path
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from openai_oauth_runtime import (require_local, public_status, start_login, poll_login, answer_login, end_login, disconnect, available_models, complete, LOCAL_HOME, AUTH_USE_LOCK)
+from openai_oauth_runtime import (require_local, public_status, start_login, poll_login, answer_login, end_login, disconnect, available_models, complete, diagnostics, LOCAL_HOME, AUTH_USE_LOCK)
 
 app = FastAPI(docs_url=None, redoc_url=None)
 ROOT = Path(os.environ.get("PROJECTS_ROOT", "/data/projects")).resolve()
@@ -38,6 +38,11 @@ def runner_auth(key: str):
 def openai_status(x_runner_key: str = Header(default='')):
     runner_auth(x_runner_key)
     return public_status()
+
+@app.get('/oauth/openai/diagnostics')
+async def openai_diagnostics(x_runner_key: str = Header(default='')):
+    runner_auth(x_runner_key)
+    return await diagnostics()
 
 @app.post('/oauth/openai/start')
 async def openai_start(x_runner_key: str = Header(default='')):

@@ -235,3 +235,10 @@ Fix an Alembic initialization error on empty PostgreSQL databases (`relation "sp
 - **Cloudflare Tunnel + `COOKIE_SECURE=true`** remains supported when using HTTPS. This setting is unrelated to Fernet/OAuth subprocess errors.
 
 If running images from GHCR, push this source to GitHub to publish a new image, then set `SPECWEAVE_IMAGE_TAG` to the published tag and execute `docker compose -f compose.external-db.images.yaml --profile pi pull && docker compose -f compose.external-db.images.yaml --profile pi up -d --no-build`. If using local build, run `docker compose -f compose.external-db.yaml --profile pi up -d --build`. Preserve `.env` and existing volumes.
+
+## v0.9.5 — Provider deletion and OpenAI OAuth diagnostics
+
+- **Providers & Models:** nút **Sửa** và **Xóa** trên mỗi provider; trang chi tiết hỗ trợ **Xóa model**.
+- Xóa provider xóa toàn bộ models và bỏ model khỏi các dự án liên quan; review hoàn tất vẫn giữ nguồn gốc model. Review/chat đang chạy sẽ chặn xóa (HTTP 409).
+- **OpenAI OAuth:** thêm nút **Chẩn đoán** để kiểm tra Pi modules/adapter/credential volume; sự cố đăng nhập xuất hiện thêm `phase` và `hint` an toàn. Chưa xác nhận luồng live trên máy chủ.
+- Migration mới: `0007_provider_deletion`; chi tiết tại `docs/RELEASE_v0.9.5.vi.md`.

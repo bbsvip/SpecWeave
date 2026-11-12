@@ -5,7 +5,7 @@
  * JSONL stdout: public progress/auth_url/prompt/done/error events ONLY.
  * Run as the same unix user and HOME as the Pi agent. Never log secrets.
  */
-import {createModels} from '@earendil-works/pi-ai';
+import {createModels} from '@earendil-works/pi-ai/models';
 import {openaiProvider} from '@earendil-works/pi-ai/providers/openai';
 import {readFile, mkdir, writeFile, rename, chmod, open, unlink} from 'node:fs/promises';
 import {join, dirname} from 'node:path';
@@ -14,6 +14,22 @@ import {createInterface} from 'node:readline';
 import {randomUUID} from 'node:crypto';
 
 const path = join(process.env.HOME || homedir(), '.pi', 'agent', 'auth.json');
+let oauthPhase='bootstrap';
+// Hints are selected from known-safe strings, never derived from token-bearing URLs.
+function safeHint(err) {
+  const value = String(err?.message || '');
+  if (/Cannot read properties of (undefined|null)/i.test(value)) return 'INCOMPATIBLE_API';
+  if (/not a function|does not provide an export/i.test(value)) return 'INCOMPATIBLE_PACKAGE_VERSION';
+  if (/ERR_MODULE_NOT_FOUND|Cannot find (module|package)/i.test(value)) return 'MISSING_DEPENDENCY';
+  if (/EACCES|EPERM/i.test(value)) return 'VAULT_PERMISSION';
+  if (/ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|fetch failed/i.test(value)) return 'NETWORK_OR_PROXY';
+  if (/Invalid URL|bad URL/i.test(value)) return 'INVALID_REDIRECT';
+  if (/invalid_grant|access_denied|unauthorized/i.test(value)) return 'AUTH_REJECTED';
+  if (/Login input expired/i.test(value)) return 'INPUT_TIMEOUT';
+  if (/did not persist/i.test(value)) return 'CREDENTIAL_NOT_PERSISTED';
+  return 'UNCLASSIFIED';
+}
+
 // Errors are classified before crossing the runner boundary; raw provider
 // exceptions can include callback URLs, tokens or authorization codes.
 function classifyFailure(err) {
@@ -45,11 +61,16 @@ input.on('line',line=>{
   }
 });
 const ask=async (req)=>{
+  oauthPhase='awaiting_manual_callback';
   send('prompt',{message:String(req.message||'Paste the final redirect URL / authorization code').slice(0,1000),input_type:req.type||'manual_code'});
   if(answers.length)return answers.shift();
   return await new Promise((resolve,reject)=>{
-    const timeout=setTimeout(()=>{answerResolve=undefined;reject(new Error('Login input expired'))},180000);
-    answerResolve=v=>{clearTimeout(timeout);resolve(v)};
+    let finished=false;
+    const clean=()=>{clearTimeout(timeout);req.signal?.removeEventListener('abort',abort);answerResolve=undefined};
+    const abort=()=>{if(finished)return;finished=true;clean();reject(new DOMException('Manual callback input cancelled', 'AbortError'))};
+    const timeout=setTimeout(()=>{if(finished)return;finished=true;clean();reject(new Error('Login input expired'))},180000);
+    answerResolve=v=>{if(finished)return;finished=true;clean();resolve(v)};
+    if(req.signal?.aborted)abort();else req.signal?.addEventListener('abort',abort,{once:true});
   });
 };
 // Pi auth.json is local-only and 0600. Single user / single runner is intentional.
@@ -80,8 +101,10 @@ const store={
 };
 async function main(){
   // Only OpenAI provider is registered: never expose any other provider login.
+  oauthPhase='register_provider';
   const models=createModels({credentials:store});
   models.setProvider(openaiProvider());
+  oauthPhase='provider_login';
   await models.login('openai','oauth',{
     prompt:ask,
     notify:(event)=>{
@@ -91,6 +114,7 @@ async function main(){
     },
   });
   // Check that an OAuth record (not API key) was stored, without exposing it.
+  oauthPhase='persisting_credential';
   const record=(await load()).openai;
   if(record?.type!=='oauth')throw new Error('OpenAI OAuth provider did not persist an OAuth credential');
   send('done',{connected:true});
@@ -99,7 +123,8 @@ async function main(){
 main().catch(e=>{
   const [code,message]=classifyFailure(e);
   // Never print raw error messages to stdout/stderr: they can contain secrets.
-  console.error(`[openai-oauth] ${code}`);
-  send('error',{code,message});
+  const hint=safeHint(e);
+  console.error(`[openai-oauth] ${code} phase=${oauthPhase} hint=${hint} error_type=${String(e?.name||'Error').replace(/[^a-zA-Z]/g,'').slice(0,30)}`);
+  send('error',{code,message,phase:oauthPhase,hint});
   input.close();process.stdin.pause();process.exitCode=1;
 });

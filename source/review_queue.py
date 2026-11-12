@@ -61,7 +61,7 @@ def job_payload(db: Session, job: ReviewJob) -> dict:
         "id": job.id, "project_id": job.project_id,
         "status": job.status, "progress": len(by_role), "total": len(ROLES),
         "cancel_requested": bool(job.cancel_requested),
-        "model_id": job.model_id, "review_id": job.review_id,
+        "model_id": job.model_id, "model_snapshot": job.model_snapshot or {}, "review_id": job.review_id,
         "output_budget": job.output_budget, "output_used": job.output_used,
         "role_models": job.role_models or {},
         "usage_estimated": bool(job.usage_estimated),

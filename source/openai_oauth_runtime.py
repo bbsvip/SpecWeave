@@ -77,7 +77,17 @@ def safe_event(event):
     if kind=='prompt':
         return {'type':'prompt','message':str(event.get('message',''))[:600]}
     if kind=='done': return {'type':'done','connected':True}
-    if kind=='error': return _oauth_error(str(event.get('code','OAUTH_RUNTIME_FAILURE')))
+    if kind=='error':
+        result=_oauth_error(str(event.get('code','OAUTH_RUNTIME_FAILURE')))
+        phase=str(event.get('phase',''))
+        hint=str(event.get('hint',''))
+        allowed_phases={'bootstrap','register_provider','provider_login','awaiting_manual_callback','persisting_credential'}
+        allowed_hints={'INCOMPATIBLE_API','INCOMPATIBLE_PACKAGE_VERSION','MISSING_DEPENDENCY','VAULT_PERMISSION',
+                       'NETWORK_OR_PROXY','INVALID_REDIRECT','AUTH_REJECTED','INPUT_TIMEOUT',
+                       'CREDENTIAL_NOT_PERSISTED','UNCLASSIFIED'}
+        if phase in allowed_phases:result['phase']=phase
+        if hint in allowed_hints:result['hint']=hint
+        return result
     if kind=='progress': return {'type':'progress','message':'OpenAI sign-in in progress'}
     return None
 
@@ -207,6 +217,40 @@ def _disconnect_unlocked():
         file.flush();os.fsync(file.fileno())
     temp.replace(AUTH_PATH)
     return {'ok':True,'revoked_remotely':False}
+
+
+async def diagnostics():
+    """Non-secret, non-network preflight for a locally controlled OpenAI OAuth runner."""
+    require_local()
+    # Check the actual installed ESM API and provider OAuth method. No token,
+    # callback, credential contents, or external requests are involved.
+    script=("import {createModels} from '@earendil-works/pi-ai/models';"
+            "import {openaiProvider} from '@earendil-works/pi-ai/providers/openai';"
+            "const p=openaiProvider();const m=createModels();m.setProvider(p);"
+            "console.log(JSON.stringify({model_login:typeof m.login==='function',"
+            "provider_oauth:typeof p.auth?.oauth?.login==='function'}))")
+    status={'local_mode':True,'node_import':False,'model_login':False,
+            'provider_oauth':False,'vault_writable':False}
+    try:
+        proc=await asyncio.create_subprocess_exec('node','--input-type=module','-e',script,
+            cwd='/runner',stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL,
+            env={**os.environ,'HOME':str(LOCAL_HOME)})
+        stdout,_=await asyncio.wait_for(proc.communicate(),timeout=12)
+        if proc.returncode==0:
+            result=json.loads(stdout.decode('utf8')[:300])
+            status.update(node_import=True,model_login=result.get('model_login') is True,
+                          provider_oauth=result.get('provider_oauth') is True)
+    except (ValueError,OSError,asyncio.TimeoutError):pass
+    try:
+        # Only inspect/write a random temp probe; never read or modify auth.json.
+        folder=AUTH_PATH.parent
+        folder.mkdir(parents=True,exist_ok=True,mode=0o700)
+        name=folder/('.probe-'+secrets.token_hex(8))
+        fd=os.open(name,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+        os.close(fd);name.unlink()
+        status['vault_writable']=True
+    except OSError:pass
+    return status
 
 
 async def available_models():

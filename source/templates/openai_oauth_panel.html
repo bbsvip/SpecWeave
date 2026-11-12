@@ -5,8 +5,10 @@
   <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
     <span id="openaiOAuthStatus" class="status-chip">Đang kiểm tra…</span>
     <button class="btn btn-primary btn-sm" type="button" id="openaiOAuthConnect"><i class="ti ti-link"></i> Connect / Reconnect</button>
+    <button class="btn btn-outline-secondary btn-sm" type="button" id="openaiOAuthDiagnose"><i class="ti ti-stethoscope"></i> Chẩn đoán</button>
     <button class="btn btn-outline-danger btn-sm" type="button" id="openaiOAuthDisconnect">Disconnect</button>
   </div>
+  <pre class="d-none text-secondary small mt-2" id="openaiOAuthDiagnostics" aria-live="polite"></pre>
   <div id="openaiOAuthFlow" class="d-none mt-3">
     <p class="small text-secondary" id="openaiOAuthProgress">Đang tạo phiên xác thực…</p>
     <a id="openaiOAuthLink" class="btn btn-outline-primary d-none" href="#" target="_blank" rel="noopener noreferrer">Mở trang xác thực OpenAI</a>

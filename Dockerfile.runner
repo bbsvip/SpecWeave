@@ -5,7 +5,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 python3
     && python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir fastapi uvicorn pydantic \
     && mkdir -p /runner \
-    && npm install --prefix /runner --no-save --ignore-scripts @earendil-works/pi-coding-agent @earendil-works/pi-ai typebox \
+    && npm install --prefix /runner --no-save --ignore-scripts @earendil-works/pi-coding-agent@1.5.2 @earendil-works/pi-ai@1.5.2 typebox \
+    && (cd /runner && node --input-type=module -e "import {createModels} from '@earendil-works/pi-ai/models'; import {openaiProvider} from '@earendil-works/pi-ai/providers/openai'; const m=createModels(); m.setProvider(openaiProvider()); if(!m.getModel) throw Error('Missing Models API')") \
     && useradd -r -u 10001 -m -d /home/specweave specweave \
     && mkdir -p /runner /data/projects /auth-local \
     && chown -R specweave:specweave /runner /data /auth-local \
