@@ -15,7 +15,7 @@ def test_no_retired_python_agent_or_rpc_process():
     assert '/chat/completions' not in ai
     assert 'pi_client import complete' in planning
     assert 'httpx.AsyncClient' not in planning
-    assert 'async def complete(' not in (SRC/'openai_oauth_runtime.py').read_text()
+    assert 'async def complete(' not in (SRC/'openai_oauth_runtime.py').read_text(encoding='utf-8')
 
 
 def test_pi_native_host_controls_model_and_tool_lifecycle():
@@ -27,10 +27,15 @@ def test_pi_native_host_controls_model_and_tool_lifecycle():
     assert 'tools:[]' not in code  # Passing [] suppresses custom tools in Pi.
 
 
-def test_pi_is_mandatory_in_every_compose_variant():
+def test_pi_is_in_web_in_every_compose_variant():
     for name in ('compose.yaml','compose.external-db.yaml','compose.images.yaml','compose.external-db.images.yaml'):
         compose=yaml.safe_load((ROOT/name).read_text(encoding='utf-8'))
         services=compose['services']
-        assert 'pi-runner' in services
-        assert 'profiles' not in services['pi-runner']
-        assert 'pi-runner' in services['web']['depends_on']
+        assert set(services) <= {'web','review-worker','db'}
+        web,worker=services['web'],services['review-worker']
+        assert web['environment']['PI_RUNNER_URL']=='http://127.0.0.1:8090'
+        assert worker['environment']['PI_RUNNER_URL']=='http://web:8090'
+        assert 'openai_oauth_local:/auth-local' in web['volumes']
+        assert 'openai_oauth_local:/auth-local' not in worker['volumes']
+        assert worker['depends_on']['web']['condition']=='service_healthy'
+        assert all(str(port).endswith(':8080') for port in web['ports'])

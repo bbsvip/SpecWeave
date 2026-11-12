@@ -37,13 +37,12 @@ def test_prebuilt_compose_matches_build_compose_except_build_image(build, prebui
             continue
         original = {k: v for k, v in before.items() if k != 'build'}
         assert {k: v for k, v in after.items() if k != 'image'} == original
-        expected_suffix = '-pi:' if service == 'pi-runner' else '-web:'
         assert after['image'].startswith('${SPECWEAVE_IMAGE_REPO:?Set SPECWEAVE_IMAGE_REPO in .env}')
-        assert expected_suffix in after['image']
+        assert '-web:' in after['image']
         assert after['image'].endswith('${SPECWEAVE_IMAGE_TAG:-main}')
 
 
-def test_publish_workflow_has_two_images_and_release_tags():
+def test_publish_workflow_has_one_web_image_and_release_tags():
     workflow = _yaml('.github/workflows/docker-publish.yml')
     assert 'workflow_dispatch' in workflow['on']
     assert workflow['on']['push']['tags'] == ['v*']
@@ -51,15 +50,14 @@ def test_publish_workflow_has_two_images_and_release_tags():
     assert workflow['jobs']['publish']['needs'] == 'validate'
     publish = workflow['jobs']['publish']
     assert publish['permissions']['packages'] == 'write'
-    include = publish['strategy']['matrix']['include']
-    assert {row['component'] for row in include} == {'web', 'pi'}
-    assert {row['dockerfile'] for row in include} == {'Dockerfile', 'Dockerfile.runner'}
     steps = publish['steps']
     build = next(x for x in steps if x.get('uses', '').startswith('docker/build-push-action@'))
     assert build['with']['platforms'] == 'linux/amd64'
+    assert build['with']['file'] == './Dockerfile'
     assert build['with']['push'] == 'true'
     assert 'cache-from' in build['with'] and 'cache-to' in build['with']
     metadata = next(x for x in steps if x.get('uses', '').startswith('docker/metadata-action@'))
+    assert metadata['with']['images'].endswith('-web')
     assert 'type=ref,event=tag' in metadata['with']['tags']
     assert 'type=sha,format=short' in metadata['with']['tags']
 

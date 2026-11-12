@@ -3,7 +3,7 @@ import asyncio
 import json
 
 from test_app import client, auth, _make_discussion_with_model, SessionLocal, db
-from chat_background import run_once
+from chat_background import claim_next, process_queued_run, run_once
 
 
 def test_detached_run_completes_without_any_open_sse_subscriber(client, monkeypatch):
@@ -137,3 +137,104 @@ def test_reconnect_uses_eventsource_without_issuing_new_prompt():
     assert 'source.onerror' in code
     # Tab navigation does not call /runs/.../cancel; only explicit Stop does.
     assert 'window.addEventListener(\'beforeunload\'' not in code
+
+
+def test_page_keeps_the_run_id_when_it_finishes_before_subscription(client, monkeypatch):
+    import app as application
+    csrf=auth(client)
+    pid,did=_make_discussion_with_model(client,csrf,'reload-during-chat')
+    async def pi_stub(*args, **kwargs):
+        yield 'thinking',{'text':'Thinking already streamed'}
+        yield 'delta',{'text':'Durable response'}
+    monkeypatch.setattr(application,'pi_stream',pi_stub)
+    job=client.post(f'/api/projects/{pid}/chat/start',headers=csrf,json={
+        'discussion_id':did,'message':'Original prompt'}).json()
+    run_id=job['run_id']
+    assert claim_next()==run_id
+    page=client.get(f'/projects/{pid}/discussion?did={did}')
+    assert f'data-active-run="{run_id}"' in page.text
+    assert 'id="piRunPlaceholder"' in page.text
+    active=f'/api/projects/{pid}/discussions/{did}/active-run'
+    assert client.get(active).json()=={'run_id':run_id,'status':'running'}
+    assert client.get(active).headers['cache-control']=='no-store'
+
+    asyncio.run(process_queued_run(run_id))
+    assert client.get(active).json()=={'run_id':None,'status':'idle'}
+    assert 'Durable response' in client.get(f'/projects/{pid}/discussion?did={did}').text
+    response=client.get(job['events_url'])
+    ids=[int(line[4:]) for line in response.text.splitlines() if line.startswith('id: ')]
+    assert len(ids)>=5
+    resumed=client.get(job['events_url'],headers={'Last-Event-ID':str(ids[-2])})
+    assert resumed.text.count('data: ')==1
+    assert '"type": "done"' in resumed.text
+    assert client.get(job['events_url'],headers={'Last-Event-ID':str(ids[-1])}).text==''
+
+
+def test_workers_overlap_between_discussions_and_retry_same_id_after_lock(client, monkeypatch):
+    import app as application
+    from chat_background import chat_worker_main
+    from chat_coordination import discussion_lease
+    from datetime import timedelta
+    csrf=auth(client)
+    pid,did=_make_discussion_with_model(client,csrf,'parallel-chat')
+    other=client.post(f'/api/projects/{pid}/discussions',headers=csrf,json={'title':'Other'}).json()['id']
+    first,second=[client.post(f'/api/projects/{pid}/chat/start',headers=csrf,json={
+        'discussion_id':discussion,'message':discussion}).json()['run_id'] for discussion in (did,other)]
+
+    async def exercise():
+        entered=set()
+        overlap=asyncio.Event()
+        async def pi_stub(project,discussion,sess,model,**kwargs):
+            assert kwargs['run_id'] not in entered
+            entered.add(kwargs['run_id'])
+            if entered=={first,second}:
+                overlap.set()
+            await asyncio.wait_for(overlap.wait(),5)
+            yield 'delta',{'text':discussion.id}
+        monkeypatch.setattr(application,'pi_stream',pi_stub)
+        async with discussion_lease(did):
+            assert await run_once()==first
+            assert entered==set()
+        with SessionLocal() as sess:
+            waiting=sess.get(db.AgentRun,first)
+            assert waiting.status=='queued' and waiting.worker_owner is None
+            waiting.lease_expires_at=db.utcnow()-timedelta(seconds=1)
+            sess.commit()
+        worker=asyncio.create_task(chat_worker_main())
+        try:
+            await asyncio.wait_for(overlap.wait(),5)
+            for _ in range(100):
+                with SessionLocal() as sess:
+                    if all(sess.get(db.AgentRun,rid).status=='completed' for rid in (first,second)):
+                        break
+                await asyncio.sleep(.02)
+            else:
+                raise AssertionError('Both discussions must reach a durable terminal state')
+        finally:
+            worker.cancel()
+            await asyncio.gather(worker,return_exceptions=True)
+        with SessionLocal() as sess:
+            for rid,discussion in ((first,did),(second,other)):
+                assert sess.get(db.AgentRun,rid).worker_owner is None
+                assert sess.query(db.Message).filter_by(run_id=rid,role='assistant').one().content==discussion
+    asyncio.run(exercise())
+
+
+def test_prompt_includes_only_questions_from_its_discussion(client):
+    from ai import plan_prompt
+    from planning import save_question
+    csrf=auth(client)
+    pid,did=_make_discussion_with_model(client,csrf,'scoped-planning-context')
+    other=client.post(f'/api/projects/{pid}/discussions',headers=csrf,json={'title':'Other'}).json()['id']
+    with SessionLocal() as sess:
+        for discussion,question in ((did,'Question specific to Alpha'),(other,'Question specific to Bravo')):
+            save_question(sess,pid,discussion,{
+                'question':question,
+                'options':[{'label':'First approach','pros':'Simple','cons':'Basic'},
+                           {'label':'Second approach','pros':'Flexible','cons':'Complex'}],
+                'recommended_index':0,'recommendation_reason':'First is enough for now'})
+        project=sess.get(db.Project,pid)
+        alpha=plan_prompt(project,sess,'analyst','discovery',discussion_id=did)
+        bravo=plan_prompt(project,sess,'analyst','discovery',discussion_id=other)
+        assert 'Question specific to Alpha' in alpha and 'Question specific to Bravo' not in alpha
+        assert 'Question specific to Bravo' in bravo and 'Question specific to Alpha' not in bravo

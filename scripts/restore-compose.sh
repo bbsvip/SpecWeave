@@ -32,7 +32,6 @@ command -v docker >/dev/null || { echo 'Docker required' >&2; exit 1; }
 echo 'WARNING: replacing the entire project volume and specweave database.'
 echo 'Stopping all SpecWeave writers...'
 docker compose stop web review-worker
-docker compose --profile pi stop pi-runner >/dev/null 2>&1 || true
 # DATABASE_RESET is intentionally a single explicit action; no new backup is made here.
 echo 'Recreating PostgreSQL database...'
 docker compose exec -T db sh -c 'dropdb --if-exists -U specweave specweave && createdb -U specweave specweave'
@@ -42,4 +41,4 @@ docker compose run --rm --no-deps --entrypoint sh web -c 'rm -rf /data/projects 
 docker compose run --rm --no-deps --entrypoint tar web -C /data -xzf - < "$FILESFILE"
 echo 'Starting web and review worker (Alembic upgrades any older snapshot)...'
 docker compose up -d web review-worker
-echo 'Restore complete. Verify health, login and export; restart optional Pi runner manually if used.'
+echo 'Restore complete. Verify health, login and export.'

@@ -7,14 +7,14 @@
  * without first implementing distributed session ownership/leases.
  */
 import {createServer} from 'node:http';
-import {mkdir,writeFile,realpath,stat} from 'node:fs/promises';
+import {mkdir,mkdtemp,rm,writeFile,realpath,stat} from 'node:fs/promises';
 import {join,resolve,sep} from 'node:path';
 import {createHash,timingSafeEqual} from 'node:crypto';
 import {createAgentSession,ModelRuntime,SessionManager,DefaultResourceLoader,SettingsManager} from '@earendil-works/pi-coding-agent';
 import {createScopedTools} from './pi_host_tools.mjs';
 import {oauthEnabled,oauthStatus,oauthBusy,oauthStart,oauthPoll,oauthAnswer,oauthCancel,oauthDisconnect,oauthModels,oauthDiagnostics,oauthPaths} from './pi_host_oauth.mjs';
 
-const PORT=Number(process.env.PORT||8090);
+const PORT=Number(process.env.PI_HOST_PORT||process.env.PORT||8090);
 const ROOT=resolve(process.env.PROJECTS_ROOT||'/data/projects');
 // The container owns /runner, but the unprivileged GitHub Actions test runner does not.
 // A test may override ONLY this resource directory, never agent/project session paths.
@@ -28,7 +28,7 @@ const MODEL_REGISTRY=join(oauthPaths.HOME,'.pi','agent','models.json');
 const sessions=new Map();
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const THOUGHT=new Set(['off','minimal','low','medium','high','xhigh','max']);
-const err=(status,message)=>Object.assign(new Error(message),{status});
+const err=(status,message,code)=>Object.assign(new Error(message),{status,code});
 const sha=value=>createHash('sha256').update(value).digest('hex');
 const safeDetail=e=>e?.status?e.message:`Pi Agent Host failed (${e?.name||'Error'}). See server logs without exposing credentials.`;
 const loggedError=e=>console.error(`[pi-host] ${e?.name||'Error'} in ${e?.phase||'request'} (${e?.status||500})`);
@@ -107,23 +107,26 @@ async function runtimeFor(data,scope){
   if(!model)throw err(422,'Pi could not register custom OpenAI-compatible model');
   return {modelRuntime,model};
 }
-function createResourceLoader(systemContext,settingsManager){
+function createResourceLoader(active,settingsManager){
   return new DefaultResourceLoader({cwd:SAFE_RESOURCES,agentDir:join(SAFE_RESOURCES,'.pi','agent'),
     settingsManager,
-    systemPromptOverride:()=>systemContext,appendSystemPromptOverride:()=>[]});
+    systemPromptOverride:()=>active.systemContext,appendSystemPromptOverride:()=>[],
+    extensionFactories:[pi=>{
+      pi.on('before_agent_start',()=>({systemPrompt:active.systemContext}));
+    }]});
 }
-async function newSession(data,{persistent,withTools}){
+async function newSession(data,{persistent,withTools,registryPath}){
   const workspace=await checkedProject(data.project_id);
   if(!UUID.test(data.discussion_id||''))throw err(422,'Invalid discussion ID');
   const scope=join(workspace,'.system','pi-native',data.discussion_id);
-  const {modelRuntime,model}=await runtimeFor(data,join(scope,'registry'));
+  const {modelRuntime,model}=await runtimeFor(data,registryPath||join(scope,'registry'));
   const sessionDir=join(scope,'sessions');
-  await mkdir(sessionDir,{recursive:true,mode:0o700});
+  if(persistent)await mkdir(sessionDir,{recursive:true,mode:0o700});
   // Never load user-controlled Pi settings/extensions from uploaded project files.
   const settingsManager=SettingsManager.inMemory();
-  const loader=createResourceLoader(String(data.system_context||'').slice(0,30000),settingsManager);
+  const active={current:null,systemContext:String(data.system_context||'').slice(0,30000)};
+  const loader=createResourceLoader(active,settingsManager);
   await loader.reload();
-  const active={current:null};
   const {session}=await createAgentSession({
     cwd:workspace,modelRuntime,model,
     thinkingLevel:THOUGHT.has(data.thinking)?data.thinking:'medium',
@@ -134,19 +137,6 @@ async function newSession(data,{persistent,withTools}){
   });
   return {session,active,signature:modelSignature(data),workspace};
 }
-async function getDiscussionSession(data){
-  const key=`${data.project_id}:${data.discussion_id}`;
-  let current=sessions.get(key);
-  if(current?.busy)throw err(409,'Pi session is busy');
-  const signature=modelSignature(data);
-  if(current&&current.signature!==signature){current.session.dispose();sessions.delete(key);current=null;}
-  if(!current){
-    current=await newSession(data,{persistent:true,withTools:true});
-    sessions.set(key,current);
-  }
-  current.session.setThinkingLevel(THOUGHT.has(data.thinking)?data.thinking:'medium');
-  return current;
-}
 function validateRun(data){
   for(const key of ['project_id','discussion_id','run_id'])if(!UUID.test(data[key]||''))throw err(422,'Invalid '+key);
   if(!/^[0-9a-f]{64}$/i.test(data.tool_token||''))throw err(422,'Invalid tool capability');
@@ -156,10 +146,34 @@ function validateRun(data){
 async function runStream(data,res){
   validateRun(data);
   if(data.auth_mode==='openai-oauth'&&oauthBusy())throw err(409,'OpenAI login is in progress');
-  const current=await getDiscussionSession(data);
-  current.busy=true;current.runId=data.run_id;current.authMode=data.auth_mode;
-  current.active.current={runId:data.run_id,token:data.tool_token};
-  const sess=current.session;let output='',thought='',usage={},assistantCount=0;
+  const key=`${data.project_id}:${data.discussion_id}`;
+  const current=sessions.get(key)||{};
+  if(current.busy)throw err(409,'Pi session is busy','PI_SESSION_BUSY');
+  // Reserve before any await, including first-use setup and model changes.
+  current.busy=true;current.runId=data.run_id;current.authMode=data.auth_mode;current.cancelled=false;
+  sessions.set(key,current);
+  try{
+    if(current.session&&current.signature!==modelSignature(data)){
+      current.session.dispose();current.session=null;
+    }
+    if(!current.session)Object.assign(current,await newSession(data,{persistent:true,withTools:true}));
+    if(current.cancelled||res.destroyed)throw err(409,'Pi run cancelled');
+    current.session.setThinkingLevel(THOUGHT.has(data.thinking)?data.thinking:'medium');
+    current.active.systemContext=data.system_context;
+    current.active.current={runId:data.run_id,token:data.tool_token};
+    await streamSession(current,data,res);
+  }finally{
+    if(current.active)current.active.current=null;
+    current.busy=false;current.runId=null;
+    if(!current.session)sessions.delete(key);
+  }
+}
+
+async function streamSession(current,data,res){
+  const sess=current.session;
+  let output='',partial='',usage={};
+  const abortOnDisconnect=()=>{void sess.abort().catch(loggedError);};
+  res.once('close',abortOnDisconnect);
   res.writeHead(200,{'Content-Type':'text/event-stream; charset=utf-8',
     'Cache-Control':'no-cache, no-transform','X-Accel-Buffering':'no','Connection':'keep-alive'});
   const keepalive=setInterval(()=>{if(!res.destroyed&&!res.writableEnded)res.write(':heartbeat\n\n');},12000);
@@ -167,8 +181,8 @@ async function runStream(data,res){
   const unsubscribe=sess.subscribe(event=>{
     if(event.type==='message_update'){
       const update=event.assistantMessageEvent||{};
-      if(update.type==='text_delta'&&typeof update.delta==='string'){output+=update.delta;sse(res,'delta',{text:update.delta});}
-      if(update.type==='thinking_delta'&&typeof update.delta==='string'){thought+=update.delta;sse(res,'thinking',{text:update.delta});}
+      if(update.type==='text_delta'&&typeof update.delta==='string'){partial+=update.delta;sse(res,'delta',{text:update.delta});}
+      if(update.type==='thinking_delta'&&typeof update.delta==='string')sse(res,'thinking',{text:update.delta});
       if(update.type==='toolcall_start'||update.type==='toolcall_delta'||update.type==='toolcall_end'){
         sse(res,'tool',{name:update.toolName||update.toolCall?.name||'Pi tool',
           id:update.id||update.toolCall?.id||String(update.contentIndex??''),status:update.type,
@@ -181,9 +195,8 @@ async function runStream(data,res){
     if(event.type==='tool_execution_end')sse(res,'tool',{name:event.toolName,id:event.toolCallId,status:event.isError?'error':'complete',
       result:JSON.stringify(event.result||{}).slice(0,8000)});
     if(event.type==='message_end'&&event.message?.role==='assistant'){
-      assistantCount++;
-      const complete=assistantText(event.message);
-      if(complete){if(assistantCount===1)output=complete;else output+=complete;}
+      output+=assistantText(event.message)||partial;
+      partial='';
       const stats=normalizeUsage(event.message.usage);
       if(stats){for(const k of ['input_tokens','output_tokens','cache_read_tokens'])
         if(typeof stats[k]==='number')usage[k]=(usage[k]||0)+stats[k];
@@ -205,14 +218,15 @@ async function runStream(data,res){
     sse(res,'status',{phase:'request',message:'Pi đã nhận yêu cầu; đang gọi model…'});
     await sess.prompt(message);
     const last=sess.messages?.filter(m=>m.role==='assistant').at(-1);
-    if(!output&&last)output=assistantText(last);
-    sse(res,'final',{text:output});
+    if(current.cancelled||last?.stopReason==='aborted')throw err(409,'Pi run cancelled');
+    if(last?.stopReason==='error')throw err(502,'Pi model request failed');
+    sse(res,'final',{text:output+partial});
   } catch(e) {
     loggedError(e);
     sse(res,'error',{message:safeDetail(e)});
   } finally {
     unsubscribe();clearInterval(keepalive);
-    current.busy=false;current.active.current=null;current.runId=null;
+    res.off('close',abortOnDisconnect);
     if(!res.writableEnded)res.end();
   }
 }
@@ -220,7 +234,14 @@ async function complete(data){
   // All one-shot planning/review jobs also use Pi AgentSession, with NO tools.
   if(!UUID.test(data.project_id||''))throw err(422,'Invalid project ID');
   const taskData={...data,discussion_id:data.discussion_id&&UUID.test(data.discussion_id)?data.discussion_id:data.project_id};
-  const current=await newSession(taskData,{persistent:false,withTools:false});
+  // A stateless request must not overwrite a chat session's model registry.
+  const registryPath=await mkdtemp(join(SAFE_RESOURCES,'completion-'));
+  try{return await completeInSession(taskData,registryPath);}
+  finally{await rm(registryPath,{recursive:true,force:true});}
+}
+
+async function completeInSession(data,registryPath){
+  const current=await newSession(data,{persistent:false,withTools:false,registryPath});
   const sess=current.session;
   let output='',usage={},assistantCount=0;
   const unsubscribe=sess.subscribe(event=>{
@@ -248,7 +269,8 @@ async function readRequest(req,res){
     if(pathname==='/abort'&&req.method==='POST'){
       const data=await readJson(req);const item=sessions.get(`${data.project_id}:${data.discussion_id}`);
       if(!item?.busy||item.runId!==data.run_id)throw err(404,'Active run not found');
-      await item.session.abort();return sendJson(res,200,{ok:true});
+      item.cancelled=true;
+      await item.session?.abort();return sendJson(res,200,{ok:true});
     }
     if(pathname==='/oauth/openai/status'&&req.method==='GET')return sendJson(res,200,await oauthStatus());
     if(pathname==='/oauth/openai/diagnostics'&&req.method==='GET')return sendJson(res,200,await oauthDiagnostics());
@@ -272,13 +294,19 @@ async function readRequest(req,res){
     }
     if(pathname==='/oauth/openai/models'&&req.method==='GET')return sendJson(res,200,await oauthModels(()=>ModelRuntime.create({authPath:AUTH,modelsPath:MODEL_REGISTRY})));
     throw err(404,'Not found');
-  }catch(e){loggedError(e);sendJson(res,e.status||500,{detail:safeDetail(e)});}
+  }catch(e){loggedError(e);sendJson(res,e.status||500,{detail:safeDetail(e),code:e.code==='PI_SESSION_BUSY'?e.code:undefined});}
 }
 
 export const _test={normalizeUsage,modelSignature,validateRun};
 if(process.env.SPECWEAVE_HOST_TEST!=='1'){
   await mkdir(SAFE_RESOURCES,{recursive:true,mode:0o700});
   const server=createServer(readRequest);
-  server.listen(PORT,'0.0.0.0',()=>console.log(`[pi-host] Pi SDK Agent Host listening on :${PORT}`));
-  process.on('SIGTERM',()=>{for(const item of sessions.values())item.session.dispose();server.close();});
+  server.listen(PORT,process.env.PI_HOST_BIND||'127.0.0.1',()=>console.log(`[pi-host] Pi SDK Agent Host listening on :${PORT}`));
+  process.on('SIGTERM',()=>{
+    server.close();
+    for(const item of sessions.values()){
+      if(item.session&&item.busy)void item.session.abort().catch(loggedError);
+      else item.session?.dispose();
+    }
+  });
 }

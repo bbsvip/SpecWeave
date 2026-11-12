@@ -14,13 +14,9 @@ RUNNING=$(docker compose ps --services --status running)
 STOPPED=0
 resume() {
   if [ "$STOPPED" -eq 1 ]; then
-    for service in web review-worker pi-runner; do
+    for service in web review-worker; do
       if printf '%s\n' "$RUNNING" | grep -qx "$service"; then
-        if [ "$service" = 'pi-runner' ]; then
-          docker compose --profile pi up -d pi-runner >/dev/null 2>&1 || echo 'WARNING: Could not restart pi-runner' >&2
-        else
-          docker compose up -d "$service" >/dev/null 2>&1 || echo "WARNING: Could not restart $service" >&2
-        fi
+        docker compose up -d "$service" >/dev/null 2>&1 || echo "WARNING: Could not restart $service" >&2
       fi
     done
   fi
@@ -28,9 +24,8 @@ resume() {
 trap resume EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-printf 'Stopping web, review worker and optional Pi runner for a consistent snapshot...\n'
+printf 'Stopping web and review worker for a consistent snapshot...\n'
 docker compose stop web review-worker
-docker compose --profile pi stop pi-runner >/dev/null 2>&1 || true
 STOPPED=1
 printf 'Dumping PostgreSQL...\n'
 docker compose exec -T db pg_dump --no-owner --no-privileges -U specweave -d specweave > "$DBFILE"

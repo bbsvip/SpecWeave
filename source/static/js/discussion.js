@@ -13,7 +13,6 @@
   const progressElement=document.getElementById('discoveryProgress');
   let controller=null,runId=null,openQuestion=null,selectedIds=new Set();
   let discoveryDone=root.dataset.discoveryReady==='true';
-  let checkedInterruptedAnswer=false;
   let streamingTimer=null,mermaidLibrary=null,mermaidCounter=0;
   const make=(tag,cls='',txt)=>{const node=document.createElement(tag);if(cls)node.className=cls;if(txt!==undefined)node.textContent=txt;return node;};
   function followIfNearBottom(force=false){
@@ -132,7 +131,7 @@
   const actionButton=(label,cls,cb)=>{const b=make('button','btn btn-sm '+cls,label);b.type='button';b.addEventListener('click',cb);return b;};
   function setBusy(active,label){
     send.disabled=active;input.disabled=active;
-    stop.classList.toggle('d-none',!active);
+    stop.classList.toggle('d-none',!runId||!active);
     state.textContent=label||(active?'Đang trả lời…':'Ready');
     root.classList.toggle('chat-busy',active);
     suggestButton&&(suggestButton.disabled=active);
@@ -164,18 +163,6 @@
     row.append(make('span','activity-dot '+type),make('span','',text));
     timeline.append(row);if(timeline.children.length>32)timeline.firstChild.remove();
   }
-  async function readSSE(response,onFrame){
-    if(!response.body)throw new Error('Server không trả về SSE stream');
-    const reader=response.body.getReader(),decoder=new TextDecoder();
-    const parser=window.SpecWeaveSSE.createParser(onFrame);
-    try{
-      for(;;){
-        const {done,value}=await reader.read();if(done)break;
-        parser.push(decoder.decode(value,{stream:true}));
-      }
-      parser.push(decoder.decode());parser.finish();
-    }finally{reader.releaseLock();}
-  }
   async function talk({continueQuestionId=null,answerQuestion=null,advancePlanning=false,resumeRunId=null}={}){
     if(controller||!did)return false;
     // The answer-stream endpoint saves the choice and starts the Pi run in ONE
@@ -192,10 +179,12 @@
         (answerQuestion.data.note?'\nGhi chú: '+answerQuestion.data.note:'');
       optimistic=addMessage('user',text);
     }
+    document.getElementById('piRunPlaceholder')?.remove();
     const turn=addMessage('assistant','');const panel=buildTurnActivity(turn);
     const role=sw.val('agentRole'),mode=sw.val('agentMode');
-    let full='',usage={},contextWindow=0,firstTokenMs=null,elapsedMs=0,completed=false,hadError=false,outputTps=null;
+    let full='',usage={},contextWindow=0,firstTokenMs=null,elapsedMs=0,completed=false,outputTps=null;
     let thinkingFull='',lastPhase='request',shouldAdvance=false,answerAccepted=false;
+    let observing=Boolean(resumeRunId), terminalStatus=null;
     const started=performance.now();let renderScheduled=false,renderHandle=null;
     const scheduleRender=()=>{
       if(renderScheduled)return;renderScheduled=true;
@@ -206,11 +195,12 @@
       renderScheduled=false;renderHandle=null;
       renderMarkdown(turn.content,full||'(Không có nội dung)');
     };
-    runId=null;controller=new AbortController();setBusy(true,'Đang kết nối…');
+    runId=resumeRunId;controller=new AbortController();setBusy(true,'Đang kết nối…');
+    if(observing)followIfNearBottom(true);
     headerUsage&&(headerUsage.textContent='Đang kết nối…');
     addTimeline(panel.timeline,'status','Kết nối tới agent');
     streamingTimer=setInterval(()=>{
-      if(!controller)return;
+      if(terminalStatus)return;
       elapsedMs=performance.now()-started;
       panel.metrics.textContent=describeUsage(usage,firstTokenMs,elapsedMs,contextWindow,full.length,outputTps);
       if(headerUsage)headerUsage.textContent=panel.metrics.textContent;
@@ -238,7 +228,7 @@
           body,signal:controller.signal,
         });
         const data=await response.json().catch(()=>({}));
-        if(response.status===409&&!answerQuestion){
+        if(response.status===409){
           // F5/double-submit race: a durable Pi run may already have been
           // committed by the preceding tab. Attach it; do NOT send a second
           // prompt or create a second run on this discussion.
@@ -250,7 +240,7 @@
             if(existing.run_id){
               queued={run_id:existing.run_id,
                 events_url:`/api/projects/${pid}/runs/${encodeURIComponent(existing.run_id)}/events`};
-              checkedInterruptedAnswer=true;
+              observing=true;
               // The new message was NOT accepted. Remove its optimistic bubble
               // and restore the input while observing the earlier Pi run.
               if(optimistic){optimistic.article.remove();optimistic=null;}
@@ -266,12 +256,21 @@
       }
       if(!queued.run_id)throw new Error('Server chưa trả về Pi run ID');
       runId=queued.run_id;
-      answerAccepted=Boolean(answerQuestion);
-      if(answerQuestion)renderPlanningQuestion(null);
+      setBusy(true,'Đang kết nối với Pi…');
+      answerAccepted=Boolean(answerQuestion&&!observing);
+      if(answerAccepted)renderPlanningQuestion(null);
+      const historyStatus=document.querySelector(`[data-run-status="${CSS.escape(runId)}"]`);
+      const showStatus=(status)=>{
+        terminalStatus=['completed','cancelled','error'].includes(status)?status:terminalStatus;
+        if(historyStatus){
+          historyStatus.textContent=status;
+          historyStatus.classList.toggle('good',status==='completed');
+        }
+      };
       const handleFrame=(ev)=>{
-        if(ev.run_id)runId=ev.run_id;
         const p=ev.payload||{};
         if(ev.type==='start'){
+          showStatus('running');
           contextWindow=Number(p.context_window)||0;
           const message=`${p.model||'Agent'} · ${p.backend||'model'}`;
           panel.summary.textContent='Hoạt động · '+message;
@@ -279,6 +278,7 @@
           addTimeline(panel.timeline,'status','Bắt đầu: '+message);
           setBusy(true,'Đang phân tích…');
         }else if(ev.type==='status'){
+          if(['queued','waiting_lock'].includes(p.phase))showStatus('queued');
           const message=String(p.message||'Đang xử lý…');
           setBusy(true,message);panel.heading.textContent=message;
           if(p.phase!==lastPhase||panel.timeline.lastElementChild?.textContent!==message){
@@ -292,11 +292,11 @@
             panel.thinking.hidden=false;
             panel.thinkingText.textContent=thinkingFull;
             panel.heading.textContent='Đang suy luận…';
-            if(!firstTokenMs)firstTokenMs=Math.round(performance.now()-started);
+            if(firstTokenMs===null)firstTokenMs=Math.round(performance.now()-started);
             if(panel.thinking.open)panel.thinkingText.scrollTop=panel.thinkingText.scrollHeight;
           }
         }else if(ev.type==='delta'){
-          if(!firstTokenMs)firstTokenMs=Math.round(performance.now()-started);
+          if(firstTokenMs===null)firstTokenMs=Math.round(performance.now()-started);
           full+=String(p.text||'');scheduleRender();
           setBusy(true,'Đang trả lời…');panel.heading.textContent='Đang viết câu trả lời…';
         }else if(ev.type==='timing'){
@@ -354,6 +354,7 @@
           turn.body.append(notice);
           addTimeline(panel.timeline,'status','Discovery kết thúc; tài liệu draft sẵn sàng review');
         }else if(ev.type==='done'){
+          showStatus('completed');
           completed=true;elapsedMs=typeof p.duration_ms==='number'?p.duration_ms:performance.now()-started;
           if(typeof p.first_token_ms==='number')firstTokenMs=p.first_token_ms;
           usage={...usage,...(p.usage||{})};
@@ -363,13 +364,13 @@
           panel.details.open=false;
           addTimeline(panel.timeline,'status','Hoàn thành');
         }else if(ev.type==='error'){
-          hadError=true;
-          throw new Error(ev.message||p.message||'Agent error');
+          showStatus(p.status==='cancelled'?'cancelled':'error');
         }
       };
       await new Promise((resolve,reject)=>{
         const url=queued.events_url||`/api/projects/${pid}/runs/${encodeURIComponent(runId)}/events`;
         const source=new EventSource(url,{withCredentials:true});
+        let lastEventId=0;
         let settled=false;
         const finish=(error)=>{
           if(settled)return;
@@ -383,13 +384,28 @@
           if(settled)return;
           try{
             const frame=JSON.parse(raw.data);
+            if(frame.run_id!==runId)return;
+            const eventId=Number(raw.lastEventId);
+            if(eventId&&eventId<=lastEventId&&frame.type!=='done'&&frame.type!=='error')return;
+            lastEventId=Math.max(lastEventId,eventId||0);
             handleFrame(frame);
             if(frame.type==='done')finish();
-            else if(frame.type==='error')finish(new Error(frame.payload?.message||'Pi run failed'));
+            else if(frame.type==='error'){
+              const error=new Error(frame.payload?.message||'Pi run failed');
+              if(terminalStatus==='cancelled')error.name='AbortError';
+              finish(error);
+            }
           }catch(e){finish(e);}
+        };
+        source.onopen=()=>{
+          if(!settled)state.textContent='Đang theo dõi Pi…';
         };
         source.onerror=()=>{
           if(settled)return;
+          if(source.readyState===EventSource.CLOSED){
+            finish(new Error('Không thể mở luồng Pi. Anh có thể thử kết nối lại.'));
+            return;
+          }
           // EventSource reconnects with Last-Event-ID, so no duplicate Pi call.
           panel.heading.textContent='Mất kết nối, đang nối lại và tải các sự kiện còn thiếu…';
           state.textContent='Đang kết nối lại…';
@@ -414,7 +430,7 @@
       // No nested request while the prior AbortController is active. Schedule
       // exactly ONE follow-up after finally clears the busy state; this avoids
       // silent `if(controller) return false` and accidental infinite loops.
-      shouldAdvance=Boolean(autoNext?.checked&&mode==='discovery'&&
+      shouldAdvance=Boolean(!observing&&autoNext?.checked&&mode==='discovery'&&
         !discoveryDone&&!advancePlanning&&!openQuestion&&!turn.body.querySelector('.planning-handoff'));
       return true;
     }catch(error){
@@ -424,13 +440,21 @@
         addTimeline(panel.timeline,'status','Người dùng dừng phản hồi');
       }else{
         if(full)flushRender();
-        if(optimistic&&!answerAccepted)optimistic.article.remove();
+        if(optimistic&&!runId)optimistic.article.remove();
+        if(message&&!runId&&!input.value.trim())input.value=message;
         panel.summary.textContent='Không hoàn thành';panel.heading.textContent='Không hoàn thành';panel.spinner.classList.add('completed');
         const msg=String(error.message||error).slice(0,400);
         addTimeline(panel.timeline,'error',msg);
         turn.content.append(make('p','turn-error','Lỗi: '+msg));
         sw.toast(msg,'error');
-        if(answerQuestion&&answerAccepted){
+        if(runId&&!terminalStatus){
+          const interruptedRun=runId;
+          turn.body.append(actionButton('Kết nối lại với Pi','btn-outline-primary',()=>{
+            if(controller)return;
+            turn.article.remove();
+            talk({resumeRunId:interruptedRun});
+          }));
+        }else if(answerQuestion&&answerAccepted){
           const retry=actionButton('Thử tiếp tục trong cùng phiên Pi','btn-outline-primary',()=>{
             retry.disabled=true;talk({continueQuestionId:answerQuestion.question.id});
           });turn.body.append(retry);
@@ -539,20 +563,17 @@
       }
     }catch(e){progressElement.textContent='Chưa tải được tiến độ: '+e.message;}
   }
-  async function refreshPlanningQuestion({allowLegacyResume=false}={}){
+  async function refreshPlanningQuestion(){
     if(!did)return;
     try{
       const data=await sw.api(`/api/projects/${pid}/planning/questions?discussion_id=${encodeURIComponent(did)}`,{},'GET');
       renderPlanningQuestion(data.pending);
-      if(allowLegacyResume&&!checkedInterruptedAnswer){
-        checkedInterruptedAnswer=true;
-        // Recover old sessions where the choice was persisted but the separate
-        // "send to AI" request never happened (v1.0.1 and earlier).
-        const recent=(data.history||[])[0];
-        const unanswered=recent?.status==='answered'&&!(recent.answer||{}).continuation_run_id?recent:null;
-        if(!data.pending&&unanswered&&!discoveryDone&&autoNext?.checked&&!controller){
-          queueMicrotask(()=>{if(!controller)talk({continueQuestionId:unanswered.id});});
-        }
+      const recent=data.history?.[0];
+      if(!data.pending&&!discoveryDone&&recent?.status==='answered'&&!recent.answer?.continuation_run_id){
+        questionSlot.hidden=false;
+        questionSlot.append(actionButton('Tiếp tục từ lựa chọn đã lưu','btn-outline-primary',()=>{
+          talk({continueQuestionId:recent.id});
+        }));
       }
     }catch(e){console.warn('Planning question unavailable:',e.message);}
   }
@@ -573,8 +594,11 @@
   document.querySelectorAll('[data-suggest]').forEach(b=>b.addEventListener('click',()=>{input.value=b.dataset.suggest;input.focus();}));
   stop?.addEventListener('click',async()=>{
     // Server-side cancellation survives browser disconnects.
-    if(runId)try{await sw.api(`/api/projects/${pid}/runs/${runId}/cancel`);}catch{}
-    controller?.abort();
+    if(!runId)return;
+    stop.disabled=true;
+    try{await sw.api(`/api/projects/${pid}/runs/${runId}/cancel`);}
+    catch(e){sw.toast(e.message,'error');}
+    finally{stop.disabled=false;}
   });
   document.getElementById('clearContextView')?.addEventListener('click',()=>followIfNearBottom(true));
   document.getElementById('newDiscussion')?.addEventListener('click',async()=>{
@@ -583,24 +607,24 @@
   });
   async function reconnectActiveRun(){
     if(!did||controller)return;
+    // Use the ID captured by the HTML even if it finished before JS loaded.
+    if(root.dataset.activeRun){
+      await talk({resumeRunId:root.dataset.activeRun});
+      return;
+    }
     setBusy(true,'Đang kiểm tra Pi run trên server…');
     try{
       const current=await sw.api(`/api/projects/${pid}/discussions/${did}/active-run`,{},'GET');
       if(current.run_id){
-        checkedInterruptedAnswer=true; // F5 is a subscriber, never a new prompt.
         await talk({resumeRunId:current.run_id});
         return;
       }
       setBusy(false);
-      // Recover an old interrupted answer only after the server positively
-      // confirms there is NO queued/running run for this discussion.
-      await refreshPlanningQuestion({allowLegacyResume:true});
+      await refreshPlanningQuestion();
     }catch(e){
       console.warn('Pi run reconnect:',e.message);
-      setBusy(false);
-      // If the check failed, DO NOT guess that the session is idle or enqueue
-      // a replacement run; only show existing pending questions.
-      await refreshPlanningQuestion({allowLegacyResume:false});
+      setBusy(false,'Chưa kiểm tra được trạng thái Pi');
+      sw.toast(e.message,'error');
     }
   }
   list.scrollTop=list.scrollHeight;

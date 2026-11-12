@@ -6,28 +6,32 @@ worker does not blindly retry a potentially already-executed Pi prompt.
 """
 import asyncio
 import json
+import os
 import socket
 import uuid
+from contextlib import aclosing
 from datetime import timedelta
+from fastapi import HTTPException
 from sqlalchemy import or_
 
-from db import SessionLocal, AgentRun, ChatStreamEvent, PlanningQuestion, utcnow
+from chat_coordination import clear_chat_continuation
+from db import SessionLocal, AgentRun, ChatStreamEvent, utcnow
 
 WORKER_ID = 'chat-'+socket.gethostname()[:30]+'-'+uuid.uuid4().hex[:10]
 LEASE_SECONDS=180
-TERMINAL={'completed','error','cancelled'}
+CONCURRENCY=4
 
 
 def record(db, run_id: str, event: dict):
-    if not isinstance(event,dict):
-        return
+    run=db.get(AgentRun,run_id,with_for_update=True)
+    if not run or run.status!='running' or run.worker_owner!=WORKER_ID:
+        return False
     # Store all actual Pi events for replay. Never store credentials or tool
     # capability headers here (these are not part of forwarded chat frames).
     db.add(ChatStreamEvent(run_id=run_id,event=event,created_at=utcnow()))
-    run=db.get(AgentRun,run_id)
-    if run and run.status=='running':
-        run.lease_expires_at=utcnow()+timedelta(seconds=LEASE_SECONDS)
+    run.lease_expires_at=utcnow()+timedelta(seconds=LEASE_SECONDS)
     db.commit()
+    return True
 
 
 def fail_run(db, run: AgentRun, message: str):
@@ -36,12 +40,7 @@ def fail_run(db, run: AgentRun, message: str):
     run.finished_at=utcnow()
     run.worker_owner=None
     run.lease_expires_at=None
-    request=run.request_payload or {}
-    question_id=request.get('continue_question_id')
-    if question_id:
-        q=db.get(PlanningQuestion,question_id)
-        if q and (q.answer or {}).get('continuation_run_id')==run.id:
-            q.answer={k:v for k,v in q.answer.items() if k!='continuation_run_id'}
+    clear_chat_continuation(db,run)
     db.add(ChatStreamEvent(run_id=run.id,event={
         'type':'error','run_id':run.id,'payload':{'message':str(message)[:500]}},created_at=utcnow()))
     db.commit()
@@ -54,9 +53,9 @@ def claim_next():
         # a Pi prompt that may have completed inside the Pi Host already.
         stale=(db.query(AgentRun).filter(AgentRun.status=='running',
             AgentRun.worker_owner.isnot(None),AgentRun.lease_expires_at < now)
-            .with_for_update(skip_locked=True).limit(10).all())
-        for run in stale:
-            fail_run(db,run,'Worker mất kết nối; phiên Pi có thể vẫn đang chạy. Kiểm tra trạng thái trước khi gửi lại.')
+            .with_for_update(skip_locked=True).first())
+        if stale:
+            fail_run(db,stale,'Worker mất kết nối; phiên Pi có thể vẫn đang chạy. Kiểm tra trạng thái trước khi gửi lại.')
         row=(db.query(AgentRun).filter(AgentRun.status=='queued')
             # Requeued jobs back off until the prior Pi session releases its
             # advisory lock; they must not spin or be treated as failures.
@@ -80,7 +79,7 @@ async def process_queued_run(run_id: str):
     from db import Project, User
     with SessionLocal() as db:
         run=db.get(AgentRun,run_id)
-        if not run or run.status!='running':return
+        if not run or run.status!='running' or run.worker_owner!=WORKER_ID:return
         project=db.get(Project,run.project_id)
         actor=db.get(User,run.requester_id) if run.requester_id else None
         if not project or not actor or not actor.enabled:
@@ -96,39 +95,40 @@ async def process_queued_run(run_id: str):
         try:
             response=await _chat_stream_impl(run.project_id,db,actor,project,
                 run.request_payload or {},existing_run_id=run_id)
-            async for chunk in response.body_iterator:
-                if isinstance(chunk,bytes):chunk=chunk.decode('utf-8','replace')
-                for line in str(chunk).splitlines():
-                    if not line.startswith('data: '):continue
-                    try:event=json.loads(line[6:])
-                    except ValueError:continue
+            async with aclosing(response.body_iterator) as frames:
+                async for frame in frames:
+                    event=json.loads(frame.removeprefix('data: '))
+                    # The producer commits these with their run state. A
+                    # subscriber must never see terminal state before the event.
+                    if event['type'] in ('done','error'):
+                        continue
                     with SessionLocal() as events_db:
-                        record(events_db,run_id,event)
+                        if not record(events_db,run_id,event):
+                            break
         except BaseException as exc:
             # Catch worker cancellation only to mark durable state, then let the
             # worker shutdown; don't silently re-run a possibly completed prompt.
             with SessionLocal() as err_db:
-                current=err_db.get(AgentRun,run_id)
-                if current and current.status not in TERMINAL:
-                    fail_run(err_db,current,'Pi background run interrupted ('+type(exc).__name__+')')
+                current=err_db.get(AgentRun,run_id,with_for_update=True)
+                if current and current.status=='running' and current.worker_owner==WORKER_ID:
+                    detail=(exc.detail if isinstance(exc,HTTPException) else
+                            'Pi background run interrupted ('+type(exc).__name__+')')
+                    fail_run(err_db,current,detail)
             if isinstance(exc,asyncio.CancelledError):raise
             return
     with SessionLocal() as db:
-        run=db.get(AgentRun,run_id)
-        if run and run.status=='queued':
-            # Expected advisory-lock contention. Nothing was sent to Pi; the
-            # same run ID will be retried after its lease backoff.
-            return
-        if run and run.status not in TERMINAL:
+        run=db.get(AgentRun,run_id,with_for_update=True)
+        if run and run.status=='running' and run.worker_owner==WORKER_ID:
             fail_run(db,run,'Pi stream ended without a terminal result')
-        elif run:
-            run.worker_owner=None
-            run.lease_expires_at=None
-            db.commit()
 
 
 async def chat_worker_main():
-    print('[chat-worker] running with durable PostgreSQL queue',flush=True)
+    slots=max(1,min(int(os.getenv('SPECWEAVE_CHAT_CONCURRENCY',CONCURRENCY)),16))
+    print(f'[chat-worker] running with {slots} chat slots',flush=True)
+    await asyncio.gather(*(_chat_worker_slot() for _ in range(slots)))
+
+
+async def _chat_worker_slot():
     while True:
         try:
             run_id=claim_next()

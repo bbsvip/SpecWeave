@@ -41,20 +41,12 @@ jobs:
           node --test tests/test_openai_oauth_contract.mjs tests/test_pi_native_host.mjs
 
   publish:
-    name: Publish ${{ matrix.component }} (amd64)
+    name: Publish web (amd64)
     needs: validate
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - component: web
-            dockerfile: Dockerfile
-          - component: pi
-            dockerfile: Dockerfile.runner
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -67,7 +59,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ steps.names.outputs.repo }}-${{ matrix.component }}
+          images: ghcr.io/${{ steps.names.outputs.repo }}-web
           flavor: |
             latest=false
           tags: |
@@ -77,7 +69,7 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.description=SpecWeave ${{ matrix.component }} service
+            org.opencontainers.image.description=SpecWeave web service
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4
       - name: Log in to GHCR
@@ -90,10 +82,10 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: ./${{ matrix.dockerfile }}
+          file: ./Dockerfile
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=specweave-${{ matrix.component }}
-          cache-to: type=gha,scope=specweave-${{ matrix.component }},mode=max
+          cache-from: type=gha,scope=specweave-web
+          cache-to: type=gha,scope=specweave-web,mode=max

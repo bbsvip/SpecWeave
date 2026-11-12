@@ -7,6 +7,7 @@ import {join,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:net';
+import {once} from 'node:events';
 const root=resolve(fileURLToPath(new URL('..',import.meta.url)));
 const PID='123e4567-e89b-42d3-a456-426614174000';
 const DID='123e4567-e89b-42d3-a456-426614174001';
@@ -21,17 +22,25 @@ export function defineTool(tool){return tool;}
 export async function createAgentSession(options){
  if(!['builtin','all'].includes(options.noTools))throw Error('Unsafe builtin tools');
  if(options.tools?.length)throw Error('Unsafe tool allowlist');
- const listeners=[];
- const session={messages:[],setThinkingLevel:()=>{},dispose:()=>{},abort:async()=>{},
-   subscribe(cb){listeners.push(cb);return()=>{}},
+ const listeners=new Set();
+ let beforeStart, release, aborted=false;
+ for(const factory of options.resourceLoader.options.extensionFactories||[]){
+   factory({on(name,handler){if(name==='before_agent_start')beforeStart=handler}});
+ }
+ const session={messages:[],setThinkingLevel:()=>{},dispose:()=>{},abort:async()=>{aborted=true;release?.()},
+   subscribe(cb){listeners.add(cb);return()=>listeners.delete(cb)},
    async prompt(user){
+     aborted=false;
      const emit=e=>listeners.forEach(fn=>fn(e));
      emit({type:'agent_start'});
+     if(user==='hold')await new Promise(resolve=>{release=resolve});
+     if(aborted)return;
      emit({type:'message_update',assistantMessageEvent:{type:'thinking_delta',delta:'Considering the request.'}});
      if(options.customTools.length){emit({type:'tool_execution_start',toolName:'search_web',toolCallId:'call1',args:{query:'a'}});
        emit({type:'tool_execution_end',toolName:'search_web',toolCallId:'call1',result:{ok:true}});}
-     emit({type:'message_update',assistantMessageEvent:{type:'text_delta',delta:'Native Pi output'}});
-     const message={role:'assistant',content:[{type:'text',text:'Native Pi output'}],usage:{input:12,output:4}};
+     const text=user==='report'?'Turn '+(session.messages.length+1)+': '+beforeStart().systemPrompt:'Native Pi output';
+     emit({type:'message_update',assistantMessageEvent:{type:'text_delta',delta:text}});
+     const message={role:'assistant',content:[{type:'text',text}],usage:{input:12,output:4}};
      session.messages.push(message);emit({type:'message_end',message});emit({type:'agent_settled'});
    },getLastAssistantText:()=> 'Native Pi output'};
  return {session};
@@ -66,6 +75,14 @@ const requestData={project_id:PID,discussion_id:DID,run_id:RID,tool_token:'a'.re
  auth_mode:'api_key',provider_base:'http://example.invalid/v1',provider_key:'not-a-real-key',
  model_id:'local-model',system_context:'System planning context',thinking:'high',message:'Plan this project.'};
 const post=(base,path,body,secret=SECRET)=>fetch(base+path,{method:'POST',headers:{'x-runner-key':secret,'content-type':'application/json'},body:JSON.stringify(body)});
+async function stopSandbox({child,dir}){
+ if(child.exitCode===null&&child.signalCode===null){
+   const stopped=once(child,'exit');
+   child.kill('SIGTERM');
+   await stopped;
+ }
+ await rm(dir,{recursive:true,force:true,maxRetries:5});
+}
 test('Pi Host handles chat and planning through same SDK and exposes native SSE',async()=>{
  const x=await startSandbox();
  try{
@@ -83,5 +100,27 @@ test('Pi Host handles chat and planning through same SDK and exposes native SSE'
    assert.match(stream,/"type":"final"/);assert.match(stream,/Native Pi output/);
    assert.equal((await post(x.base,'/run',{...requestData,project_id:'../x'})).status,422);
    assert.equal((await post(x.base,'/oauth/openai/start',{})).status,503);
- }finally{x.child.kill('SIGTERM');await rm(x.dir,{recursive:true,force:true});}
+ }finally{await stopSandbox(x);}
+});
+
+test('Pi sessions run independently, keep history, and refresh context for each turn',async()=>{
+ const x=await startSandbox();
+ try{
+   const held=await post(x.base,'/run',{...requestData,message:'hold'});
+   assert.equal(held.status,200);
+   const other={...requestData,discussion_id:'123e4567-e89b-42d3-a456-426614174010',
+     run_id:'123e4567-e89b-42d3-a456-426614174011',message:'report',system_context:'Context B'};
+   const busy=await post(x.base,'/run',{...requestData,run_id:other.run_id});
+   assert.equal(busy.status,409);
+   assert.equal((await busy.json()).code,'PI_SESSION_BUSY');
+   const parallel=await post(x.base,'/run',other);
+   assert.match(await parallel.text(),/Turn 1: Context B/);
+   assert.equal((await post(x.base,'/abort',{...other,discussion_id:DID})).status,404);
+   assert.equal((await post(x.base,'/abort',requestData)).status,200);
+   assert.match(await held.text(),/Pi run cancelled/);
+   const first=await post(x.base,'/run',{...requestData,message:'report',system_context:'Context A'});
+   assert.match(await first.text(),/Turn 1: Context A/);
+   const next=await post(x.base,'/run',{...other,message:'report',system_context:'Updated context B'});
+   assert.match(await next.text(),/Turn 2: Updated context B/);
+ }finally{await stopSandbox(x);}
 });

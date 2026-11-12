@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 from contextlib import asynccontextmanager
 from sqlalchemy import text
-from db import engine, SessionLocal, AgentRun
+from db import engine, SessionLocal, AgentRun, PlanningQuestion
 
 LOCAL_LOCKS = {}
 
@@ -14,6 +14,9 @@ def lock_key(discussion_id: str) -> int:
     return int.from_bytes(hashlib.sha256(('specweave-chat:' + discussion_id).encode()).digest()[:8], 'big', signed=True)
 
 class ChatBusy(Exception):
+    pass
+
+class ChatStopped(Exception):
     pass
 
 @asynccontextmanager
@@ -53,4 +56,12 @@ async def discussion_lease(discussion_id: str):
 def cancellation_requested(run_id: str) -> bool:
     with SessionLocal() as db:
         run = db.get(AgentRun, run_id)
-        return run is None or bool(run.cancel_requested) or run.status == 'cancelled'
+        return run is None or bool(run.cancel_requested) or run.status != 'running'
+
+
+def clear_chat_continuation(db, run):
+    question_id=(run.request_payload or {}).get('continue_question_id')
+    if question_id:
+        question=db.get(PlanningQuestion,question_id)
+        if question and (question.answer or {}).get('continuation_run_id')==run.id:
+            question.answer={k:v for k,v in question.answer.items() if k!='continuation_run_id'}

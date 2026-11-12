@@ -50,11 +50,12 @@ TOOLS = [
  {"type":"function","function":{"name":"propose_memory","description":"Write a compact proposed memory note. Never overwrite confirmed project facts.","parameters":{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}}},
 ]
 
-def plan_prompt(project, db, role, mode):
+def plan_prompt(project, db, role, mode, *, discussion_id):
     data = json.dumps(project.profile or {}, ensure_ascii=False)[:11000]
     choices = db.query(Decision).filter_by(project_id=project.id, status="approved").limit(25).all()
     decided = "\n".join(f"- {d.title}: {d.description[:500]}" for d in choices)
-    latest_questions = db.query(PlanningQuestion).filter_by(project_id=project.id).order_by(PlanningQuestion.created_at.desc()).limit(12).all()
+    latest_questions = (db.query(PlanningQuestion).filter_by(project_id=project.id,discussion_id=discussion_id)
+                        .order_by(PlanningQuestion.created_at.desc()).limit(12).all())
     answered = "\n".join(f"- {q.question[:200]} => {str(q.answer)[:600]} [{q.status}]" for q in latest_questions)
     sources = db.query(ResearchItem).filter_by(project_id=project.id).order_by(ResearchItem.created_at.desc()).limit(6).all()
     research_summary = "\n".join(f"- {r.title[:100]} | {r.url[:500]} | {r.snippet[:250]}" for r in sources)
@@ -220,8 +221,9 @@ async def pi_stream(project, discussion, db, model, *, role, mode, run_id, actor
     payload={
         'project_id':project.id,'discussion_id':discussion.id,'run_id':run_id,
         'tool_token':pi_tool_token(run.id,run.project_id,run.discussion_id,run.created_at),
-        'message':prompt,'system_context':plan_prompt(project,db,role,mode),
-        'bootstrap_history':[{'role':x.role,'content':x.content[:1800]} for x in history[:-1]],
+        'message':prompt,'system_context':plan_prompt(project,db,role,mode,discussion_id=discussion.id),
+        'bootstrap_history':[{'role':x.role,'content':x.content[:1800]}
+                             for x in (history if prompt_override is not None else history[:-1])],
     }
     async for kind, content in stream(project,model,actor_id,payload):
         yield kind,content

@@ -1066,7 +1066,7 @@ async def test_pi_tool_bridge_caps_and_project_scope(client, monkeypatch):
 
 def test_pi_runner_has_custom_only_allowlist_and_project_restricted_env():
     """Pi SDK is the only agent; no built-in shell or independent completion loop."""
-    host=(ROOT/'source/pi_host.mjs').read_text()
+    host=(ROOT/'source/pi_host.mjs').read_text(encoding='utf-8')
     tools=(ROOT/'source/pi_host_tools.mjs').read_text()
     ai=(ROOT/'source/ai.py').read_text()
     assert 'createAgentSession(' in host and 'SessionManager.continueRecent' in host
@@ -1075,7 +1075,7 @@ def test_pi_runner_has_custom_only_allowlist_and_project_restricted_env():
     assert 'X-Specweave-Token' in tools and 'X-Specweave-Run' in tools
     assert 'propose_planning_question' in tools and 'tool_token' in ai
     assert 'compatible_stream' not in ai
-    assert 'pi --mode rpc' not in (ROOT/'Dockerfile.runner').read_text()
+    assert 'pi --mode rpc' not in (ROOT/'Dockerfile').read_text(encoding='utf-8')
 
 
 @pytest.mark.asyncio
@@ -1654,9 +1654,11 @@ def test_usage_normalization_distinguishes_provider_from_estimates():
 
 
 @pytest.mark.asyncio
-async def test_pi_sdk_stream_forwards_native_events(client,monkeypatch):
+@pytest.mark.parametrize('include_final',[True,False])
+async def test_pi_sdk_stream_forwards_native_events(client,monkeypatch,include_final):
     import pi_client
     import httpx
+    from fastapi import HTTPException
     csrf=auth(client)
     provider=client.post('/api/providers',headers=csrf,json={
         'name':'Native Pi Stream','base_url':'http://model.internal/v1','api_key':'x'}).json()['id']
@@ -1670,8 +1672,9 @@ async def test_pi_sdk_stream_forwards_native_events(client,monkeypatch):
         packets=[{'type':'thinking','payload':{'text':'Available model reasoning'}},
                  {'type':'tool','payload':{'name':'search_web','status':'complete'}},
                  {'type':'delta','payload':{'text':'Hello'}},
-                 {'type':'usage','payload':{'source':'pi','input_tokens':99,'output_tokens':7}},
-                 {'type':'final','payload':{'text':'Hello'}}]
+                 {'type':'usage','payload':{'source':'pi','input_tokens':99,'output_tokens':7}}]
+        if include_final:
+            packets.append({'type':'final','payload':{'text':'Hello'}})
         data=''.join('data: '+json.dumps(x)+'\n\n' for x in packets)
         return httpx.Response(200,content=data,headers={'Content-Type':'text/event-stream'})
     real=httpx.AsyncClient
@@ -1680,6 +1683,10 @@ async def test_pi_sdk_stream_forwards_native_events(client,monkeypatch):
     with SessionLocal() as db_session:
         project=db_session.get(Project,pid)
         model=db_session.query(Model).filter_by(model_id='pi-model').one()
+        if not include_final:
+            with pytest.raises(HTTPException,match='ended before a final event'):
+                _=[x async for x in pi_client.stream(project,model,None,{'message':'Hi','run_id':'run'})]
+            return
         events=[x async for x in pi_client.stream(project,model,None,{'message':'Hi','run_id':'run'})]
     assert ('delta',{'text':'Hello'}) in events
     assert events[-1]==('final',{'text':'Hello'})

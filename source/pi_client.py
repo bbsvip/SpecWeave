@@ -4,6 +4,7 @@ This module does not assemble an agent, call LLM APIs or implement a tool loop.
 import json
 import httpx
 from fastapi import HTTPException
+from chat_coordination import ChatBusy
 from security import decrypt
 from openai_oauth_gateway import require_access, runner_config
 
@@ -50,13 +51,23 @@ async def stream(project, model, actor_id, payload):
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(540,connect=15,read=540),trust_env=False) as client:
             async with client.stream('POST',url+'/run',json=payload,headers=headers) as response:
+                if response.status_code==409:
+                    await response.aread()
+                    try: code=response.json().get('code')
+                    except (ValueError, AttributeError): code=None
+                    if code=='PI_SESSION_BUSY':
+                        raise ChatBusy()
                 response.raise_for_status()
                 async for line in response.aiter_lines():
                     if not line.startswith('data: '):continue
                     try: event=json.loads(line[6:])
                     except ValueError:continue
                     if isinstance(event,dict) and isinstance(event.get('payload'),dict):
-                        yield event.get('type','status'),event['payload']
+                        kind=event.get('type','status')
+                        yield kind,event['payload']
+                        if kind in ('final','error'):
+                            return
+                raise HTTPException(502,'Pi Agent Host stream ended before a final event')
     except httpx.HTTPStatusError as exc:
         raise HTTPException(502,f'Pi Agent Host rejected run (HTTP {exc.response.status_code})') from exc
     except httpx.HTTPError as exc:

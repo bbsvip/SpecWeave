@@ -10,7 +10,7 @@ import shutil
 import hashlib
 import hmac
 import zipfile
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -44,7 +44,7 @@ from planning_engine import (STEPS, SOURCE_KINDS, VERIFY_STATES, stage_current, 
                              quality_export, adversarial_review)
 from review_queue import create_review_job, job_payload, TERMINAL
 from provider_management import owned_provider, impact as provider_impact, delete_provider as perform_provider_deletion, delete_models as perform_model_deletion
-from chat_coordination import discussion_lease, ChatBusy, cancellation_requested
+from chat_coordination import discussion_lease, ChatBusy, ChatStopped, cancellation_requested, clear_chat_continuation
 from chat_content import parse_model_response
 from chat_events import with_heartbeat
 
@@ -1149,7 +1149,7 @@ async def suggest_planning_question(pid:str,request:Request,db:Session=Depends(g
         raise HTTPException(409,"Hãy chọn model hoạt động trong Project Settings")
     openai_oauth_access(pr,model,u.id)
     history=db.query(Message).filter_by(discussion_id=did).order_by(Message.created_at.desc()).limit(10).all()[::-1]
-    system=plan_prompt(pr,db,"analyst","discovery")+"\n"+QUESTION_JSON_INSTRUCTIONS
+    system=plan_prompt(pr,db,"analyst","discovery",discussion_id=did)+"\n"+QUESTION_JSON_INSTRUCTIONS
     messages=[{"role":"system","content":system}]
     messages += [{"role":m.role,"content":m.content[:2500]} for m in history]
     messages.append({"role":"user","content":"Đọc hồ sơ dự án và đề xuất câu hỏi QUAN TRỌNG NHẤT chưa được trả lời. Kèm 2-4 phương án có phân tích và một đề xuất mặc định. Chỉ trả JSON."})
@@ -1173,6 +1173,12 @@ async def suggest_planning_question(pid:str,request:Request,db:Session=Depends(g
         raise HTTPException(502,"Không tạo được phương án có cấu trúc từ model. Hãy thử model khác hoặc tiếp tục chat.") from exc
 
 # ------------------------ Discussions & Agent ------------------------
+def find_active_chat_run(db, pid, did):
+    return (db.query(AgentRun).filter_by(project_id=pid,discussion_id=did)
+            .filter(AgentRun.status.in_(['queued','running']))
+            .order_by(AgentRun.created_at.desc(), AgentRun.id.desc()).first())
+
+
 @app.get("/projects/{pid}/discussion",response_class=HTMLResponse)
 def discussion_page(pid:str,request:Request,did:str="",db:Session=Depends(get_db)):
     u,s,redirect=auth_page(request,db)
@@ -1181,15 +1187,23 @@ def discussion_page(pid:str,request:Request,did:str="",db:Session=Depends(get_db
     discussions=db.query(Discussion).filter_by(project_id=pid).order_by(Discussion.created_at.asc()).all()
     selected=db.get(Discussion,did) if did else (discussions[0] if discussions else None)
     if selected and selected.project_id!=pid:raise HTTPException(404,"Discussion not found")
+    active_run=find_active_chat_run(db,pid,selected.id) if selected else None
     messages=(db.query(Message).filter_by(discussion_id=selected.id)
               .order_by(Message.created_at.desc()).limit(120).all()[::-1]) if selected else []
+    if active_run:
+        # This run may finish between the two reads. Replay owns its assistant
+        # response on this page, so do not render a second copy from history.
+        messages=[m for m in messages if not (m.run_id==active_run.id and m.role=='assistant')]
     trace_runs={r.id:r for r in (db.query(AgentRun).filter(AgentRun.id.in_([m.run_id for m in messages if m.run_id])).all()
                                   if any(m.run_id for m in messages) else [])}
     models=db.query(Model).join(Provider).filter(Model.enabled==True,Provider.enabled==True).all()
     runs=(db.query(AgentRun).filter_by(project_id=pid,discussion_id=selected.id)
           .order_by(AgentRun.created_at.desc()).limit(7).all()) if selected else []
-    return page(request,"discussion.html",db=db,user=u,session=s,pr=pr,discussions=discussions,discussion=selected,messages=messages,
-                models=models,runs=runs,trace_runs=trace_runs,modes=MODES,roles=ROLES,active="discussion")
+    response=page(request,"discussion.html",db=db,user=u,session=s,pr=pr,discussions=discussions,discussion=selected,messages=messages,
+                models=models,runs=runs,trace_runs=trace_runs,active_run=active_run,
+                modes=MODES,roles=ROLES,active="discussion")
+    response.headers['Cache-Control']='no-store'
+    return response
 
 @app.post("/api/projects/{pid}/discussions")
 async def new_discussion(pid:str,request:Request,db:Session=Depends(get_db)):
@@ -1239,13 +1253,12 @@ async def answer_and_start(pid:str,qid:str,request:Request,db:Session=Depends(ge
 
 
 @app.get("/api/projects/{pid}/discussions/{did}/active-run")
-def active_discussion_run(pid:str,did:str,request:Request,db:Session=Depends(get_db)):
+def active_discussion_run(pid:str,did:str,request:Request,response:Response,db:Session=Depends(get_db)):
     u,s=api_guard(request,db);acl(db,pid,u)
     d=db.get(Discussion,did)
     if not d or d.project_id!=pid:raise HTTPException(404,'Discussion not found')
-    run=(db.query(AgentRun).filter_by(project_id=pid,discussion_id=did)
-        .filter(AgentRun.status.in_(['queued','running']))
-        .order_by(AgentRun.created_at.desc()).first())
+    run=find_active_chat_run(db,pid,did)
+    response.headers['Cache-Control']='no-store'
     return {'run_id':run.id,'status':run.status} if run else {'run_id':None,'status':'idle'}
 
 
@@ -1256,11 +1269,12 @@ def detached_run_events(pid:str,run_id:str,request:Request,after:int=0,db:Sessio
     run=db.get(AgentRun,run_id)
     if not run or run.project_id!=pid:raise HTTPException(404,'Run not found')
     header=request.headers.get('last-event-id','')
-    if header.isdigit():after=max(after,int(header))
+    if len(header)<=10 and header.isascii() and header.isdigit():after=max(after,int(header))
     after=max(0,min(after,2147483647))
     # Revalidate access periodically even on a long-lived SSE connection.
     subscriber_id=u.id
     subscriber_session_id=s.id
+    db.close()
     async def frames():
         cursor=after
         last_heartbeat=time.monotonic()
@@ -1273,20 +1287,26 @@ def detached_run_events(pid:str,run_id:str,request:Request,after:int=0,db:Sessio
                     auth_session=authdb.get(AuthSession,subscriber_session_id)
                     target=authdb.get(Project,pid)
                     member=(authdb.query(Membership.id).filter_by(project_id=pid,user_id=subscriber_id).first())
-                    allowed=(bool(viewer and viewer.enabled and auth_session and
-                        auth_session.revoked_at is None and target and target.status!='deleted' and
+                    allowed=(bool(viewer and viewer.enabled and not viewer.must_change_password and auth_session and
+                        auth_session.revoked_at is None and auth_session.expires_at>=utcnow() and
+                        target and target.status!='deleted' and
                         (target.owner_id==subscriber_id or member)))
                 if not allowed:break
                 last_acl=time.monotonic()
             with SessionLocal() as conn:
+                # Read status first. A terminal status and its durable frame
+                # are committed together, and the next query must see that frame.
+                latest=conn.get(AgentRun,run_id)
+                if not latest:return
+                status=latest.status
                 rows=(conn.query(ChatStreamEvent)
                     .filter(ChatStreamEvent.run_id==run_id,ChatStreamEvent.id>cursor)
                     .order_by(ChatStreamEvent.id).limit(150).all())
-                status=conn.get(AgentRun,run_id).status
                 entries=[(row.id,row.event) for row in rows]
             for seq,event in entries:
                 cursor=seq
                 yield 'id: '+str(seq)+'\ndata: '+json.dumps(event,ensure_ascii=False)+'\n\n'
+                if event.get('type') in ('done','error'):return
             if entries:
                 last_heartbeat=time.monotonic()
                 continue
@@ -1295,12 +1315,17 @@ def detached_run_events(pid:str,run_id:str,request:Request,after:int=0,db:Sessio
                 with SessionLocal() as conn:
                     tail=(conn.query(ChatStreamEvent).filter_by(run_id=run_id)
                           .order_by(ChatStreamEvent.id.desc()).first())
-                    latest=conn.get(AgentRun,run_id)
+                    assistant=(conn.query(Message).filter_by(run_id=run_id,role='assistant').first()
+                               if status=='completed' else None)
                 if not tail or tail.event.get('type') not in ('done','error'):
                     if status=='completed':
-                        event={'type':'done','run_id':run_id,'payload':{'duration_ms':latest.duration_ms,'usage':latest.usage or {}}}
+                        if assistant:
+                            final={'type':'final','run_id':run_id,'payload':{'text':assistant.content}}
+                            yield 'id:\ndata: '+json.dumps(final,ensure_ascii=False)+'\n\n'
+                        event={'type':'done','run_id':run_id,'payload':{'duration_ms':latest.duration_ms,
+                               'first_token_ms':latest.first_token_ms,'usage':latest.usage or {}}}
                     else:
-                        event={'type':'error','run_id':run_id,'payload':{'message':latest.error or status}}
+                        event={'type':'error','run_id':run_id,'payload':{'message':latest.error or status,'status':status}}
                     yield 'data: '+json.dumps(event,ensure_ascii=False)+'\n\n'
                 break
             if time.monotonic()-last_heartbeat>=12:
@@ -1308,7 +1333,7 @@ def detached_run_events(pid:str,run_id:str,request:Request,after:int=0,db:Sessio
                 last_heartbeat=time.monotonic()
             await asyncio.sleep(.35)
     return StreamingResponse(frames(),media_type='text/event-stream',headers={
-        'Cache-Control':'no-cache, no-transform','X-Accel-Buffering':'no'})
+        'Cache-Control':'no-store, no-transform','X-Accel-Buffering':'no'})
 
 
 @app.post("/api/projects/{pid}/planning/questions/{qid}/answer-stream")
@@ -1363,6 +1388,8 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
             raise HTTPException(409,'Hãy trả lời câu hỏi đang chờ trước')
         if (pr.profile or {}).get('_discovery',{}).get('status')=='draft_ready':
             raise HTTPException(409,'Discovery đã hoàn tất; xem tài liệu draft')
+    if queue_only:
+        lock_project_write(db,pid)
     if continue_qid:
         if content:
             raise HTTPException(422, 'Continuation cannot include a second user message')
@@ -1382,7 +1409,6 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
     if queue_only:
         # Serialize enqueue by project row. Only one pending/running Pi run per
         # discussion: prevents double clicks and cross-worker race conditions.
-        lock_project_write(db,pid)
         busy=(db.query(AgentRun).filter_by(project_id=pid,discussion_id=did)
               .filter(AgentRun.status.in_(['queued','running'])).first())
         if busy:raise HTTPException(409,'Phiên đang có Pi run; hãy theo dõi run hiện tại')
@@ -1406,9 +1432,29 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
         return {'run_id':run_id,'status':'queued','events_url':f'/api/projects/{pid}/runs/{run_id}/events'}
     backend='pi'
     actor_id=u.id
+    worker_owner=run.worker_owner
+
+    def locked_run(sdb):
+        current=sdb.get(AgentRun,run_id,populate_existing=True,with_for_update=True)
+        if current and current.status=='running' and current.worker_owner==worker_owner:
+            return current
+        return None
+
+    def frame(kind,payload,**extra):
+        return {'type':kind,'payload':payload,'run_id':run_id,**extra}
+
+    def wire(event):
+        return 'data: '+json.dumps(event,ensure_ascii=False)+'\n\n'
+
+    def finish(sdb,current,event):
+        if existing_run_id:
+            current.worker_owner=None
+            current.lease_expires_at=None
+            sdb.add(ChatStreamEvent(run_id=run_id,event=event))
+        sdb.commit()
+        return wire(event)
 
     async def produce():
-        full=[];completed=False
         with SessionLocal() as sdb:
             p=sdb.get(Project,pid);d=sdb.get(Discussion,did);m=sdb.get(Model,p.active_model_id)
             try:
@@ -1416,42 +1462,29 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
                     if content and not sdb.query(Message).filter_by(discussion_id=did,run_id=run_id,role='user').first():
                         sdb.add(Message(discussion_id=did,role="user",content=content,run_id=run_id))
                         sdb.commit()
-                    async for event in produce_locked(sdb, p, d, m):
-                        yield event
+                    async with aclosing(produce_locked(sdb,p,d,m)) as events:
+                        async for event in events:
+                            yield event
             except ChatBusy:
                 # A previous Pi run may have committed its terminal status while
                 # still holding the advisory lock. Do NOT fail the next run: the
                 # user has already submitted it and the Pi prompt has not run.
-                if existing_run_id:
-                    obj=sdb.get(AgentRun,run_id)
-                    if obj and obj.status=='running' and not obj.cancel_requested:
-                        obj.status='queued'
-                        obj.worker_owner=None
-                        obj.lease_expires_at=utcnow()+timedelta(seconds=3)
-                        sdb.commit()
-                        yield 'data: '+json.dumps({'type':'status','run_id':run_id,
-                            'payload':{'phase':'waiting_lock',
-                                       'message':'Pi đang hoàn tất lượt trước; tự chờ để tiếp tục…'}},
-                            ensure_ascii=False)+'\n\n'
-                        return
-                obj=sdb.get(AgentRun,run_id)
-                if existing_run_id and obj and obj.cancel_requested:
-                    obj.status='cancelled';obj.finished_at=utcnow()
-                    obj.worker_owner=None;obj.lease_expires_at=None
-                    sdb.commit()
-                    yield 'data: '+json.dumps({'type':'error','run_id':run_id,
-                        'payload':{'message':'Đã hủy lượt Pi'}},ensure_ascii=False)+'\n\n'
+                obj=locked_run(sdb)
+                if not obj:
                     return
-                # Preserve the legacy attached-stream behavior.
-                if obj and obj.status=='running':
-                    obj.status='error';obj.error='Another chat is running';obj.finished_at=utcnow()
-                    if continue_qid:
-                        answer=sdb.get(PlanningQuestion,continue_qid)
-                        if answer and (answer.answer or {}).get('continuation_run_id')==run_id:
-                            answer.answer={k:v for k,v in answer.answer.items() if k!='continuation_run_id'}
+                if existing_run_id and not obj.cancel_requested:
+                    obj.status='queued'
+                    obj.worker_owner=None
+                    obj.lease_expires_at=utcnow()+timedelta(seconds=3)
+                    sdb.add(ChatStreamEvent(run_id=run_id,event=frame('status',{'phase':'waiting_lock',
+                        'message':'Pi đang hoàn tất lượt trước; tự chờ để tiếp tục…'})))
                     sdb.commit()
-                yield 'data: '+json.dumps({'type':'error','run_id':run_id,
-                    'payload':{'message':'Một lượt thảo luận đang chạy'}},ensure_ascii=False)+'\n\n' 
+                    return
+                message='Đã hủy lượt Pi' if obj.cancel_requested else 'Một lượt thảo luận đang chạy'
+                obj.status='cancelled' if obj.cancel_requested else 'error'
+                obj.error=message;obj.finished_at=utcnow()
+                clear_chat_continuation(sdb,obj)
+                yield finish(sdb,obj,frame('error',{'message':message,'status':obj.status}))
 
     async def produce_locked(sdb,p,d,m):
         full=[]
@@ -1461,8 +1494,10 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
         usage={}
         thinking_trace=None
         def emit(event_type,payload=None,**extra):
-            return 'data: '+json.dumps({'type':event_type,'payload':payload or {},'run_id':run_id,**extra},ensure_ascii=False)+'\n\n'
+            return wire(frame(event_type,payload or {},**extra))
         try:
+            if cancellation_requested(run_id):
+                raise ChatStopped()
             yield emit('start',{'model':m.model_id,'backend':backend,'context_window':m.context_window,
                                 'continued':bool(continue_qid),'automatic':advance})
             yield emit('status',{'phase':'request','message':'Pi đang tiếp nhận ngữ cảnh dự án…'})
@@ -1480,43 +1515,44 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
             if advance:
                 pi_kwargs['prompt_override']=advance_prompt
             stream=pi_stream(p,d,sdb,m,**pi_kwargs)
-            async for typ,payload in with_heartbeat(stream):
-                if cancellation_requested(run_id):
-                    raise asyncio.CancelledError()
-                if typ in ('delta','thinking'):
-                    part=payload.get('text','')
-                    if typ=='delta':
-                        full.append(part)
-                    elif isinstance(part,str) and part:
-                        if thinking_trace is None and len(trace)<64:
-                            thinking_trace={'type':'thinking','text':'','at_ms':int((time.monotonic()-clock)*1000)}
-                            trace.append(thinking_trace)
-                        if thinking_trace is not None:
-                            remaining=50_000-len(thinking_trace['text'])
-                            if remaining>0: thinking_trace['text']+=part[:remaining]
-                    if first_token_ms is None and part:
-                        first_token_ms=int((time.monotonic()-clock)*1000)
-                        yield emit('timing',{'first_token_ms':first_token_ms})
-                elif typ=='final':
-                    txt=payload.get('text','')
-                    if txt:full=[txt]
-                elif typ=='usage':
-                    for k,v in payload.items():
-                        if v is not None:
-                            usage[k]=v
-                elif typ=='error':
-                    raise RuntimeError(payload.get('message','Lỗi Pi Runner'))
-                if typ in ('status','tool') and len(trace)<64:
-                    item={'type':typ,'at_ms':int((time.monotonic()-clock)*1000)}
-                    if typ=='status':item['message']=str(payload.get('message',''))[:220]
-                    else:item.update({'name':str(payload.get('name',''))[:80],
-                                      'id':str(payload.get('id',''))[:100],
-                                      'status':str(payload.get('status',''))[:30],
-                                      'summary':str(payload.get('summary',''))[:200],
-                                      'arguments':str(payload.get('arguments',''))[:8000],
-                                      'result':str(payload.get('result',''))[:8000]})
-                    trace.append(item)
-                yield emit(typ,payload)
+            async with aclosing(stream), aclosing(with_heartbeat(stream)) as events:
+                async for typ,payload in events:
+                    if cancellation_requested(run_id):
+                        raise ChatStopped()
+                    if typ in ('delta','thinking'):
+                        part=payload.get('text','')
+                        if typ=='delta':
+                            full.append(part)
+                        elif isinstance(part,str) and part:
+                            if thinking_trace is None and len(trace)<64:
+                                thinking_trace={'type':'thinking','text':'','at_ms':int((time.monotonic()-clock)*1000)}
+                                trace.append(thinking_trace)
+                            if thinking_trace is not None:
+                                remaining=50_000-len(thinking_trace['text'])
+                                if remaining>0: thinking_trace['text']+=part[:remaining]
+                        if first_token_ms is None and part:
+                            first_token_ms=int((time.monotonic()-clock)*1000)
+                            yield emit('timing',{'first_token_ms':first_token_ms})
+                    elif typ=='final':
+                        txt=payload.get('text','')
+                        if txt:full=[txt]
+                    elif typ=='usage':
+                        for k,v in payload.items():
+                            if v is not None:
+                                usage[k]=v
+                    elif typ=='error':
+                        raise RuntimeError(payload.get('message','Lỗi Pi Runner'))
+                    if typ in ('status','tool') and len(trace)<64:
+                        item={'type':typ,'at_ms':int((time.monotonic()-clock)*1000)}
+                        if typ=='status':item['message']=str(payload.get('message',''))[:220]
+                        else:item.update({'name':str(payload.get('name',''))[:80],
+                                          'id':str(payload.get('id',''))[:100],
+                                          'status':str(payload.get('status',''))[:30],
+                                          'summary':str(payload.get('summary',''))[:200],
+                                          'arguments':str(payload.get('arguments',''))[:8000],
+                                          'result':str(payload.get('result',''))[:8000]})
+                        trace.append(item)
+                    yield emit(typ,payload)
             output=''.join(full).strip() or '(Không có nội dung phản hồi)'
             output, embedded_brief = parse_model_response(output)
             if embedded_brief:
@@ -1543,32 +1579,37 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
             # Replace raw stream text only when normalization produced a cleaner answer.
             if output != ''.join(full).strip():
                 yield emit('final', {'text':output})
+            run=locked_run(sdb)
+            if not run:
+                return
+            if run.cancel_requested:
+                raise ChatStopped()
             sdb.add(Message(discussion_id=did,role='assistant',content=output,run_id=run_id))
-            run=sdb.get(AgentRun,run_id)
             run.status='completed';run.finished_at=utcnow()
             run.usage=usage;run.events=trace;run.first_token_ms=first_token_ms;run.duration_ms=int((time.monotonic()-clock)*1000)
-            sdb.commit()
-            seconds=max(0,(run.duration_ms-(first_token_ms or run.duration_ms))/1000)
+            seconds=max(0,(run.duration_ms-first_token_ms)/1000) if first_token_ms is not None else 0
             output_tps=round(usage['output_tokens']/seconds,2) if seconds>0 and isinstance(usage.get('output_tokens'),int) else None
-            yield emit('done',{'duration_ms':run.duration_ms,'first_token_ms':first_token_ms,'usage':usage,'output_tps':output_tps})
-        except (asyncio.CancelledError,GeneratorExit):
-            run=sdb.get(AgentRun,run_id)
-            run.status='cancelled';run.events=trace;run.finished_at=utcnow();run.duration_ms=int((time.monotonic()-clock)*1000)
-            if continue_qid:
-                q=sdb.get(PlanningQuestion,continue_qid)
-                if q and (q.answer or {}).get('continuation_run_id')==run_id:
-                    q.answer={k:v for k,v in q.answer.items() if k!='continuation_run_id'}
-            sdb.commit()
-            yield emit('error',{'message':'Đã dừng lượt chạy'},message='Đã dừng lượt chạy')
-        except Exception as exc:
-            run=sdb.get(AgentRun,run_id)
-            run.status='error';run.events=trace;run.error=str(exc)[:700];run.finished_at=utcnow();run.duration_ms=int((time.monotonic()-clock)*1000)
-            if continue_qid:
-                q=sdb.get(PlanningQuestion,continue_qid)
-                if q and (q.answer or {}).get('continuation_run_id')==run_id:
-                    q.answer={k:v for k,v in q.answer.items() if k!='continuation_run_id'}
-            sdb.commit()
-            yield emit('error',{'message':str(exc)[:500]},message=str(exc)[:500])
+            yield finish(sdb,run,frame('done',{'duration_ms':run.duration_ms,'first_token_ms':first_token_ms,
+                                               'usage':usage,'output_tps':output_tps}))
+        except ChatBusy:
+            raise
+        except (asyncio.CancelledError, GeneratorExit, Exception) as exc:
+            sdb.rollback()
+            run=locked_run(sdb)
+            if run:
+                stopped=run.cancel_requested or not existing_run_id and isinstance(exc,(asyncio.CancelledError,GeneratorExit))
+                message=('Đã dừng lượt chạy' if stopped else
+                         'Pi worker bị gián đoạn' if isinstance(exc,(asyncio.CancelledError,GeneratorExit))
+                         else str(exc)[:500])
+                run.status='cancelled' if stopped else 'error'
+                run.events=trace;run.error=message;run.finished_at=utcnow()
+                run.duration_ms=int((time.monotonic()-clock)*1000)
+                clear_chat_continuation(sdb,run)
+                result=finish(sdb,run,frame('error',{'message':message,'status':run.status},message=message))
+            if isinstance(exc,(GeneratorExit,asyncio.CancelledError)):
+                raise
+            if run:
+                yield result
     return StreamingResponse(produce(),media_type="text/event-stream",headers={"Cache-Control":"no-cache, no-transform","X-Accel-Buffering":"no"})
 
 
@@ -1622,13 +1663,15 @@ async def internal_pi_tool(request: Request, db: Session = Depends(get_db)):
 @app.post("/api/projects/{pid}/runs/{run_id}/cancel")
 async def cancel_run(pid:str,run_id:str,request:Request,db:Session=Depends(get_db)):
     u,s=api_guard(request,db,True);acl(db,pid,u,write=True)
-    run=db.get(AgentRun,run_id)
+    run=db.get(AgentRun,run_id,with_for_update=True)
     if not run or run.project_id!=pid:raise HTTPException(404,"Run not found")
     if run.status=='queued':
         run.cancel_requested=True
         run.status='cancelled';run.finished_at=utcnow()
+        run.lease_expires_at=None
+        clear_chat_continuation(db,run)
         db.add(ChatStreamEvent(run_id=run.id,event={'type':'error','run_id':run.id,
-             'payload':{'message':'Đã hủy trước khi Pi bắt đầu'}},created_at=utcnow()))
+             'payload':{'message':'Đã hủy trước khi Pi bắt đầu','status':'cancelled'}},created_at=utcnow()))
         db.commit()
     elif run.status=='running':
         run.cancel_requested=True

@@ -2,9 +2,9 @@
 
 SpecWeave is a self-hosted workspace for turning project ideas into implementation-ready specifications through guided AI conversations, research, requirements management, a traceability graph, BMAD-inspired workflows, human approvals, and document exports.
 
-**Architecture:** All model inference and agent execution run exclusively through the **in-process Pi SDK** inside the `pi-runner` service. FastAPI does not call LLMs directly, run a second agent, or maintain a fallback OpenAI-compatible agent. Local and remote OpenAI-compatible models remain available **through Pi's model runtime**. Pi owns agent sessions, context and compaction, thinking and tool events, and usage reporting. The frontend requires no Node.js build step.
+**Architecture:** All model inference and agent execution run exclusively through the **in-process Pi SDK** in the Node.js Pi Host inside the `web` container. FastAPI does not call LLMs directly, run a second agent, or maintain a fallback OpenAI-compatible agent. Local and remote OpenAI-compatible models remain available **through Pi's model runtime**. Pi owns agent sessions, context and compaction, thinking and tool events, and usage reporting. The frontend requires no Node.js build step.
 
-> **Release status:** The repository includes integration code and automated tests, but the Pi package installed from npm, actual Docker builds and runtime behavior, live OpenAI OAuth, and live model integrations have not been verified in the development environment used to prepare this release. Do not treat this release as production-validated. See [`docs/RELEASE_v1.0.3_DETACHED_PI_CHAT.vi.md`](docs/RELEASE_v1.0.3_DETACHED_PI_CHAT.vi.md) and [`docs/RELEASE_v1.0_PI_NATIVE.vi.md`](docs/RELEASE_v1.0_PI_NATIVE.vi.md) for the implementation details and validation checklist. These two documents are currently in Vietnamese.
+> **Verification:** Local tests exercise the real Pi SDK with a local OpenAI-compatible test provider and the AI Discussion page in Edge. Docker builds and runtime, PostgreSQL deployment, and live model/OAuth integrations still need deployment verification.
 
 ## Features
 
@@ -15,14 +15,16 @@ SpecWeave is a self-hosted workspace for turning project ideas into implementati
 - **Planning and traceability:** Goals, requirements, acceptance criteria, decisions, coverage checks, a specification graph, and a roadmap.
 - **Quality and deliverables:** BMAD-inspired draft documents, semantic review, background multi-role reviews, quality gates, human approval, Markdown document management, and exports.
 - **Research and files:** SearXNG, HTTP research, Playwright/Chromium, and a project-scoped file manager with quotas and revision history.
-- **Deployment:** Docker Compose with bundled or external PostgreSQL, plus GitHub Actions publishing cached `-web` and `-pi` images to GHCR.
+- **Deployment:** Docker Compose with bundled or external PostgreSQL, plus GitHub Actions publishing the `-web` image to GHCR.
 
 
-## Background chat and reconnect (v1.0.3)
+## Background chat and reconnect
 
 Chat, decision answers and Pi thinking/tool/usage events are now **independent of the browser tab**. The web application creates a PostgreSQL-backed `agent_runs` job and immediately returns its ID. The existing **review-worker** service runs the Pi task, persists event frames in `chat_stream_events`, and the browser subscribes via an `EventSource` GET endpoint. Switching pages, disconnecting from the network or closing the tab only closes the observer connection; it **does not cancel the Pi run**.
 
-When returning to the same discussion, the UI discovers any active run and replays its stored events using SSE event IDs and `Last-Event-ID`. The explicit **Stop** button is the only normal action that sends cancellation to the agent. Do not disable the `review-worker` container: it now processes both AI review and chat jobs. A worker or Pi Host restart during an active inference can still interrupt the task; for safety, an interrupted run is marked failed rather than silently re-executed. This is intentional to avoid duplicate tool side effects.
+The discussion page includes the active run ID and displays a Pi activity card immediately. Its subscriber replays persisted events from that run even if it finishes before the browser connects. Reconnecting uses SSE event IDs and `Last-Event-ID`. The **Stop** button requests cancellation and the subscriber displays the server's result.
+
+Each discussion gets its own Pi SDK `AgentSession`, transcript and active tool capability. Different discussions can run concurrently. `SPECWEAVE_CHAT_CONCURRENCY` defaults to 4 per background worker and accepts values from 1 through 16. A worker or Pi Host restart can interrupt active inference. The interrupted job fails without replaying its prompt or tools.
 
 The `0010_detached_chat` Alembic migration creates the event log and lease fields. Back up PostgreSQL before deploying and keep all existing volumes. Tool call input/output JSON is pretty-printed in UTF-8 in the UI, including legacy escaped Unicode strings; the actual tool arguments are not changed. Full details: [`docs/RELEASE_v1.0.3_DETACHED_PI_CHAT.vi.md`](docs/RELEASE_v1.0.3_DETACHED_PI_CHAT.vi.md) (Vietnamese).
 
@@ -34,7 +36,7 @@ Browser (Jinja2 + JavaScript + SSE)
 FastAPI (authentication, authorization, PostgreSQL, documents,
          approvals, project-scoped tool gateway)
   ↕
-Pi Agent Host (separate Node.js service: createAgentSession,
+Pi Agent Host (Node.js process inside web: createAgentSession,
                ModelRuntime, SessionManager)
   ↘ scoped tools → FastAPI
 ```
@@ -61,7 +63,6 @@ Set at least the following values in `.env`:
 DATABASE_URL=postgresql+psycopg://your_user:your_password@your_db_host:5432/specweave
 ENCRYPTION_KEY=YOUR_VALID_32_BYTE_FERNET_BASE64_KEY
 BOOTSTRAP_TOKEN=YOUR_RANDOM_BOOTSTRAP_SECRET
-PI_RUNNER_URL=http://pi-runner:8090
 PI_RUNNER_KEY=YOUR_RANDOM_SECRET_AT_LEAST_32_CHARACTERS
 COOKIE_SECURE=true
 OPENAI_OAUTH_LOCAL_MODE=false
@@ -77,7 +78,7 @@ python3 -c "import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_
 
 ### Build locally
 
-Pi is mandatory; no `--profile pi` flag is needed:
+The `web` image includes the Pi SDK and starts the Pi Host alongside FastAPI.
 
 ```sh
 docker compose -f compose.external-db.yaml up -d --build
@@ -92,7 +93,7 @@ SPECWEAVE_IMAGE_REPO=ghcr.io/your-user/your-repository
 SPECWEAVE_IMAGE_TAG=v1.0.2
 ```
 
-Set the repository name to lowercase and omit the `-web` / `-pi` suffix. The tag must actually exist in your GHCR packages. Then deploy:
+Set the repository name to lowercase and omit the `-web` suffix. The tag must actually exist in your GHCR packages. Then deploy:
 
 ```sh
 docker compose -f compose.external-db.images.yaml pull
@@ -106,27 +107,34 @@ Open `http://<server>:8080/first-run` to create the initial administrator accoun
 ## Upgrading from v0.9.8 or v1.0.x
 
 1. **Back up** PostgreSQL and the `projects_data` and `openai_oauth_local` volumes. Back up `postgres_data` too if you use bundled PostgreSQL.
-2. Update the source to v1.0.2, or publish the `-web` and `-pi` images from **the same commit/tag**.
+2. Update the source and Compose file together, or use a `-web` image published from the same revision as the updated Compose file.
 3. Preserve `.env`, `ENCRYPTION_KEY`, volumes, and existing project data. Keep `PI_RUNNER_KEY` strong and consistent across services.
-4. With GHCR images, run `docker compose ... pull`, followed by `docker compose ... up -d --no-build` using the appropriate Compose file.
+4. Reuse the existing Compose project name so the `projects_data` and `openai_oauth_local` volumes are picked up. Deploy with `docker compose ... up -d --build --remove-orphans`, or pull the updated image and use `up -d --no-build --remove-orphans`. This retires the previous `pi-runner` container. The OAuth volume moves to `web` and keeps its existing data. Remove any obsolete Pi runner URL overrides from custom Compose files.
 5. If upgrading from v0.9.8, Alembic revision `0009_pi_native` converts the old project `agent_backend` setting to `pi`. Existing discussion history is retained and used to seed new Pi sessions. Upgrading from v1.0.x does not require re-creating projects or clearing sessions.
 
 Do **not** use `alembic stamp head` to bypass an unapplied migration. Do **not** delete the `openai_oauth_local` volume.
 
 ## Development without Python packaging
 
-Keep application code inside `source/` and the virtual environment outside it, in `.venv/`. Run Python files directly; no editable package installation (`pip install -e .`) is required.
+Keep code in `source/` and install dependencies at the repository root. Create a local Python environment and install the pinned Pi SDK with Node.js 22 or later.
 
 ```sh
-python -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-python source/app.py
+python -m venv venv
+# Windows PowerShell: .\venv\Scripts\Activate.ps1
+# Linux/macOS: . venv/bin/activate
+python -m pip install -r requirements.txt pytest pytest-asyncio
+npm install --prefix . --no-save --no-package-lock --ignore-scripts @earendil-works/pi-coding-agent@1.5.2 @earendil-works/pi-ai@1.5.2 typebox
 ```
 
-The Pi Agent Host runs in a separate Node.js runtime with `@earendil-works/pi-coding-agent`. It can be started with `node source/pi_host.mjs` when its runtime configuration and project storage are correctly provided. The frontend does **not** require Node.js or a bundling/build pipeline.
+For a direct local run, set `DATABASE_URL`, `DATA_ROOT`, `ENCRYPTION_KEY`, `BOOTSTRAP_TOKEN`, and `PI_RUNNER_KEY` in the process environment. Point `PROJECTS_ROOT` to `DATA_ROOT/projects`, `PI_RUNNER_URL` to `http://127.0.0.1:8090`, and `PI_TOOL_URL` to `http://127.0.0.1:8080/api/internal/pi-tool`. Use writable directories outside project storage for `SPECWEAVE_PI_SAFE_RESOURCES_DIR` and `OPENAI_OAUTH_LOCAL_HOME`. Run each file in its own terminal with those settings.
 
-When scanning or indexing the repository, exclude `.venv/`, `venv/`, `node_modules/`, caches, and other generated runtime directories.
+```sh
+node source/pi_host.mjs
+python source/app.py
+python source/review_worker.py
+```
+
+Exclude `venv/`, `node_modules/`, caches and runtime storage when scanning the source.
 
 ## Automated tests
 
@@ -136,7 +144,7 @@ python -m compileall -q source tests migrations
 node --test tests/test_openai_oauth_contract.mjs tests/test_pi_native_host.mjs
 ```
 
-The Pi Native Host contract tests use a **mock Pi SDK**. They do not constitute an end-to-end test of a real Pi installation or provider. GitHub Actions also performs SDK import/export checks during the image build. Validate Docker, live model connectivity, OpenAI OAuth, and the browser experience in your deployment environment.
+The Node contract tests stub the SDK boundary. Run `python scripts/e2e_pi_discussion.py` with local Pi dependencies and Playwright Chromium to verify the real SDK, detached worker, and discussion UI against a local provider fixture. Set `CHROMIUM_EXECUTABLE` to use an existing Chromium browser such as Edge.
 
 ## Continuous discovery in v1.0.2
 
@@ -144,7 +152,7 @@ The planning workflow is designed to continue within **one discussion and one Pi
 
 1. Pi evaluates the project context and asks a focused question with candidate answers and a recommendation.
 2. The user selects, customizes, or defers an option in the chat interface.
-3. Confirming an answer saves it and **streams the next Pi turn within the same request** via `/planning/questions/{qid}/answer-stream`—no additional **Send** or **AI Suggest** click is required.
+3. Confirming an answer saves it and **queues the next Pi turn in the same request** via `/planning/questions/{qid}/answer-start`—no additional **Send** or **AI Suggest** click is required.
 4. Pi analyzes the answer in the existing session, explains its implications, and asks the next unresolved question.
 5. Once enough information has been collected, Pi can draft Markdown documents and call `finish_discovery` to generate any missing BMAD artifacts. All generated documents remain **drafts requiring human review**, never automatically approved.
 
@@ -160,7 +168,7 @@ The frontend also supports resuming a previously saved answer that was not yet p
 
 ## Operational and security notes
 
-- Keep the Pi runner reachable only through your trusted internal network; do not expose its management API publicly.
+- Publish only the FastAPI port. The worker reaches Pi over the Compose network and authenticates with `PI_RUNNER_KEY`. Run a single `web` container for a given session volume.
 - OpenAI OAuth is optional, owner-scoped, and disabled by default. Enable `OPENAI_OAUTH_LOCAL_MODE` only in an explicitly supported, individual user-controlled deployment; follow the provider's applicable terms.
 - Project tools are authorization-checked. Agent-generated decisions, requirements, and documents should be reviewed before approval or external handoff.
 - Preserve PostgreSQL and persistent project/OAuth volumes across image updates.
