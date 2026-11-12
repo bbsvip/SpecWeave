@@ -1,4 +1,4 @@
-# SpecWeave v0.9.0 — AI Project Planning Workspace
+# SpecWeave v0.9.3 — AI Project Planning Workspace
 
 **Self-hosted project discovery, guided decisions, AI-assisted research, requirement planning, architecture, quality review, human approval, and implementation handoff.** The application is built with FastAPI, Jinja2, native JavaScript, PostgreSQL, optional Pi RPC and Playwright. No frontend Node.js build step or Python editable package installation.
 
@@ -57,6 +57,27 @@ docker compose --profile pi up -d --build
 ```
 
 Pi runner is a separate JavaScript runtime; it is **not** a Node.js frontend build. The runner is configured with custom OpenAI-compatible model metadata and API key. Its built-in shell/file tools, extra extensions and MCP are disabled; all custom project tools pass through the backend's scoped/HMAC-protected capability endpoint. OpenAI-only OAuth can be enabled separately in an owner-controlled local runner; see `docs/RELEASE_v0.9_OPENAI_OAUTH.vi.md`. Other providers remain API-key based. Validate Pi CLI and model/provider compatibility on the target host.
+
+
+## Fast deployment using prebuilt GHCR images (v0.9.3)
+
+GitHub Actions now tests the project, builds two Docker images (`-web`, `-pi`) once on GitHub-hosted runners and publishes them to GHCR using layer caching. Both `web` and `review-worker` use the same `-web` image. **No local Docker build is needed when deploying these images.**
+
+After the workflow has successfully published images from your GitHub repo, add this to `.env` (lowercase owner/repository):
+
+```ini
+SPECWEAVE_IMAGE_REPO=ghcr.io/<github-owner>/<github-repository>
+SPECWEAVE_IMAGE_TAG=main
+```
+
+For **external PostgreSQL with Pi** (the deployment supported by `compose.external-db.yaml` previously):
+
+```sh
+docker compose -f compose.external-db.images.yaml --profile pi pull
+docker compose -f compose.external-db.images.yaml --profile pi up -d --no-build
+```
+
+Or `bash scripts/deploy-images.sh external pi`. This keeps the Compose project name, mounts and existing volumes unchanged. The local-build Compose files remain available. A version or `sha-` tag is recommended over `main` for controlled rollouts. See [`docs/GITHUB_ACTIONS_GHCR.v0.9.3.vi.md`](docs/GITHUB_ACTIONS_GHCR.v0.9.3.vi.md) for GitHub setup, GHCR login, Portainer, tags, rollback and limitations.
 
 ## Local developer setup (no Python packaging)
 

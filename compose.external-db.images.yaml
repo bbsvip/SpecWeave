@@ -1,0 +1,59 @@
+name: specweave-external
+services:
+  web:
+    image: ${SPECWEAVE_IMAGE_REPO:?Set SPECWEAVE_IMAGE_REPO in .env}-web:${SPECWEAVE_IMAGE_TAG:-main}
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Set external postgresql+psycopg DATABASE_URL in .env}
+      DATA_ROOT: /data
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY in .env}
+      BOOTSTRAP_TOKEN: ${BOOTSTRAP_TOKEN:?Set BOOTSTRAP_TOKEN in .env}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      SEARXNG_URL: ${SEARXNG_URL:-}
+      PI_RUNNER_URL: ${PI_RUNNER_URL:-}
+      PI_RUNNER_KEY: ${PI_RUNNER_KEY:-}
+      PI_TOOL_URL: ${PI_TOOL_URL:-http://web:8080/api/internal/pi-tool}
+      OPENAI_OAUTH_LOCAL_MODE: ${OPENAI_OAUTH_LOCAL_MODE:-false}
+    volumes:
+      - projects_data:/data
+    shm_size: "1gb"
+    security_opt: ["no-new-privileges:true"]
+  review-worker:
+    image: ${SPECWEAVE_IMAGE_REPO:?Set SPECWEAVE_IMAGE_REPO in .env}-web:${SPECWEAVE_IMAGE_TAG:-main}
+    restart: unless-stopped
+    init: true
+    command: ["python", "source/review_worker.py"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Set external postgresql+psycopg DATABASE_URL in .env}
+      DATA_ROOT: /data
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY in .env}
+      SPECWEAVE_MIGRATIONS_MANAGED: "true"
+      OPENAI_OAUTH_LOCAL_MODE: ${OPENAI_OAUTH_LOCAL_MODE:-false}
+      PI_RUNNER_URL: ${PI_RUNNER_URL:-}
+      PI_RUNNER_KEY: ${PI_RUNNER_KEY:-}
+    depends_on:
+      - web
+    volumes:
+      - projects_data:/data
+    security_opt: ["no-new-privileges:true"]
+  pi-runner:
+    profiles: [pi]
+    image: ${SPECWEAVE_IMAGE_REPO:?Set SPECWEAVE_IMAGE_REPO in .env}-pi:${SPECWEAVE_IMAGE_TAG:-main}
+    restart: unless-stopped
+    init: true
+    environment:
+      PROJECTS_ROOT: /data/projects
+      OPENAI_OAUTH_LOCAL_MODE: ${OPENAI_OAUTH_LOCAL_MODE:-false}
+      OPENAI_OAUTH_LOCAL_HOME: /auth-local
+      PI_RUNNER_KEY: ${PI_RUNNER_KEY:-}
+      PI_TOOL_URL: ${PI_TOOL_URL:-http://web:8080/api/internal/pi-tool}
+    volumes:
+      - projects_data:/data
+      - openai_oauth_local:/auth-local
+    security_opt: ["no-new-privileges:true"]
+volumes:
+  projects_data:
+  openai_oauth_local:
