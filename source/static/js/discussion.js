@@ -17,6 +17,16 @@
     if(force||list.scrollHeight-list.scrollTop-list.clientHeight<170)list.scrollTop=list.scrollHeight;
   }
   function formatNumber(n){return typeof n==='number'?new Intl.NumberFormat('vi-VN').format(n):'—';}
+  function hideUnfinishedDecisionJSON(raw,mode){
+    // Do not show raw JSON choices in the chat while the model is writing them.
+    // Final server message is parsed/normalized, including persisted session history.
+    if(mode!=='discovery'&&mode!=='compare')return raw;
+    const match=/(?:\[\s*)?\{\s*"(?:id|label|question|options)"\s*:/.exec(raw);
+    if(match&&raw.slice(0,match.index).split('```').length%2===1){
+      return raw.slice(0,match.index).trimEnd()+'\n\n*Đang chuẩn hóa các lựa chọn…*';
+    }
+    return raw;
+  }
   function renderMarkdown(node,content){
     if(window.marked&&window.DOMPurify){
       node.innerHTML=DOMPurify.sanitize(marked.parse(content,{breaks:true}),{USE_PROFILES:{html:true}});
@@ -58,7 +68,7 @@
     const shouldFollow=list.scrollHeight-list.scrollTop-list.clientHeight<170;
     list.querySelector('.conversation-intro')?.remove();
     const article=make('article','message '+(who==='user'?'message-user':'message-agent'));
-    const avatar=make('div','message-avatar',who==='user'?'U':'✦');
+    const avatar=make('div','message-avatar',who==='user'?'A':'✦');
     const body=make('div','message-body');
     const meta=make('div','message-meta',who==='user'?'Anh':'SpecWeave AI');
     const content=make('div','message-content'+(who==='assistant'?' markdown-content':''),text);
@@ -70,13 +80,22 @@
     return {article,body,content};
   }
   function buildTurnActivity(turn){
-    const details=make('details','turn-activity');
-    const summary=make('summary','','Đang kết nối…');
+    const surface=make('section','turn-live');
+    const live=make('div','turn-live-heading');
+    const spinner=make('span','turn-loader');spinner.setAttribute('aria-hidden','true');
+    const heading=make('span','turn-live-label','Đang kết nối model…');live.append(spinner,heading);
+    const details=make('details','turn-activity');details.open=true;
+    const summary=make('summary','','Hoạt động của agent · đang chạy');
     const inner=make('div','turn-activity-body');
     const timeline=make('div','turn-timeline');
-    const metrics=make('div','turn-metrics','Usage: chưa được cung cấp');
-    inner.append(timeline,metrics);details.append(summary,inner);turn.body.append(details);
-    return {details,summary,timeline,metrics};
+    const thinking=make('details','turn-thinking');thinking.open=true;thinking.hidden=true;
+    const thinkingTitle=make('summary','','Thinking · model đang phân tích');
+    const thinkingText=make('pre','turn-thinking-text');thinking.append(thinkingTitle,thinkingText);
+    const tools=make('div','turn-tool-list');
+    inner.append(thinking,timeline,tools);details.append(summary,inner);
+    const metrics=make('div','turn-metrics turn-metrics-visible','Đang đo thời gian phản hồi…');
+    surface.append(live,details,metrics);turn.body.append(surface);
+    return {surface,live,spinner,heading,details,summary,timeline,thinking,thinkingTitle,thinkingText,tools,metrics,toolRows:new Map()};
   }
   const actionButton=(label,cls,cb)=>{const b=make('button','btn btn-sm '+cls,label);b.type='button';b.addEventListener('click',cb);return b;};
   function setBusy(active,label){
@@ -86,7 +105,7 @@
     root.classList.toggle('chat-busy',active);
     suggestButton&&(suggestButton.disabled=active);
   }
-  function describeUsage(usage,first,elapsed,contextWindow){
+  function describeUsage(usage,first,elapsed,contextWindow,outputChars=0,outputTps=null){
     const parts=[];
     if(typeof usage.input_tokens==='number')parts.push('Input '+formatNumber(usage.input_tokens));
     if(typeof usage.output_tokens==='number')parts.push('Output '+formatNumber(usage.output_tokens));
@@ -98,6 +117,14 @@
     }
     if(typeof first==='number')parts.push('TTFT '+(first/1000).toFixed(2)+'s');
     if(typeof elapsed==='number')parts.push('Thời gian '+(elapsed/1000).toFixed(1)+'s');
+    if(typeof outputTps==='number'&&Number.isFinite(outputTps)){
+      parts.push(outputTps.toFixed(1)+' tok/s (trung bình)');
+    }else if(typeof usage.output_tokens==='number'&&typeof first==='number'&&elapsed>first){
+      parts.push((usage.output_tokens/((elapsed-first)/1000)).toFixed(1)+' tok/s (trung bình)');
+    }else if(outputChars>0&&typeof first==='number'&&elapsed>first+250){
+      parts.push('~'+(outputChars/4/((elapsed-first)/1000)).toFixed(1)+' tok/s (ước tính ký tự)');
+    }
+    if(!('input_tokens' in usage)&&!('output_tokens' in usage))parts.unshift('Token thực: chưa có');
     return parts.length?parts.join(' · '):'Usage: provider chưa cung cấp';
   }
   function addTimeline(timeline,type,text){
@@ -124,11 +151,12 @@
     if(message){input.value='';input.style.height='auto';addMessage('user',message);}
     const turn=addMessage('assistant','');const panel=buildTurnActivity(turn);
     const role=sw.val('agentRole'),mode=sw.val('agentMode');
-    let full='',usage={},contextWindow=0,firstTokenMs=null,elapsedMs=0,completed=false,hadError=false;
+    let full='',usage={},contextWindow=0,firstTokenMs=null,elapsedMs=0,completed=false,hadError=false,outputTps=null;
+    let thinkingFull='',lastPhase='request';
     const started=performance.now();let renderScheduled=false,renderHandle=null;
     const scheduleRender=()=>{
       if(renderScheduled)return;renderScheduled=true;
-      renderHandle=setTimeout(()=>{renderScheduled=false;renderHandle=null;renderMarkdown(turn.content,full);followIfNearBottom();},95);
+      renderHandle=setTimeout(()=>{renderScheduled=false;renderHandle=null;renderMarkdown(turn.content,hideUnfinishedDecisionJSON(full,mode));followIfNearBottom();},95);
     };
     const flushRender=()=>{
       if(renderHandle!==null)clearTimeout(renderHandle);
@@ -141,7 +169,7 @@
     streamingTimer=setInterval(()=>{
       if(!controller)return;
       elapsedMs=performance.now()-started;
-      panel.metrics.textContent=describeUsage(usage,firstTokenMs,elapsedMs,contextWindow);
+      panel.metrics.textContent=describeUsage(usage,firstTokenMs,elapsedMs,contextWindow,full.length,outputTps);
       if(headerUsage)headerUsage.textContent=panel.metrics.textContent;
     },350);
     try{
@@ -158,29 +186,63 @@
         if(ev.type==='start'){
           contextWindow=Number(p.context_window)||0;
           const message=`${p.model||'Agent'} · ${p.backend||'model'}`;
-          panel.summary.textContent=message+' · Đang chạy';
+          panel.summary.textContent='Hoạt động · '+message;
+          panel.heading.textContent='Đang phân tích với '+String(p.model||'model')+'…';
           addTimeline(panel.timeline,'status','Bắt đầu: '+message);
           setBusy(true,'Đang phân tích…');
         }else if(ev.type==='status'){
           const message=String(p.message||'Đang xử lý…');
-          setBusy(true,message);
-          addTimeline(panel.timeline,'status',message);
+          setBusy(true,message);panel.heading.textContent=message;
+          if(p.phase!==lastPhase||panel.timeline.lastElementChild?.textContent!==message){
+            addTimeline(panel.timeline,'status',message);
+          }
+          lastPhase=p.phase||'';
+        }else if(ev.type==='thinking'){
+          const piece=String(p.text||'');
+          if(piece){
+            thinkingFull+=piece;
+            panel.thinking.hidden=false;
+            panel.thinkingText.textContent=thinkingFull;
+            panel.heading.textContent='Đang suy luận…';
+            if(!firstTokenMs)firstTokenMs=Math.round(performance.now()-started);
+            if(panel.thinking.open)panel.thinkingText.scrollTop=panel.thinkingText.scrollHeight;
+          }
         }else if(ev.type==='delta'){
           if(!firstTokenMs)firstTokenMs=Math.round(performance.now()-started);
           full+=String(p.text||'');scheduleRender();
-          setBusy(true,'Đang trả lời…');
+          setBusy(true,'Đang trả lời…');panel.heading.textContent='Đang viết câu trả lời…';
         }else if(ev.type==='timing'){
           if(typeof p.first_token_ms==='number')firstTokenMs=p.first_token_ms;
         }else if(ev.type==='tool'){
           const name=String(p.name||'tool').slice(0,90);
-          const toolStatus=p.status==='complete'?'✓ Hoàn tất':'Đang chạy';
+          const toolStatus=p.status==='complete'?'✓ Hoàn tất':p.status==='update'?'Đang cập nhật':p.status==='preparing'?'Đang tạo tham số':p.status==='queued'?'Sắp thực thi':'Đang chạy';
+          panel.heading.textContent='Công cụ: '+name+' · '+toolStatus;
+          const key=String(p.id||name);
+          let item=panel.toolRows.get(key);
+          if(!item){
+            const details=make('details','turn-tool');
+            const title=make('summary','','◌ '+name+' · Đang chạy');
+            const text=make('pre','turn-tool-detail','');
+            details.append(title,text);panel.tools.append(details);
+            item={details,title,text,args:null,result:null,progress:null};panel.toolRows.set(key,item);
+          }
+          item.title.textContent=(p.status==='complete'?'✓ ':p.status==='running'?'◌ ':'↻ ')+name+' · '+toolStatus;
+          if(p.status==='complete')item.details.classList.add('tool-complete');
+          if(p.arguments!==undefined)item.args=typeof p.arguments==='string'?p.arguments:JSON.stringify(p.arguments,null,2);
+          if(p.result!==undefined)item.result=typeof p.result==='string'?p.result:JSON.stringify(p.result,null,2);
+          if(p.summary)item.progress=String(p.summary);
+          item.text.textContent=[
+            item.args!==null?'Input\n'+item.args:null,
+            item.progress?'Tiến độ\n'+item.progress:null,
+            item.result!==null?'Output\n'+item.result:null
+          ].filter(Boolean).join('\n\n');
           addTimeline(panel.timeline,'tool',name+' · '+toolStatus);
           if(activity.textContent==='Chưa có tool call')activity.replaceChildren();
           const row=make('div','tool-item',name+' · '+toolStatus);activity.prepend(row);
           if(activity.children.length>15)activity.lastElementChild?.remove();
         }else if(ev.type==='usage'){
           usage={...usage,...p};
-          panel.metrics.textContent=describeUsage(usage,firstTokenMs,elapsedMs,contextWindow);
+          panel.metrics.textContent=describeUsage(usage,firstTokenMs,elapsedMs,contextWindow,full.length,outputTps);
           if(headerUsage)headerUsage.textContent=panel.metrics.textContent;
         }else if(ev.type==='final'&&typeof p.text==='string'){
           full=p.text;scheduleRender();
@@ -188,7 +250,10 @@
           completed=true;elapsedMs=typeof p.duration_ms==='number'?p.duration_ms:performance.now()-started;
           if(typeof p.first_token_ms==='number')firstTokenMs=p.first_token_ms;
           usage={...usage,...(p.usage||{})};
-          panel.summary.textContent='Hoàn thành · '+(elapsedMs/1000).toFixed(1)+'s';
+          outputTps=typeof p.output_tps==='number'?p.output_tps:null;
+          panel.summary.textContent='Hoạt động · hoàn thành '+(elapsedMs/1000).toFixed(1)+'s';
+          panel.heading.textContent='Hoàn thành';panel.spinner.classList.add('completed');
+          panel.details.open=false;
           addTimeline(panel.timeline,'status','Hoàn thành');
         }else if(ev.type==='error'){
           hadError=true;
@@ -198,7 +263,7 @@
       await readSSE(response,handleFrame);
       if(!completed)throw new Error('Kết nối bị ngắt trước khi có sự kiện hoàn thành');
       flushRender();
-      panel.metrics.textContent=describeUsage(usage,firstTokenMs,elapsedMs,contextWindow);
+      panel.metrics.textContent=describeUsage(usage,firstTokenMs,elapsedMs,contextWindow,full.length,outputTps);
       if(headerUsage)headerUsage.textContent=panel.metrics.textContent;
       await refreshPlanningQuestion();
       // Discovery is an ongoing interview. Once the answer has been discussed,
@@ -210,11 +275,11 @@
     }catch(error){
       if(error.name==='AbortError'){
         if(full)flushRender();
-        panel.summary.textContent='Đã dừng';
+        panel.summary.textContent='Đã dừng';panel.heading.textContent='Đã dừng';panel.spinner.classList.add('completed');
         addTimeline(panel.timeline,'status','Người dùng dừng phản hồi');
       }else{
         if(full)flushRender();
-        panel.summary.textContent='Không hoàn thành';
+        panel.summary.textContent='Không hoàn thành';panel.heading.textContent='Không hoàn thành';panel.spinner.classList.add('completed');
         const msg=String(error.message||error).slice(0,400);
         addTimeline(panel.timeline,'error',msg);
         turn.content.append(make('p','turn-error','Lỗi: '+msg));

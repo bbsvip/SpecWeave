@@ -16,7 +16,7 @@ from research import search_searxng, fetch_web
 from security import decrypt
 from openai_oauth_gateway import require_access
 from planning import save_question, QUESTION_JSON_INSTRUCTIONS
-from chat_events import normalize_usage, accumulate_usage
+from chat_events import normalize_usage, accumulate_usage, safe_tool_preview
 from intelligence import coverage_report
 
 ROLES = {
@@ -90,6 +90,7 @@ Rules:
 - Help plan and SPECIFY a product, do not implement its application code.
 - Never just ask an open-ended question and expect the user to invent options. Proactively draft 2-4 credible approaches with clear pros/cons and mark ONE recommended default with rationale.
 - In discovery/design, call propose_planning_question for interactive option cards whenever the model supports tools. Ask only ONE significant open question per turn.
+- NEVER print raw JSON describing choices/options in prose. When tools are unavailable, write clear Markdown with headings and bullet points for each option. Do not output JSON arrays or objects of options in chat.
 - When the user's latest turn is a confirmed answer to a planning question, FIRST acknowledge and evaluate its implications, update relevant draft context where permitted, THEN identify the next genuinely unanswered high-impact question. Continue in the SAME discussion. Never demand that the user click a separate button to continue.
 - Offer the user the ability to select, discuss, customize or defer. Do not regard an AI recommendation as human approval.
 - Prioritize unanswered high-impact decisions over trivial choices. Explicitly label hypotheses and unverified assumptions.
@@ -195,6 +196,7 @@ async def compatible_stream(project, discussion, db, model, *, role, mode):
             accumulated=[]
             calls={}
             seen_reasoning=False
+            reasoning_chars=0
             try:
                 # Some local endpoints reject stream_options or tool calling.
                 # Downgrade only those OPTIONAL capabilities and keep streaming.
@@ -228,9 +230,16 @@ async def compatible_stream(project, discussion, db, model, *, role, mode):
                                 choices=event.get('choices') or []
                                 if not choices:continue
                                 delta=choices[0].get('delta') or {}
-                                if not seen_reasoning and (delta.get('reasoning_content') or delta.get('reasoning')):
-                                    seen_reasoning=True
-                                    yield 'status',{'phase':'reasoning','message':'Đang phân tích…'}
+                                reasoning = delta.get('reasoning_content') or delta.get('reasoning')
+                                if isinstance(reasoning, str) and reasoning:
+                                    if not seen_reasoning:
+                                        seen_reasoning=True
+                                        yield 'status', {'phase':'reasoning','message':'Model đang phân tích…'}
+                                    # Send only data actually exposed by the provider.
+                                    if reasoning_chars < 60_000:
+                                        part = reasoning[:60_000-reasoning_chars]
+                                        reasoning_chars += len(part)
+                                        yield 'thinking', {'text':part}
                                 text=delta.get('content')
                                 if isinstance(text,str) and text:
                                     accumulated.append(text)
@@ -256,14 +265,14 @@ async def compatible_stream(project, discussion, db, model, *, role, mode):
             messages.append({'role':'assistant','content':''.join(accumulated) or None,'tool_calls':tool_calls})
             for call in tool_calls:
                 name=call['function']['name']
-                yield 'tool',{'name':name,'status':'running'}
+                yield 'tool',{'name':name,'id':call['id'],'status':'running','arguments':safe_tool_preview(call['function']['arguments'])}
                 try:
                     args=json.loads(call['function']['arguments'] or '{}')
                     result=await tool_call(name,args,project=project,db=db,discussion_id=discussion.id)
                 except Exception as exc:
                     result={'error':str(exc)[:500]}
                 messages.append({'role':'tool','tool_call_id':call['id'],'content':json.dumps(result,ensure_ascii=False)[:19000]})
-                yield 'tool',{'name':name,'status':'complete','result':json.dumps(result,ensure_ascii=False)[:300]}
+                yield 'tool',{'name':name,'id':call['id'],'status':'complete','result':safe_tool_preview(result)}
     yield 'final',{'text':''.join(all_visible) or 'Agent đã đạt giới hạn số lượt gọi công cụ.'}
 
 def pi_tool_token(run_id: str, project_id: str, discussion_id: str, created_at) -> str:

@@ -17,3 +17,10 @@ assert.equal(items[0].payload.text,'Tiếng Việt 🌿');
 assert.equal(items[1].payload.input_tokens,42);
 assert.equal(items[2].type,'done');
 console.log('SpecWeave SSE framing tests passed');
+
+// A valid error frame must propagate a callback error rather than disappearing
+// behind the invalid-JSON catch block.
+{
+  const reader = createParser((frame) => {if(frame.type === 'error') throw Error('model failed');});
+  assert.throws(() => reader.push('data: {"type":"error"}\n\n'), /model failed/);
+}

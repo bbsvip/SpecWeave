@@ -6,7 +6,7 @@ import asyncio
 from pathlib import Path
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
-from chat_events import normalize_usage, accumulate_usage
+from chat_events import normalize_usage, accumulate_usage, safe_tool_preview
 from pydantic import BaseModel, Field
 from openai_oauth_runtime import (require_local, public_status, start_login, poll_login, answer_login, end_login, disconnect, available_models, complete, diagnostics, LOCAL_HOME, AUTH_USE_LOCK)
 
@@ -143,6 +143,9 @@ async def run(data: RunnerRequest, x_runner_key: str = Header(default="")):
             proc = None
             collected = []
             reported_usage={}
+            assembling_calls={}
+            assistant_start=0
+            streamed_thinking=''
             try:
                 proc = await asyncio.create_subprocess_exec(*cmd,cwd=str(root),env=env,
                                   stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,
@@ -157,6 +160,9 @@ async def run(data: RunnerRequest, x_runner_key: str = Header(default="")):
                     try: event = json.loads(raw)
                     except ValueError: continue
                     tp = event.get("type")
+                    if tp=='message_start' and (event.get('message') or {}).get('role')=='assistant':
+                        assistant_start=len(collected)
+                        streamed_thinking=''
                     if tp in ('agent_start','turn_start'):
                         status='Agent bắt đầu phân tích…' if tp=='agent_start' else 'Model đang xử lý lượt trả lời…'
                         yield 'data: '+json.dumps({'type':'status','payload':{'phase':tp,'message':status}},ensure_ascii=False)+'\n\n'
@@ -177,11 +183,40 @@ async def run(data: RunnerRequest, x_runner_key: str = Header(default="")):
                             delta=upd.get("delta","")
                             collected.append(delta)
                             yield "data: "+json.dumps({"type":"delta","payload":{"text":delta}},ensure_ascii=False)+"\n\n"
+                    if tp == 'message_update':
+                        upd=event.get('assistantMessageEvent') or {}
+                        part_type=upd.get('type')
+                        index=upd.get('contentIndex')
+                        if part_type=='toolcall_start':
+                            cid=str(upd.get('id') or f'block-{index}')[:100]
+                            assembling_calls[index]={'id':cid,'name':str(upd.get('toolName') or 'Tool')[:80],'args':''}
+                            item=assembling_calls[index]
+                            yield 'data: '+json.dumps({'type':'tool','payload':{'name':item['name'],'id':cid,'status':'preparing'}},ensure_ascii=False)+'\n\n'
+                        elif part_type=='toolcall_delta' and index in assembling_calls:
+                            item=assembling_calls[index]
+                            if len(item['args'])<12000:
+                                item['args']+=str(upd.get('delta') or '')[:12000-len(item['args'])]
+                            yield 'data: '+json.dumps({'type':'tool','payload':{'name':item['name'],'id':item['id'],'status':'preparing','arguments':safe_tool_preview(item['args'])}},ensure_ascii=False)+'\n\n'
+                        elif part_type=='toolcall_end':
+                            call=upd.get('toolCall') or {}
+                            item=assembling_calls.pop(index, {})
+                            name=str(call.get('name') or item.get('name') or 'Tool')[:80]
+                            cid=str(call.get('id') or item.get('id') or '')[:100]
+                            arguments=safe_tool_preview(call.get('arguments') if 'arguments' in call else item.get('args',''))
+                            yield 'data: '+json.dumps({'type':'tool','payload':{'name':name,'id':cid,'status':'queued','arguments':arguments}},ensure_ascii=False)+'\n\n'
                     if tp in ('message_end','agent_end'):
                         # Pi reports the final usage on assistant messages. Do not
                         # count agent_end again (it may repeat the same total).
                         message=event.get('message') or {}
                         if tp=='message_end' and isinstance(message,dict) and message.get('role')=='assistant':
+                            blocks=message.get('content') or []
+                            if isinstance(blocks,list):
+                                authoritative=''.join(str(b.get('text','')) for b in blocks if isinstance(b,dict) and b.get('type')=='text')
+                                if authoritative and authoritative!=''.join(collected[assistant_start:]):
+                                    collected[assistant_start:]=[authoritative]
+                                thought=''.join(str(b.get('thinking','')) for b in blocks if isinstance(b,dict) and b.get('type')=='thinking')
+                                if thought and not streamed_thinking:
+                                    yield 'data: '+json.dumps({'type':'thinking','payload':{'text':thought[:60000]}},ensure_ascii=False)+'\n\n'
                             item=normalize_usage(message.get('usage'),source='pi')
                             if item:
                                 reported_usage=accumulate_usage(reported_usage,item)
@@ -189,13 +224,26 @@ async def run(data: RunnerRequest, x_runner_key: str = Header(default="")):
                     if tp == 'message_update':
                         upd=event.get('assistantMessageEvent') or {}
                         if upd.get('type') in ('thinking_delta','reasoning_delta'):
-                            yield 'data: '+json.dumps({'type':'status','payload':{'phase':'reasoning','message':'Đang phân tích…'}},ensure_ascii=False)+'\n\n'
+                            # Pi exposes thinking_delta only when the selected model/provider supplies it.
+                            part=upd.get('delta')
+                            if isinstance(part,str) and part:
+                                streamed_thinking+=part
+                                yield 'data: '+json.dumps({'type':'thinking','payload':{'text':part}},ensure_ascii=False)+'\n\n'
+                            else:
+                                yield 'data: '+json.dumps({'type':'status','payload':{'phase':'reasoning','message':'Model đang phân tích…'}},ensure_ascii=False)+'\n\n'
                     if tp == "tool_execution_start":
                         name=event.get("toolName") or event.get("tool_name") or "Pi tool"
-                        yield "data: "+json.dumps({"type":"tool","payload":{"name":str(name)[:80],"status":"running"}},ensure_ascii=False)+"\n\n"
+                        yield "data: "+json.dumps({"type":"tool","payload":{"name":str(name)[:80],"id":str(event.get('toolCallId') or event.get('tool_call_id') or '')[:100],"status":"running","arguments":safe_tool_preview(event.get("args") or {})}},ensure_ascii=False)+"\n\n"
+                    if tp == 'tool_execution_update':
+                        name=event.get('toolName') or event.get('tool_name') or 'Pi tool'
+                        # Pi partialResult is a replacement snapshot, NOT an appended delta.
+                        partial=event.get('partialResult')
+                        if isinstance(partial,dict):
+                            summary=str(partial.get('status') or partial.get('message') or '')[:200]
+                            yield 'data: '+json.dumps({'type':'tool','payload':{'name':str(name)[:80],'id':str(event.get('toolCallId') or '')[:100],'status':'update','summary':summary}},ensure_ascii=False)+'\n\n'
                     if tp == "tool_execution_end":
                         name=event.get("toolName") or event.get("tool_name") or "Pi tool"
-                        yield "data: "+json.dumps({"type":"tool","payload":{"name":str(name)[:80],"status":"complete"}},ensure_ascii=False)+"\n\n"
+                        yield "data: "+json.dumps({"type":"tool","payload":{"name":str(name)[:80],"id":str(event.get('toolCallId') or event.get('tool_call_id') or '')[:100],"status":"complete","result":safe_tool_preview(event.get("result") or {})}},ensure_ascii=False)+"\n\n"
                     if tp == "agent_settled":
                         if event.get('aborted'):
                             raise RuntimeError('Phiên Pi đã bị dừng')

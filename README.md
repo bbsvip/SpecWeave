@@ -253,3 +253,7 @@ Sau khi trả lời một Decision Brief, AI tiếp tục trong cùng session m�
 ## v0.9.7 — OpenAI OAuth stability
 
 Đã sửa thiếu Pi installation device ID trong Sign in with ChatGPT, lưu UUID ổn định theo Pi settings và bổ sung safe diagnostics. Xem `docs/RELEASE_v0.9.7_OPENAI_OAUTH_PI_IDENTITY.vi.md`. Không thay đổi schema/volume.
+
+## v0.9.8 — Full Chat Stream
+
+AI Discussion hiển thị thinking, tool call, timeline, TTFT, usage và tok/s trong từng lượt chat. Thinking chỉ hiện khi model/provider phát dữ liệu đó. JSON phương án được trình bày dễ đọc, câu hỏi hợp lệ trở thành Decision Brief. Cập nhật cả web image và Pi runner image. Xem `docs/RELEASE_v0.9.8_CHAT_STREAM.vi.md`.

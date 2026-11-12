@@ -67,3 +67,25 @@ async def with_heartbeat(events, interval_seconds=12.0):
                 await pending
             except asyncio.CancelledError:
                 pass
+
+_SECRET_KEYS = frozenset({'api_key','apikey','authorization','access_token','refresh_token','password',
+                          'provider_key','tool_token','cookie','client_secret','secret'})
+
+
+def safe_tool_preview(value, limit=8000):
+    """Display a bounded JSON/text preview of a tool call, redacting known credential fields."""
+    import json
+    def clean(item, depth=0):
+        if depth > 5: return '[nested data]'
+        if isinstance(item,dict):
+            return {str(k)[:100]: ('[redacted]' if str(k).lower().replace('-','_') in _SECRET_KEYS else clean(v,depth+1))
+                    for k,v in list(item.items())[:60]}
+        if isinstance(item,list): return [clean(v,depth+1) for v in item[:30]]
+        if isinstance(item,str): return item[:limit]
+        if isinstance(item,(int,float,bool)) or item is None: return item
+        return str(type(item).__name__)
+    if isinstance(value,str):
+        try: value=json.loads(value)
+        except (ValueError,TypeError): return value[:limit]
+    result=json.dumps(clean(value),ensure_ascii=False,indent=2)
+    return result[:limit]+('… [rút gọn]' if len(result)>limit else '')

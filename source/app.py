@@ -45,6 +45,7 @@ from planning_engine import (STEPS, SOURCE_KINDS, VERIFY_STATES, stage_current, 
 from review_queue import create_review_job, job_payload, TERMINAL
 from provider_management import owned_provider, impact as provider_impact, delete_provider as perform_provider_deletion, delete_models as perform_model_deletion
 from chat_coordination import discussion_lease, ChatBusy, cancellation_requested
+from chat_content import parse_model_response
 from chat_events import with_heartbeat
 
 BASE = Path(__file__).parent
@@ -56,10 +57,11 @@ async def lifespan(_app):
     init_db()
     yield
 
-app = FastAPI(title="SpecWeave", version="0.9.6", docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(title="SpecWeave", version="0.9.8", docs_url=None, redoc_url=None, lifespan=lifespan)
 app.mount("/static",StaticFiles(directory=BASE / "static"),name="static")
 templates = Jinja2Templates(directory=BASE / "templates")
 templates.env.filters["date_short"] = lambda d: d.strftime("%d/%m/%Y %H:%M") if d else "—"
+templates.env.filters["readable_chat"] = lambda v: parse_model_response(v)[0]
 templates.env.filters["pretty_json"] = lambda v: json.dumps(v, indent=2, ensure_ascii=False, default=str)
 STAGES = ["discovery","requirements","solution_design","ux_design","spec_review","approved"]
 ROLE_LABELS = {"analyst":"Analyst","pm":"Product Manager","architect":"Architect","ux":"UX Designer","reviewer":"Critical Reviewer","planner":"Planning"}
@@ -1236,6 +1238,7 @@ async def chat_stream(pid:str,request:Request,db:Session=Depends(get_db)):
         clock=time.monotonic()
         first_token_ms=None
         usage={}
+        thinking_trace=None
         def emit(event_type,payload=None,**extra):
             return 'data: '+json.dumps({'type':event_type,'payload':payload or {},'run_id':run_id,**extra},ensure_ascii=False)+'\n\n'
         try:
@@ -1245,9 +1248,17 @@ async def chat_stream(pid:str,request:Request,db:Session=Depends(get_db)):
             async for typ,payload in with_heartbeat(stream):
                 if cancellation_requested(run_id):
                     raise asyncio.CancelledError()
-                if typ=='delta':
+                if typ in ('delta','thinking'):
                     part=payload.get('text','')
-                    full.append(part)
+                    if typ=='delta':
+                        full.append(part)
+                    elif isinstance(part,str) and part:
+                        if thinking_trace is None and len(trace)<64:
+                            thinking_trace={'type':'thinking','text':'','at_ms':int((time.monotonic()-clock)*1000)}
+                            trace.append(thinking_trace)
+                        if thinking_trace is not None:
+                            remaining=50_000-len(thinking_trace['text'])
+                            if remaining>0: thinking_trace['text']+=part[:remaining]
                     if first_token_ms is None and part:
                         first_token_ms=int((time.monotonic()-clock)*1000)
                         yield emit('timing',{'first_token_ms':first_token_ms})
@@ -1264,16 +1275,34 @@ async def chat_stream(pid:str,request:Request,db:Session=Depends(get_db)):
                     item={'type':typ,'at_ms':int((time.monotonic()-clock)*1000)}
                     if typ=='status':item['message']=str(payload.get('message',''))[:220]
                     else:item.update({'name':str(payload.get('name',''))[:80],
-                                      'status':str(payload.get('status',''))[:30]})
+                                      'id':str(payload.get('id',''))[:100],
+                                      'status':str(payload.get('status',''))[:30],
+                                      'summary':str(payload.get('summary',''))[:200],
+                                      'arguments':str(payload.get('arguments',''))[:8000],
+                                      'result':str(payload.get('result',''))[:8000]})
                     trace.append(item)
                 yield emit(typ,payload)
             output=''.join(full).strip() or '(Không có nội dung phản hồi)'
+            output, embedded_brief = parse_model_response(output)
+            if embedded_brief:
+                try:
+                    from planning import save_question, question_payload
+                    question, created = save_question(sdb,pid,did,embedded_brief)
+                    if created:
+                        yield emit('planning_question', question_payload(question))
+                except (ValueError,TypeError,KeyError):
+                    pass  # Keep a readable model answer if structured brief validation fails.
+            # Replace raw stream text only when normalization produced a cleaner answer.
+            if output != ''.join(full).strip():
+                yield emit('final', {'text':output})
             sdb.add(Message(discussion_id=did,role='assistant',content=output,run_id=run_id))
             run=sdb.get(AgentRun,run_id)
             run.status='completed';run.finished_at=utcnow()
             run.usage=usage;run.events=trace;run.first_token_ms=first_token_ms;run.duration_ms=int((time.monotonic()-clock)*1000)
             sdb.commit()
-            yield emit('done',{'duration_ms':run.duration_ms,'first_token_ms':first_token_ms,'usage':usage})
+            seconds=max(0,(run.duration_ms-(first_token_ms or run.duration_ms))/1000)
+            output_tps=round(usage['output_tokens']/seconds,2) if seconds>0 and isinstance(usage.get('output_tokens'),int) else None
+            yield emit('done',{'duration_ms':run.duration_ms,'first_token_ms':first_token_ms,'usage':usage,'output_tps':output_tps})
         except (asyncio.CancelledError,GeneratorExit):
             run=sdb.get(AgentRun,run_id)
             run.status='cancelled';run.events=trace;run.finished_at=utcnow();run.duration_ms=int((time.monotonic()-clock)*1000)

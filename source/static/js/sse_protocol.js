@@ -9,9 +9,12 @@
         if(line.startsWith('data:'))data.push(line.slice(5).replace(/^ /,''));
       }
       if(!data.length)return;
-      try{onFrame(JSON.parse(data.join('\n')));}catch(e){
-        // Invalid SSE JSON is discarded; keep reading the connection.
+      let frame;
+      try{frame=JSON.parse(data.join('\n'));}catch(e){
+        // Invalid SSE JSON is discarded; callback failures must NOT be swallowed.
+        return;
       }
+      onFrame(frame);
     }
     function drain(){
       let match;
