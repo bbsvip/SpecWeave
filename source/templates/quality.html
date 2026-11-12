@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}Quality & BMAD Review · {{pr.name}}{% endblock %}
+{% block breadcrumb %}Quality &amp; BMAD Review{% endblock %}
+{% block content %}
+<div class="quality-page" id="qualityApp" data-project="{{pr.id}}" data-editable="{{'true' if editable else 'false'}}" data-owner="{{'true' if owner else 'false'}}">
+  <div class="page-heading">
+    <div><div class="eyebrow">SPECWEAVE QUALITY INTELLIGENCE · v0.8</div>
+      <h1>Quality &amp; BMAD Review</h1>
+      <p>Review ngữ nghĩa, đánh giá nguồn, gợi ý trace và phê duyệt workflow. AI chỉ đề xuất, con người quyết định.</p></div>
+    <a class="btn btn-outline-primary" href="/projects/{{pr.id}}/intelligence"><i class="ti ti-chart-dots-3"></i> Planning Intelligence</a>
+  </div>
+  <div class="quality-overview" id="qualityMetrics">
+    <div class="content-card q-metric"><small>REVIEWS</small><strong id="qCountReviews">—</strong><span>Phiên kiểm tra</span></div>
+    <div class="content-card q-metric"><small>FINDINGS</small><strong id="qCountFindings">—</strong><span>Cần xem xét</span></div>
+    <div class="content-card q-metric"><small>TRACE CANDIDATES</small><strong id="qCountTrace">—</strong><span>Chưa xử lý</span></div>
+    <div class="content-card q-metric"><small>QUALITY BLOCKERS</small><strong id="qCountBlockers">—</strong><span>Chặn reviewed export</span></div>
+  </div>
+  <div id="qualityError" class="alert alert-danger d-none" role="alert"></div>
+  <section class="content-card q-panel mb-3" aria-labelledby="reviewJobsTitle">
+    <div class="q-heading"><div><div class="eyebrow">BACKGROUND AGENT ORCHESTRATION</div>
+      <h2 id="reviewJobsTitle">Review đa vai trò chạy nền</h2></div></div>
+    <p class="text-secondary mb-2">Analyst → Architect → QA → Synthesis. Lưu tiến độ từng lượt vào database, hỗ trợ hủy, retry khi lỗi và cảnh báo nếu spec thay đổi.</p>
+    <div class="d-flex flex-wrap align-items-end gap-2 mb-3">
+      <div><label class="form-label" for="qOutputBudget">Ngân sách output token (ước tính)</label>
+        <input class="form-control" id="qOutputBudget" type="number" min="2048" max="24000" step="1024" value="12000" style="max-width:210px" {% if not editable %}disabled{% endif %}></div>
+      <button type="button" class="btn btn-primary" id="qEnqueueReview" {% if not editable %}disabled{% endif %}><i class="ti ti-player-play"></i> Bắt đầu review chạy nền</button>
+      <button type="button" class="btn btn-outline-secondary" id="qRefreshJobs"><i class="ti ti-refresh"></i> Cập nhật</button>
+    </div>
+    <details class="mb-3"><summary class="fw-semibold">Chọn model riêng theo vai trò (tùy chọn)</summary>
+      <p class="text-secondary small mt-2">Không chọn sẽ dùng model mặc định của dự án. Mỗi vai trò có thể sử dụng provider khác. Model ID được lưu trong lịch sử review.</p>
+      <div class="field-grid">
+      {% for role,title in [('analyst','Analyst'),('architect','Architect'),('qa','QA Reviewer'),('synthesis','Synthesis')] %}
+        <label class="field">{{title}}<select class="form-select q-role-model" data-role="{{role}}" {% if not editable %}disabled{% endif %}>
+          <option value="">Model mặc định của dự án</option>
+          {% for m in role_models %}<option value="{{m.id}}">{{m.provider.name}} / {{m.model_id}}</option>{% endfor %}
+        </select></label>
+      {% endfor %}
+      </div>
+    </details>
+    <p class="small text-secondary">Giới hạn này áp dụng cho <strong>output tokens</strong>; không giới hạn input/context và không phải dự toán chi phí. Khi provider không trả usage, số token được ước tính.</p>
+    <div id="qJobs" class="q-stack" aria-live="polite"></div>
+  </section>
+  <div class="quality-columns">
+    <section class="content-card q-panel">
+      <div class="q-heading"><div><div class="eyebrow">01 · SEMANTIC REVIEW</div><h2>Kiểm tra đặc tả</h2></div></div>
+      <p class="text-secondary">Quy tắc định sẵn hoạt động offline. Review AI sử dụng model đang chọn trong Project Settings và có thể phát sinh token.</p>
+      <div class="d-flex flex-wrap gap-2 mb-3">
+        <button type="button" class="btn btn-primary" id="qRunRules" {% if not editable %}disabled{% endif %}><i class="ti ti-checklist"></i> Review theo quy tắc</button>
+        <button type="button" class="btn btn-outline-primary" id="qRunAI" {% if not editable %}disabled{% endif %}><i class="ti ti-sparkles"></i> AI Semantic Review</button>
+        <button type="button" class="btn btn-outline-secondary" id="qRunAdversarial" {% if not editable %}disabled{% endif %}><i class="ti ti-users"></i> Review 3 góc nhìn</button>
+      </div>
+      <p class="text-secondary small">Nên dùng review chạy nền ở trên cho những spec lớn. Review 3 góc nhìn tức thời là chế độ tương thích cũ; đóng tab sẽ ngắt kết nối.</p>
+      <div id="qReviewHistory" class="q-stack" aria-live="polite"></div>
+      <h3 class="q-subhead">Findings &amp; đề xuất sửa</h3>
+      <div id="qFindings" class="q-stack"></div>
+    </section>
+    <section class="content-card q-panel">
+      <div class="q-heading"><div><div class="eyebrow">02 · SOURCE PROVENANCE</div><h2>Evidence Intelligence</h2></div><a href="/projects/{{pr.id}}/research" class="btn btn-sm btn-outline-secondary">Research</a></div>
+      <p class="text-secondary">Điểm hiển thị phản ánh mức độ đầy đủ của metadata và xác minh thủ công, <strong>không chứng minh nội dung đúng</strong>.</p>
+      <div id="qEvidence" class="q-stack"></div>
+    </section>
+    <section class="content-card q-panel">
+      <div class="q-heading"><div><div class="eyebrow">03 · AUTO TRACE</div><h2>Gợi ý Spec Graph</h2></div></div>
+      <p class="text-secondary">Tìm ứng viên liên kết bằng độ tương đồng từ khóa. Không tự tạo trace link, không duyệt tài liệu.</p>
+      <button type="button" class="btn btn-primary mb-3" id="qGenerateTrace" {% if not editable %}disabled{% endif %}><i class="ti ti-git-merge"></i> Tìm liên kết gợi ý</button>
+      <div id="qTrace" class="q-stack"></div>
+    </section>
+    <section class="content-card q-panel">
+      <div class="q-heading"><div><div class="eyebrow">04 · HUMAN GATES</div><h2>BMAD Workflow</h2></div></div>
+      <p class="text-secondary">Analyst → PM → Architect → UX → Reviewer. Chỉ owner có quyền approve; khi nội dung thay đổi, checkpoint liên quan sẽ cũ.</p>
+      <div id="qWorkflow" class="q-stack"></div>
+    </section>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script defer src="{{ url_for('static', path='/js/quality.js') }}"></script>
+{% endblock %}

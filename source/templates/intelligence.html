@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}Planning Intelligence · {{pr.name}}{% endblock %}
+{% block breadcrumb %}Planning Intelligence{% endblock %}
+{% block content %}
+<div id="intelligenceApp" data-project="{{pr.id}}" data-owner="{{'true' if user.id==pr.owner_id else 'false'}}" data-editable="{{'true' if editable else 'false'}}">
+  <div class="page-heading"><div><div class="eyebrow">PLANNING INTELLIGENCE · BMAD + TRACEABILITY</div>
+    <h1>Planning Intelligence</h1><p>Phát hiện khoảng trống, liên kết yêu cầu và duyệt từng phase trước khi xuất đặc tả.</p></div>
+    <a href="/projects/{{pr.id}}/export" class="btn btn-primary"><i class="ti ti-package-export"></i> Export &amp; handoff</a>
+  </div>
+  <div class="pi-metrics">
+    <article class="content-card pi-metric"><span class="eyebrow">TRẠNG THÁI BÀN GIAO</span><strong class="{{'text-success' if report.ready else 'text-warning'}}">{{'Ready' if report.ready else 'Cần bổ sung'}}</strong><small>Kiểm tra theo quy tắc, không phải AI phê duyệt</small></article>
+    <article class="content-card pi-metric"><span class="eyebrow">BLOCKERS</span><strong>{{report.blockers}}</strong><small>Phải giải quyết trước reviewed export</small></article>
+    <article class="content-card pi-metric"><span class="eyebrow">WARNINGS</span><strong>{{report.warnings}}</strong><small>Điểm nên rà soát</small></article>
+    <article class="content-card pi-metric"><span class="eyebrow">TRACE LINKS</span><strong>{{report.totals.links}}</strong><small>Liên kết có kiểm tra cùng project</small></article>
+  </div>
+  <div class="pi-layout">
+    <section class="content-card pi-main-panel">
+      <div class="card-heading"><h3><i class="ti ti-shield-check"></i> Requirement coverage</h3><button class="btn btn-outline-primary btn-sm" id="piRefresh"><i class="ti ti-refresh"></i> Kiểm tra lại</button></div>
+      <p class="text-secondary small">Danh sách dưới đây được phân tích từ dữ liệu có thật. Không suy diễn rằng dự án đúng chỉ vì không còn cảnh báo.</p>
+      <div class="pi-issues" id="piIssues">
+        {% if not report.issues %}<div class="pi-empty"><i class="ti ti-circle-check text-success"></i> Không còn khoảng trống theo các quy tắc đang bật.</div>{% endif %}
+        {% for issue in report.issues %}
+          <div class="pi-issue {{issue.severity}}"><span class="pi-issue-kind">{{'Blocker' if issue.severity=='blocker' else 'Warning'}}</span><div><strong>{{issue.code}}</strong><p>{{issue.message}}</p>{% if issue.recommendation %}<small>{{issue.recommendation}}</small>{% endif %}</div></div>
+        {% endfor %}
+      </div>
+    </section>
+    <section class="content-card pi-side-panel">
+      <div class="card-heading"><h3><i class="ti ti-bulb"></i> Hướng xử lý</h3></div>
+      <p class="text-secondary small">Agent có thể đọc báo cáo này để ưu tiên thảo luận đúng phần thiếu, thay vì hỏi lại từ đầu.</p>
+      <ol class="pi-next-actions">{% for issue in report.next_actions %}<li>{{issue.message}}</li>{% else %}<li>Đã đáp ứng các kiểm tra hiện hành. Nên review thủ công nội dung và dữ kiện.</li>{% endfor %}</ol>
+      <a class="btn btn-outline-primary w-100" href="/projects/{{pr.id}}/discussion"><i class="ti ti-messages"></i> Thảo luận với AI</a>
+    </section>
+  </div>
+
+  <div class="pi-section-title"><div><div class="eyebrow">01 · PRODUCT OUTCOMES</div><h2>Mục tiêu sản phẩm</h2></div></div>
+  <section class="content-card pi-section">
+    {% if editable %}<form id="piGoalForm" class="pi-form-grid" autocomplete="off">
+      <label class="field">Mục tiêu<input id="piGoalTitle" class="form-control" required maxlength="255" placeholder="Ví dụ: Giảm thao tác lập kế hoạch thủ công"></label>
+      <label class="field">Chỉ số đo lường (tùy chọn)<input id="piGoalMetric" class="form-control" maxlength="350" placeholder="Ví dụ: giảm 30% số lượt làm rõ yêu cầu"></label>
+      <label class="field pi-full">Kết quả mong muốn<textarea id="piGoalOutcome" class="form-control" rows="2" placeholder="Mô tả kết quả quan sát được, không chỉ một tính năng"></textarea></label>
+      <div class="pi-full"><button class="btn btn-primary" id="piGoalSubmit" type="submit"><i class="ti ti-plus"></i> Thêm mục tiêu</button> <button class="btn btn-outline-secondary d-none" id="piGoalCancel" type="button">Hủy sửa</button></div>
+    </form>
+    {% endif %}<div class="pi-goal-list">
+      {% for goal in goals %}<article class="pi-record"><div><strong>{{goal.title}}</strong><div class="text-secondary small">{{goal.outcome or 'Chưa mô tả kết quả mong muốn'}}</div>{% if goal.metric %}<small>Metric: {{goal.metric}}</small>{% endif %}</div><div class="pi-record-actions">{% if editable %}<button class="btn btn-sm btn-outline-secondary pi-goal-edit" data-id="{{goal.id}}">Sửa</button>{% endif %}<span class="status-chip {{'good' if goal.status=='approved' else ''}}">{{goal.status}}</span>{% if user.id==pr.owner_id and goal.status!='approved' %}<button class="btn btn-outline-primary btn-sm pi-goal-review" data-id="{{goal.id}}">Duyệt</button>{% endif %}</div></article>
+      {% else %}<div class="pi-empty">Chưa có mục tiêu. Mỗi mục tiêu phải được xác nhận trước khi bàn giao.</div>{% endfor %}
+    </div>
+  </section>
+
+  <div class="pi-section-title"><div><div class="eyebrow">02 · ROADMAP</div><h2>Plan canvas &amp; review</h2></div></div>
+  <section class="content-card pi-section">
+    {% if editable %}<form id="piPhaseForm" class="pi-form-grid">
+      <label class="field pi-full">Tên phase<input id="piPhaseTitle" class="form-control" required maxlength="255" placeholder="Ví dụ: Discovery & requirements validation"></label>
+      <label class="field pi-full">Mục tiêu và phạm vi<textarea id="piPhaseSummary" class="form-control" rows="2"></textarea></label>
+      <label class="field">Deliverables<textarea id="piPhaseDeliverables" class="form-control" rows="2" placeholder="Tài liệu hoặc kết quả có thể kiểm tra"></textarea></label>
+      <label class="field">Acceptance criteria<textarea id="piPhaseAcceptance" class="form-control" rows="2" placeholder="Khi nào phase được coi là hoàn thành?"></textarea></label>
+      <div class="pi-full"><button class="btn btn-primary" id="piPhaseSubmit" type="submit"><i class="ti ti-plus"></i> Tạo phase</button><button type="button" class="btn btn-outline-secondary d-none" id="piPhaseCancel">Hủy sửa</button></div>
+    </form>
+    {% endif %}<div class="pi-phase-list">
+      {% for phase in phases %}<article class="pi-phase"><div class="pi-phase-head"><div><div class="eyebrow">PHASE {{loop.index}} · REV {{phase.revision}}</div><h3>{{phase.title}}</h3><span class="status-chip {{'good' if phase.status=='approved' else ''}}">{{phase.status|replace('_',' ')}}</span></div>{% if editable %}<button class="btn btn-sm btn-outline-secondary pi-phase-edit" data-id="{{phase.id}}"><i class="ti ti-pencil"></i> Sửa</button>{% endif %}</div>
+        <p>{{phase.summary or 'Chưa mô tả phạm vi'}}</p><div class="pi-phase-details"><div><strong>Deliverables</strong><p>{{phase.deliverables or 'Chưa có'}}</p></div><div><strong>Acceptance criteria</strong><p>{{phase.acceptance or 'Chưa có'}}</p></div></div>
+        <div class="pi-phase-foot">{% if editable and phase.status in ('draft','needs_changes') %}<button class="btn btn-outline-primary btn-sm pi-phase-review" data-id="{{phase.id}}" data-action="submit" data-revision="{{phase.revision}}"><i class="ti ti-send"></i> Gửi review</button>{% endif %}
+          {% if user.id==pr.owner_id and phase.status=='in_review' %}<button class="btn btn-primary btn-sm pi-phase-review" data-id="{{phase.id}}" data-action="approve" data-revision="{{phase.revision}}">Phê duyệt</button><button class="btn btn-outline-danger btn-sm pi-phase-review" data-id="{{phase.id}}" data-action="request_changes" data-revision="{{phase.revision}}">Yêu cầu sửa</button>{% endif %}</div>
+      </article>{% else %}<div class="pi-empty">Chưa có phase. Lập các bước triển khai kèm điều kiện nghiệm thu và quan hệ phụ thuộc.</div>{% endfor %}
+    </div>
+    {% if editable and phases|length > 1 %}
+    <form id="piDependencyForm" class="pi-inline-form"><h4>Thiết lập thứ tự phụ thuộc</h4><label>Phase<select id="piDepPhase" class="form-select">{% for p in phases %}<option value="{{p.id}}">{{p.title}}</option>{% endfor %}</select></label><label>Phụ thuộc vào<select id="piDepPrerequisite" class="form-select">{% for p in phases %}<option value="{{p.id}}">{{p.title}}</option>{% endfor %}</select></label><button class="btn btn-outline-primary" type="submit">Thêm</button></form>
+    {% endif %}
+    <div class="pi-dependencies">{% for dep in dependencies %}<div class="pi-dep"><span>{{phases|selectattr('id','equalto',dep.prerequisite_id)|map(attribute='title')|first|default('Unknown')}} → {{phases|selectattr('id','equalto',dep.phase_id)|map(attribute='title')|first|default('Unknown')}}</span>{% if editable %}<button class="btn btn-sm btn-outline-danger pi-dep-remove" data-id="{{dep.id}}" data-phase="{{dep.phase_id}}" title="Xóa phụ thuộc"><i class="ti ti-x"></i></button>{% endif %}</div>{% endfor %}</div>
+  </section>
+
+  <div class="pi-section-title"><div><div class="eyebrow">03 · EVIDENCE &amp; TRACEABILITY</div><h2>Spec graph</h2></div></div>
+  <section class="content-card pi-section">
+    <p class="text-secondary small">Liên kết có hướng giữa mục tiêu, requirement, quyết định, tài liệu, phase và nguồn research. Không cho phép nối đối tượng thuộc dự án khác.</p>
+    {% if editable %}<form id="piTraceForm" class="pi-form-grid pi-trace-form"><label class="field">Nguồn<select id="piTraceSource" class="form-select" required></select></label><label class="field">Đích<select id="piTraceTarget" class="form-select" required></select></label><label class="field">Quan hệ<select id="piTraceRelation" class="form-select"><option value="supports">Supports</option><option value="defines">Defines</option><option value="implements">Implements</option><option value="validates">Validates</option><option value="informs">Informs</option></select></label><label class="field">Ghi chú<input id="piTraceNote" class="form-control" maxlength="1000"></label><div class="pi-full"><button class="btn btn-outline-primary" type="submit"><i class="ti ti-link"></i> Tạo trace link</button></div></form>
+    {% endif %}<div class="pi-graph-wrap" id="piGraphWrap" tabindex="0" aria-label="Sơ đồ truy vết tương tác, có thể cuộn ngang">
+      <div class="pi-graph-placeholder">Đang tải sơ đồ...</div>
+    </div>
+    <div class="card-heading mt-4"><h3><i class="ti ti-list-details"></i> Các liên kết</h3></div>
+    <div class="pi-trace-list" id="piTraceList" aria-live="polite"></div>
+  </section>
+  <section class="content-card pi-section"><div class="card-heading"><h3><i class="ti ti-history"></i> Lịch sử review gần đây</h3></div>{% for review in reviews %}<div class="pi-record"><div><strong>{{review.action|replace('_',' ')}}</strong><div class="text-secondary small">Phase {{review.phase_id[:8]}} · rev {{review.revision}} · {{review.created_at|date_short}}</div>{% if review.comment %}<p>{{review.comment}}</p>{% endif %}</div></div>{% else %}<div class="pi-empty">Chưa có bản review nào.</div>{% endfor %}</section>
+</div>
+{% endblock %}
+{% block scripts %}
+<script defer src="{{url_for('static',path='/js/intelligence.js')}}"></script>
+{% endblock %}

@@ -1,0 +1,98 @@
+name: specweave
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: specweave
+      POSTGRES_USER: specweave
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U specweave -d specweave"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [private]
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    environment:
+      DATABASE_URL: postgresql+psycopg://specweave:${POSTGRES_PASSWORD}@db:5432/specweave
+      DATA_ROOT: /data
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY in .env}
+      BOOTSTRAP_TOKEN: ${BOOTSTRAP_TOKEN:?Set BOOTSTRAP_TOKEN in .env}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-40}
+      MAX_UPLOAD_FILES: ${MAX_UPLOAD_FILES:-30}
+      MAX_PROJECT_STORAGE_MB: ${MAX_PROJECT_STORAGE_MB:-2048}
+      MAX_PROJECT_FILES: ${MAX_PROJECT_FILES:-50000}
+      SPECWEAVE_MIGRATIONS_MANAGED: "true"
+      SEARXNG_URL: ${SEARXNG_URL:-}
+      PI_RUNNER_URL: ${PI_RUNNER_URL:-}
+      PI_RUNNER_KEY: ${PI_RUNNER_KEY:-}
+      OPENAI_OAUTH_LOCAL_MODE: ${OPENAI_OAUTH_LOCAL_MODE:-false}
+    depends_on:
+      db: {condition: service_healthy}
+    volumes:
+      - projects_data:/data
+    security_opt:
+      - no-new-privileges:true
+    shm_size: "1gb"
+    networks: [private, public]
+  review-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    command: ["python", "source/review_worker.py"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://specweave:${POSTGRES_PASSWORD}@db:5432/specweave
+      DATA_ROOT: /data
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY in .env}
+      SPECWEAVE_MIGRATIONS_MANAGED: "true"
+      OPENAI_OAUTH_LOCAL_MODE: ${OPENAI_OAUTH_LOCAL_MODE:-false}
+      PI_RUNNER_URL: ${PI_RUNNER_URL:-}
+      PI_RUNNER_KEY: ${PI_RUNNER_KEY:-}
+    depends_on:
+      db: {condition: service_healthy}
+      web: {condition: service_started}
+    volumes:
+      - projects_data:/data
+    security_opt:
+      - no-new-privileges:true
+    networks: [private, public]
+  pi-runner:
+    profiles: [pi]
+    build:
+      context: .
+      dockerfile: Dockerfile.runner
+    restart: unless-stopped
+    init: true
+    environment:
+      PROJECTS_ROOT: /data/projects
+      OPENAI_OAUTH_LOCAL_MODE: ${OPENAI_OAUTH_LOCAL_MODE:-false}
+      OPENAI_OAUTH_LOCAL_HOME: /auth-local
+      PI_RUNNER_KEY: ${PI_RUNNER_KEY:-}
+      PI_TOOL_URL: ${PI_TOOL_URL:-http://web:8080/api/internal/pi-tool}
+    volumes:
+      - projects_data:/data
+      - openai_oauth_local:/auth-local
+    security_opt:
+      - no-new-privileges:true
+    networks: [private, public]
+volumes:
+  postgres_data:
+  projects_data:
+  openai_oauth_local:
+networks:
+  private:
+    internal: true
+  public:

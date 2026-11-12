@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Thiết lập lần đầu{% endblock %}
+{% block auth_content %}
+<section class="auth-card">
+  <div class="auth-brand"><span class="brand-mark"><i class="ti ti-sitemap"></i></span><strong>SpecWeave</strong></div>
+  <div class="eyebrow">FIRST-RUN SETUP</div><h1>Thiết lập workspace</h1>
+  <p class="text-secondary">Tạo tài khoản quản trị đầu tiên. Sau bước này, trang khởi tạo sẽ bị khóa.</p>
+  <form method="post" action="/first-run" class="form-stack">
+    <label class="form-label">Tên đăng nhập <input name="username" class="form-control" minlength="3" required placeholder="admin" autocomplete="username"></label>
+    <label class="form-label">Email <input name="email" type="email" class="form-control" required placeholder="admin@example.com"></label>
+    <label class="form-label">Mật khẩu (ít nhất 12 ký tự) <input name="password" type="password" minlength="12" class="form-control" required autocomplete="new-password"></label>
+    <label class="form-label">Bootstrap token <input name="bootstrap_token" type="password" class="form-control" required placeholder="Từ file .env / Docker"></label>
+    <button class="btn btn-primary w-100" type="submit">Tạo quản trị viên <i class="ti ti-arrow-right"></i></button>
+  </form>
+</section>
+{% endblock %}

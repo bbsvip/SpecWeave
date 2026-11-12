@@ -1,0 +1,7 @@
+{% extends "base.html" %}{% block title %}Dự án{% endblock %}{% block breadcrumb %}Projects{% endblock %}
+{% block content %}
+<div class="page-heading"><div><div class="eyebrow">PROJECT LIBRARY</div><h1>Tất cả dự án</h1><p>Mỗi dự án có dữ liệu, memory và bộ tài liệu độc lập.</p></div><a class="btn btn-outline-secondary" href="/projects/trash"><i class="ti ti-trash"></i> Thùng rác</a><a class="btn btn-primary" href="/projects/new"><i class="ti ti-plus"></i> Tạo mới</a></div>
+<div class="toolbar"><div class="search-wrap"><i class="ti ti-search"></i><input id="projectFilter" type="search" class="form-control" placeholder="Tìm dự án..." aria-label="Tìm dự án"></div><span class="text-secondary">{{projects|length}} dự án</span></div>
+{% if projects %}<div class="project-grid" id="projectGrid">{% for item in projects %}<a class="project-tile" data-name="{{item.name|lower}}" href="/projects/{{item.id}}"><div class="tile-top"><span class="tile-symbol"><i class="ti ti-folder-code"></i></span><span class="status-chip">{{item.status}}</span></div><h3>{{item.name}}</h3><p>{{item.description or 'Chưa có mô tả'}}</p><div class="tile-foot"><span><i class="ti ti-calendar-event"></i> {{item.created_at|date_short}}</span><i class="ti ti-arrow-up-right"></i></div></a>{% endfor %}</div>
+{% else %}<div class="empty-panel"><i class="ti ti-folders empty-icon"></i><h3>Chưa có dự án</h3><p>Bắt đầu một dự án mới để mở không gian thiết kế của riêng anh.</p><a href="/projects/new" class="btn btn-primary">Tạo dự án</a></div>{% endif %}
+{% endblock %}

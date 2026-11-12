@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Activity & Runs{% endblock %}
+{% block breadcrumb %}Activity & Runs{% endblock %}
+{% block content %}
+<div class="page-heading"><div><div class="eyebrow">PROJECT AUDIT TRAIL</div><h1>Activity & Runs</h1><p>Lịch sử thao tác, lượt chat và tác vụ review của dự án hiện tại.</p></div></div>
+<div class="row row-cards">
+<div class="col-lg-6"><div class="card"><div class="card-header"><h3 class="card-title">Agent Runs</h3></div><div class="table-responsive"><table class="table table-vcenter"><thead><tr><th>Thời gian</th><th>Model</th><th>Trạng thái</th></tr></thead><tbody>{% for r in runs %}<tr><td>{{r.created_at|date_short}}</td><td><small>{{r.model_name|truncate(35)}}</small></td><td>{{r.status}}</td></tr>{% else %}<tr><td colspan="3">Chưa có lượt chạy</td></tr>{% endfor %}</tbody></table></div></div></div>
+<div class="col-lg-6"><div class="card"><div class="card-header"><h3 class="card-title">Review Jobs</h3></div><div class="table-responsive"><table class="table table-vcenter"><thead><tr><th>Thời gian</th><th>Trạng thái</th><th>Tiến độ</th></tr></thead><tbody>{% for j in jobs %}<tr><td>{{j.created_at|date_short}}</td><td>{{j.status}}</td><td>{{j.output_used}} / {{j.output_budget}}</td></tr>{% else %}<tr><td colspan="3">Chưa có review</td></tr>{% endfor %}</tbody></table></div></div></div>
+<div class="col-12"><div class="card"><div class="card-header"><h3 class="card-title">Project Audit</h3></div><div class="table-responsive"><table class="table table-vcenter"><thead><tr><th>Thời gian</th><th>Hành động</th><th>Actor</th></tr></thead><tbody>{% for e in events %}<tr><td>{{e.created_at|date_short}}</td><td>{{e.action}}</td><td><code>{{(e.actor_id or '')[:8]}}</code></td></tr>{% else %}<tr><td colspan="3">Chưa có sự kiện</td></tr>{% endfor %}</tbody></table></div></div></div>
+</div>
+{% endblock %}

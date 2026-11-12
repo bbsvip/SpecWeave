@@ -1,0 +1,27 @@
+<section class="content-card mb-3" id="openaiOAuthApp" data-enabled="{{'true' if oauth_local else 'false'}}">
+  <div class="card-heading"><h3><i class="ti ti-lock-check"></i> OpenAI · Đăng nhập bằng ChatGPT</h3></div>
+  <p class="text-secondary small">Chỉ OpenAI hỗ trợ OAuth trong SpecWeave. Kết nối sử dụng cơ chế đăng nhập của Pi và lưu credential trong kho cục bộ của người sở hữu. Không chuyển access token, refresh token hoặc mã đăng nhập vào PostgreSQL.</p>
+  {% if oauth_local %}
+  <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+    <span id="openaiOAuthStatus" class="status-chip">Đang kiểm tra…</span>
+    <button class="btn btn-primary btn-sm" type="button" id="openaiOAuthConnect"><i class="ti ti-link"></i> Connect / Reconnect</button>
+    <button class="btn btn-outline-danger btn-sm" type="button" id="openaiOAuthDisconnect">Disconnect</button>
+  </div>
+  <div id="openaiOAuthFlow" class="d-none mt-3">
+    <p class="small text-secondary" id="openaiOAuthProgress">Đang tạo phiên xác thực…</p>
+    <a id="openaiOAuthLink" class="btn btn-outline-primary d-none" href="#" target="_blank" rel="noopener noreferrer">Mở trang xác thực OpenAI</a>
+    <div id="openaiOAuthCodeInfo" class="small my-2"></div>
+    <label class="field mt-2">Dán URL chuyển hướng cuối hoặc authorization code (chỉ khi được yêu cầu)
+      <input type="text" class="form-control" id="openaiOAuthAnswer" autocomplete="off" spellcheck="false" placeholder="Paste redirect URL / code">
+    </label>
+    <div class="d-flex gap-2 mt-2">
+      <button class="btn btn-primary btn-sm" id="openaiOAuthSend" type="button">Gửi mã để hoàn tất</button>
+      <button class="btn btn-outline-secondary btn-sm" id="openaiOAuthCancel" type="button">Hủy kết nối</button>
+    </div>
+    <p class="text-secondary small mt-2">Nếu trang báo không truy cập được localhost trên máy chủ khác, sao chép URL cuối cùng từ thanh địa chỉ vào ô trên. Không dán mã này vào chat hay file dự án.</p>
+  </div>
+  <div class="help-box mt-2"><i class="ti ti-info-circle"></i> Chỉ dùng trên runtime cá nhân do chính chủ ChatGPT kiểm soát, không dùng làm OAuth multi-tenant hoặc chia sẻ quota. Background review chỉ chạy khi chủ tài khoản tự khởi tạo. OpenAI có thể yêu cầu ứng dụng được cấp quyền Sign in with ChatGPT.</div>
+  {% else %}
+  <div class="help-box"><i class="ti ti-alert-circle"></i> OAuth đang tắt. Nếu chạy trên máy cá nhân do chính anh kiểm soát, bật <code>OPENAI_OAUTH_LOCAL_MODE=true</code> và Pi runner. Không bật trên dịch vụ managed/shared hosting.</div>
+  {% endif %}
+</section>

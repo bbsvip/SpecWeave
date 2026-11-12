@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Operations{% endblock %}
+{% block breadcrumb %}Operations{% endblock %}
+{% block content %}
+<div class="page-heading"><div><div class="eyebrow">ADMIN · OBSERVABILITY</div><h1>Operations</h1><p>Thống kê trạng thái hệ thống, không hiển thị prompt, API key hoặc dữ liệu riêng của dự án.</p></div><button type="button" class="btn btn-outline-primary" onclick="location.reload()">Làm mới</button></div>
+<div class="row row-cards mb-3">
+{% for title, value in [('Người dùng',stats.users),('Dự án',stats.projects),('Providers',stats.providers),('Models',stats.models),('Chat 24 giờ',stats.chat_last_24h),('Chat lỗi 24 giờ',stats.failed_chat_last_24h),('Review 24 giờ',stats.review_last_24h),('Audit 24 giờ',stats.audit_last_24h)] %}
+<div class="col-6 col-md-3"><div class="card"><div class="card-body"><div class="text-secondary small">{{title}}</div><div class="h1 mb-0">{{value}}</div></div></div></div>
+{% endfor %}
+</div>
+<div class="row row-cards">
+<div class="col-md-6"><div class="card"><div class="card-header"><h3 class="card-title">Chat runs · all time</h3></div><div class="card-body"><table class="table"><thead><tr><th>Trạng thái</th><th>Số lượng</th></tr></thead><tbody>{% for state, count in stats.chat_runs.items() %}<tr><td>{{state}}</td><td>{{count}}</td></tr>{% else %}<tr><td colspan="2">Chưa có dữ liệu</td></tr>{% endfor %}</tbody></table></div></div></div>
+<div class="col-md-6"><div class="card"><div class="card-header"><h3 class="card-title">Background review jobs · all time</h3></div><div class="card-body"><table class="table"><thead><tr><th>Trạng thái</th><th>Số lượng</th></tr></thead><tbody>{% for state, count in stats.review_jobs.items() %}<tr><td>{{state}}</td><td>{{count}}</td></tr>{% else %}<tr><td colspan="2">Chưa có dữ liệu</td></tr>{% endfor %}</tbody></table></div></div></div>
+</div><p class="text-secondary small mt-3">Snapshot: {{stats.generated_at}} · Đếm tổng hợp từ database, không phải hệ thống metrics thời gian thực.</p>
+{% endblock %}

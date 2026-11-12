@@ -1,0 +1,4 @@
+{% extends "base.html" %}{% block title %}Không thành công{% endblock %}
+{% block auth_content %}
+<section class="auth-card"><span class="brand-mark"><i class="ti ti-alert-triangle"></i></span><h2>Không thể tiếp tục</h2><p>{{message}}</p><a class="btn btn-primary" href="/login">Trở lại đăng nhập</a></section>
+{% endblock %}

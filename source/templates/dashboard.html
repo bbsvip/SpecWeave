@@ -1,0 +1,16 @@
+{% extends "base.html" %}{% block title %}Dashboard{% endblock %}{% block breadcrumb %}Dashboard{% endblock %}
+{% block content %}
+<div class="page-heading"><div><div class="eyebrow">YOUR WORKSPACE</div><h1>Buổi sáng tốt lành, {{ user.display_name or user.username }}.</h1><p>Tiếp tục những ý tưởng đang được định hình thành sản phẩm.</p></div><a class="btn btn-primary" href="/projects/new"><i class="ti ti-plus"></i> Tạo dự án mới</a></div>
+<div class="metrics-grid">
+  <div class="metric-card"><div class="metric-icon indigo"><i class="ti ti-stack-2"></i></div><div><span>Dự án</span><strong>{{stats.total}}</strong><small>Trong workspace</small></div></div>
+  <div class="metric-card"><div class="metric-icon emerald"><i class="ti ti-circle-check"></i></div><div><span>Đã duyệt</span><strong>{{stats.approved}}</strong><small>Sẵn sàng bàn giao</small></div></div>
+  <div class="metric-card"><div class="metric-icon amber"><i class="ti ti-git-branch"></i></div><div><span>Quyết định</span><strong>{{stats.decisions}}</strong><small>Được ghi nhận</small></div></div>
+  <div class="metric-card"><div class="metric-icon rose"><i class="ti ti-file-text"></i></div><div><span>Tài liệu</span><strong>{{stats.documents}}</strong><small>Trong các dự án</small></div></div>
+</div>
+<div class="section-heading"><div><h2>Dự án gần đây</h2><p>Tiếp tục thảo luận hoặc xem tài liệu đã tạo.</p></div><a href="/projects" class="subtle-link">Xem tất cả <i class="ti ti-arrow-right"></i></a></div>
+{% if projects %}<div class="project-grid">{% for item in projects[:9] %}
+<a class="project-tile" href="/projects/{{item.id}}"><div class="tile-top"><span class="tile-symbol"><i class="ti ti-sitemap"></i></span><span class="status-chip">{{item.stage|replace('_',' ')}}</span></div><h3>{{item.name}}</h3><p>{{item.description or 'Chưa có mô tả. Bắt đầu phiên khám phá cùng AI.'}}</p><div class="tile-foot"><span><i class="ti ti-clock"></i> {{item.updated_at|date_short}}</span><i class="ti ti-arrow-up-right"></i></div></a>
+{% endfor %}</div>
+{% else %}<div class="empty-panel"><span class="empty-illustration"><i class="ti ti-lightbulb"></i></span><h3>Ý tưởng tiếp theo bắt đầu ở đây.</h3><p>Tạo dự án đầu tiên. SpecWeave sẽ cùng anh khám phá yêu cầu, lựa chọn giải pháp và xuất tài liệu chi tiết.</p><a class="btn btn-primary" href="/projects/new"><i class="ti ti-plus"></i> Tạo dự án đầu tiên</a></div>{% endif %}
+<div class="tips-strip"><span><i class="ti ti-sparkles"></i> Planning first</span><p>BMAD-guided discovery · Human-approved decisions · Project-isolated memory · Markdown handoff</p></div>
+{% endblock %}

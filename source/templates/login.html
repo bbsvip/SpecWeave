@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Đăng nhập{% endblock %}
+{% block auth_content %}
+<section class="auth-card">
+  <div class="auth-brand"><span class="brand-mark"><i class="ti ti-sitemap"></i></span><strong>SpecWeave</strong></div>
+  <div class="eyebrow">YOUR PRIVATE PLANNING SPACE</div>
+  <h1>Chào mừng trở lại.</h1>
+  <p class="text-secondary">Biến ý tưởng thành yêu cầu rõ ràng, quyết định có căn cứ và bản thiết kế sẵn sàng triển khai.</p>
+  {% if created %}<div class="alert alert-success">Tài khoản quản trị đã tạo thành công. Vui lòng đăng nhập.</div>{% endif %}
+  <form method="post" action="/login" class="form-stack">
+    <label class="form-label">Username hoặc email <input name="username" class="form-control" autocomplete="username" required autofocus placeholder="Tên đăng nhập"></label>
+    <label class="form-label">Mật khẩu <input name="password" type="password" class="form-control" autocomplete="current-password" required placeholder="Nhập mật khẩu"></label>
+    <button class="btn btn-primary w-100" type="submit">Đăng nhập <i class="ti ti-arrow-right"></i></button>
+  </form>
+  <div class="auth-trust"><i class="ti ti-lock"></i> Dữ liệu dự án được lưu trong workspace riêng của anh.</div>
+</section>
+{% endblock %}

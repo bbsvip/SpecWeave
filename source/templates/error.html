@@ -1,0 +1,2 @@
+{% extends "base.html" %}{% block title %}Lỗi {{status}}{% endblock %}
+{% block auth_content %}<section class="auth-card"><div class="eyebrow">ERROR {{status}}</div><h1>Không thể mở trang này.</h1><p>{{message}}</p><a href="/" class="btn btn-primary">Về trang chủ</a></section>{% endblock %}

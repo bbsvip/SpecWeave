@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="vi" data-bs-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="csrf-token" content="{{ csrf|default('') }}">
+  <title>{% block title %}SpecWeave{% endblock %} · SpecWeave</title>
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+  <link href="{{url_for('static',path='/vendor/npm/@tabler/core@1.7.4/dist/css/tabler.min.css') if assets_local else 'https://cdn.jsdelivr.net/npm/@tabler/core@1.7.4/dist/css/tabler.min.css'}}" rel="stylesheet">
+  <link href="{{url_for('static',path='/vendor/npm/@tabler/icons-webfont@3.35.0/dist/tabler-icons.min.css') if assets_local else 'https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.35.0/dist/tabler-icons.min.css'}}" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', path='/css/app.css') }}">
+  {% block head %}{% endblock %}
+</head>
+<body>
+{% if user %}
+<div class="app-shell" id="appShell">
+  <aside class="app-sidebar" id="sidebar">
+    <a class="brand" href="/" aria-label="SpecWeave home">
+      <span class="brand-mark"><i class="ti ti-sitemap"></i></span>
+      <span class="brand-words"><strong>SpecWeave</strong><small>AI planning workspace</small></span>
+    </a>
+    <div class="side-section-label">WORKSPACE</div>
+    <nav class="side-nav" aria-label="Điều hướng chính">
+      <a href="/" class="side-link {% if active|default('') == 'dashboard' %}active{% endif %}"><i class="ti ti-layout-dashboard"></i><span>Tổng quan</span></a>
+      <a href="/projects" class="side-link {% if active|default('') == 'projects' %}active{% endif %}"><i class="ti ti-stack-2"></i><span>Tất cả dự án</span></a>
+    </nav>
+    <nav class="side-nav" aria-label="Thư viện cá nhân"><a href="/presets" class="side-link {% if active|default('') == 'presets' %}active{% endif %}"><i class="ti ti-bookmarks"></i><span>Project Presets</span></a><a href="/projects/trash" class="side-link"><i class="ti ti-trash"></i><span>Thùng rác dự án</span></a></nav>
+    {% if pr is defined and pr %}
+    <div class="side-project"><div class="side-section-label">DỰ ÁN ĐANG MỞ</div><strong title="{{pr.name}}">{{pr.name}}</strong><small>{{pr.stage|replace('_',' ')|title}}</small></div>
+    <nav class="side-nav" aria-label="Điều hướng dự án">
+      <a href="/projects/{{pr.id}}" class="side-link {% if active|default('') == 'overview' %}active{% endif %}"><i class="ti ti-home-2"></i><span>Overview</span></a>
+      <a href="/projects/{{pr.id}}/discussion" class="side-link {% if active|default('') == 'discussion' %}active{% endif %}"><i class="ti ti-messages"></i><span>AI Discussion</span></a>
+      <a href="/projects/{{pr.id}}/artifacts" class="side-link {% if active|default('') == 'artifacts' %}active{% endif %}"><i class="ti ti-file-code"></i><span>BMAD Draft Generator</span></a>
+      <a href="/projects/{{pr.id}}/architecture" class="side-link {% if active|default('') == 'architecture' %}active{% endif %}"><i class="ti ti-sitemap"></i><span>Architecture</span></a>
+      <a href="/projects/{{pr.id}}/roadmap" class="side-link {% if active|default('') == 'roadmap' %}active{% endif %}"><i class="ti ti-calendar-stats"></i><span>Roadmap</span></a>
+      <a href="/projects/{{pr.id}}/intelligence" class="side-link {% if active|default('') == 'intelligence' %}active{% endif %}"><i class="ti ti-chart-dots-3"></i><span>Planning Intelligence</span></a>
+      <a href="/projects/{{pr.id}}/quality" class="side-link {% if active|default('') == 'quality' %}active{% endif %}"><i class="ti ti-shield-check"></i><span>Quality &amp; BMAD Review</span></a>
+      <a href="/projects/{{pr.id}}/requirements" class="side-link {% if active|default('') == 'requirements' %}active{% endif %}"><i class="ti ti-list-check"></i><span>Requirements</span></a>
+      <a href="/projects/{{pr.id}}/decisions" class="side-link {% if active|default('') == 'decisions' %}active{% endif %}"><i class="ti ti-git-branch"></i><span>Decisions</span></a>
+      <a href="/projects/{{pr.id}}/research" class="side-link {% if active|default('') == 'research' %}active{% endif %}"><i class="ti ti-world-search"></i><span>Research</span></a>
+      <a href="/projects/{{pr.id}}/documents" class="side-link {% if active|default('') == 'documents' %}active{% endif %}"><i class="ti ti-file-text"></i><span>Documents</span></a>
+      <a href="/projects/{{pr.id}}/files" class="side-link {% if active|default('') == 'files' %}active{% endif %}"><i class="ti ti-folder"></i><span>File Manager</span></a>
+      <a href="/projects/{{pr.id}}/export" class="side-link {% if active|default('') == 'export' %}active{% endif %}"><i class="ti ti-package-export"></i><span>Export Center</span></a>
+      <a href="/projects/{{pr.id}}/activity" class="side-link {% if active|default('') == 'activity' %}active{% endif %}"><i class="ti ti-history"></i><span>Activity & Runs</span></a>
+      <a href="/projects/{{pr.id}}/settings" class="side-link {% if active|default('') == 'settings' %}active{% endif %}"><i class="ti ti-adjustments-horizontal"></i><span>Project Settings</span></a>
+    </nav>
+    {% endif %}
+    {% if user.role == 'admin' %}
+    <div class="side-section-label">SYSTEM</div>
+    <nav class="side-nav" aria-label="Quản trị">
+      <a href="/settings/providers" class="side-link {% if active|default('') == 'providers' %}active{% endif %}"><i class="ti ti-cpu"></i><span>Providers & Models</span></a>
+      <a href="/settings/integrations" class="side-link {% if active|default('') == 'integrations' %}active{% endif %}"><i class="ti ti-plug-connected"></i><span>Integrations</span></a>
+      <a href="/admin/users" class="side-link {% if active|default('') == 'users' %}active{% endif %}"><i class="ti ti-users"></i><span>Users</span></a>
+      <a href="/admin/operations" class="side-link {% if active|default('') == 'operations' %}active{% endif %}"><i class="ti ti-activity"></i><span>Operations</span></a>
+      <a href="/admin/audit" class="side-link {% if active|default('') == 'audit' %}active{% endif %}"><i class="ti ti-clipboard-list"></i><span>Audit Logs</span></a>
+    </nav>
+    {% endif %}
+    <div class="side-section-label">ACCOUNT</div>
+    <nav class="side-nav"><a href="/settings/appearance" class="side-link {% if active|default('') == 'appearance' %}active{% endif %}"><i class="ti ti-palette"></i><span>Appearance</span></a><a href="/profile" class="side-link"><i class="ti ti-user"></i><span>Account & Sessions</span></a></nav>
+    <div class="sidebar-bottom"><span class="dot-online"></span> Self-hosted · Project isolated <small>v0.8.0</small></div>
+  </aside>
+  <div class="main-column">
+    <header class="app-topbar">
+      <button class="icon-btn mobile-menu" id="mobileMenu" aria-label="Mở menu"><i class="ti ti-menu-2"></i></button>
+      <div class="topbar-location"><i class="ti ti-grid-dots"></i> <span>{% if pr is defined and pr %}{{ pr.name }}{% else %}Workspace{% endif %}</span><span class="topbar-separator">/</span><strong>{% block breadcrumb %}Overview{% endblock %}</strong></div>
+      <div class="topbar-tools">
+        <a class="btn btn-sm btn-primary btn-new" href="/projects/new"><i class="ti ti-plus"></i><span>New Project</span></a>
+        <button class="icon-btn" id="themeToggle" title="Chuyển giao diện"><i class="ti ti-moon"></i></button>
+        <a class="user-pill" href="/profile"><span class="avatar-mini">{{(user.display_name or user.username)[0]|upper}}</span><span>{{user.display_name or user.username}}</span><i class="ti ti-chevron-down"></i></a>
+      </div>
+    </header>
+    <main class="app-content">{% block content %}{% endblock %}</main>
+  </div>
+</div>
+<div class="mobile-overlay" id="mobileOverlay"></div>
+{% else %}
+<main class="auth-layout">{% block auth_content %}{% endblock %}</main>
+{% endif %}
+<div class="toast-container" id="toasts" aria-live="polite"></div>
+<script defer src="{{url_for('static',path='/vendor/npm/@tabler/core@1.7.4/dist/js/tabler.min.js') if assets_local else 'https://cdn.jsdelivr.net/npm/@tabler/core@1.7.4/dist/js/tabler.min.js'}}"></script>
+<script defer src="{{ url_for('static', path='/js/app.js') }}"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>
