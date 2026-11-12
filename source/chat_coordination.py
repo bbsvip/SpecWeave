@@ -6,7 +6,15 @@ import asyncio
 import hashlib
 from contextlib import asynccontextmanager
 from sqlalchemy import text
-from db import engine, SessionLocal, AgentRun, PlanningQuestion
+from fastapi import HTTPException
+from db import engine, SessionLocal, AgentRun, PlanningQuestion, Project
+from project_trash import TRASH_STATUSES
+
+
+def lock_project_write(db, project_id):
+    row = db.query(Project.id).filter(Project.id==project_id,Project.status.not_in(TRASH_STATUSES)).with_for_update().first()
+    if row is None:
+        raise HTTPException(404,'Project not found')
 
 LOCAL_LOCKS = {}
 
@@ -53,10 +61,11 @@ async def discussion_lease(discussion_id: str):
                 conn.invalidate()
         conn.close()
 
-def cancellation_requested(run_id: str) -> bool:
+def cancellation_requested(run_id: str, *, claim=None) -> bool:
     with SessionLocal() as db:
         run = db.get(AgentRun, run_id)
-        return run is None or bool(run.cancel_requested) or run.status != 'running'
+        return (run is None or bool(run.cancel_requested) or run.status != 'running'
+                or (claim is not None and run.worker_owner!=claim))
 
 
 def clear_chat_continuation(db, run):

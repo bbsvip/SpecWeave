@@ -7,12 +7,14 @@ def _non_negative(value):
 def normalize_usage(raw, *, source):
     if not isinstance(raw, dict): return {}
     input_count = _non_negative(raw.get('prompt_tokens'))
+    if input_count is None: input_count = _non_negative(raw.get('input_tokens'))
     if input_count is None: input_count = _non_negative(raw.get('inputTokens'))
     if input_count is None: input_count = _non_negative(raw.get('input'))
     output_count = _non_negative(raw.get('completion_tokens'))
+    if output_count is None: output_count = _non_negative(raw.get('output_tokens'))
     if output_count is None: output_count = _non_negative(raw.get('outputTokens'))
     if output_count is None: output_count = _non_negative(raw.get('output'))
-    details = raw.get('prompt_tokens_details') or {}
+    details = raw.get('prompt_tokens_details') or raw.get('input_tokens_details') or {}
     if not isinstance(details, dict): details={}
     cache_read = _non_negative(details.get('cached_tokens'))
     if cache_read is None: cache_read = _non_negative(raw.get('cacheRead'))
@@ -39,34 +41,45 @@ def accumulate_usage(total, item):
             result[key] = result.get(key,0) + item[key]
     return result
 
-async def with_heartbeat(events, interval_seconds=12.0):
+async def with_heartbeat(events, interval_seconds=12.0, *, check=None):
     """Keep reverse proxies (including tunnels) alive during long model prefill/tool calls.
 
     A pending __anext__ is *not* cancelled on timeout: that would abort the
     model stream. Only cancel on actual consumer shutdown.
     """
     import asyncio
+    from chat_coordination import ChatStopped
     iterator=events.__aiter__()
     pending=asyncio.create_task(anext(iterator))
+    loop=asyncio.get_running_loop()
+    heartbeat_at=loop.time()+interval_seconds
+    check_at=loop.time()
     try:
         while True:
-            ready,_=await asyncio.wait({pending},timeout=interval_seconds)
+            now=loop.time()
+            if check and now>=check_at:
+                if check():
+                    raise ChatStopped()
+                check_at=now+1.5
+            deadline=min(heartbeat_at,check_at) if check else heartbeat_at
+            ready,_=await asyncio.wait({pending},timeout=max(0,deadline-now))
             if not ready:
-                yield 'status', {'phase':'waiting','message':'Model vẫn đang xử lý…'}
+                if loop.time()>=heartbeat_at:
+                    heartbeat_at=loop.time()+interval_seconds
+                    yield 'status', {'phase':'waiting','message':'Model vẫn đang xử lý…'}
                 continue
             try:
                 item=pending.result()
             except StopAsyncIteration:
                 break
             yield item
+            heartbeat_at=loop.time()+interval_seconds
             pending=asyncio.create_task(anext(iterator))
     finally:
-        if pending and not pending.done():
-            pending.cancel()
-            try:
-                await pending
-            except asyncio.CancelledError:
-                pass
+        if pending:
+            if not pending.done():
+                pending.cancel()
+            await asyncio.gather(pending,return_exceptions=True)
 
 _SECRET_KEYS = frozenset({'api_key','apikey','authorization','access_token','refresh_token','password',
                           'provider_key','tool_token','cookie','client_secret','secret'})

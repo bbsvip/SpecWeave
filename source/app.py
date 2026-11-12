@@ -32,8 +32,9 @@ from security import (hash_password, verify_password, new_session, current_auth,
                       check_csrf, encrypt, decrypt, validate_encryption_key, SESSION_COOKIE)
 from storage import (DATA_ROOT, PROJECTS_ROOT, project_root, resolve, init_project, list_entries,
                      read_text, write_text, remove, move, atomic_text, project_usage, enforce_project_quota, storage_limits)
-from ai import pi_stream, tool_call, pi_tool_token, TOOLS, ROLES, MODES, plan_prompt
-from openai_oauth_gateway import enabled as openai_oauth_enabled, require_access as openai_oauth_access, relay as openai_oauth_relay
+from ai import ROLES, MODES
+from harness import SYSTEM, facts_for, facts_text, harness_stream, validate_plan
+from model_runtime import require_model, endpoint as provider_endpoint
 from planning import save_question, question_payload, answer_question, QUESTION_JSON_INSTRUCTIONS
 from intelligence import (coverage_report, graph_payload, report_markdown, link_nodes,
                           project_node, add_phase_dependency, phase_review_blockers)
@@ -44,7 +45,7 @@ from planning_engine import (STEPS, SOURCE_KINDS, VERIFY_STATES, stage_current, 
                              quality_export, adversarial_review)
 from review_queue import create_review_job, job_payload, TERMINAL
 from provider_management import owned_provider, impact as provider_impact, delete_provider as perform_provider_deletion, delete_models as perform_model_deletion
-from chat_coordination import discussion_lease, ChatBusy, ChatStopped, cancellation_requested, clear_chat_continuation
+from chat_coordination import discussion_lease, ChatBusy, ChatStopped, cancellation_requested, clear_chat_continuation, lock_project_write
 from chat_content import (EMPTY_REPLY, OUTPUT_LIMIT_PHASES, display_user_message, parse_model_response,
                           split_incomplete_tool_call, turn_notice)
 from chat_events import with_heartbeat
@@ -69,7 +70,7 @@ templates.env.filters["display_user_message"] = display_user_message
 templates.env.filters["pretty_json"] = lambda v: json.dumps(v, indent=2, ensure_ascii=False, default=str)
 
 def pretty_tool_value(value):
-    """Unicode-safe display, never alters the actual Pi tool arguments."""
+    """Unicode-safe display, never alters the actual SpecWeave tool arguments."""
     def decode(obj):
         if isinstance(obj,str):
             return re.sub(r'\\u([0-9a-fA-F]{4})',lambda m:chr(int(m.group(1),16)),obj)
@@ -132,16 +133,6 @@ def acl(db,project_id,user,write=False,owner=False):
     if not row or (write and row.role not in ("editor",)) or owner:
         raise HTTPException(403,"Bạn không có quyền với dự án")
     return pr
-
-def lock_project_write(db, pid):
-    """Serialize critical project mutations on PostgreSQL transaction boundary.
-
-    SQLite in single-worker development has no FOR UPDATE; Docker production uses
-    PostgreSQL. Keep this guard short; never hold it across model/browser fetches.
-    """
-    row = db.query(Project.id).filter(Project.id==pid,Project.status.not_in(TRASH_STATUSES)).with_for_update().first()
-    if row is None:
-        raise HTTPException(404,'Project not found')
 
 def api_guard(request,db,change=False):
     user,session = require_auth(db,request)
@@ -278,8 +269,7 @@ def new_project_page(request:Request,db:Session=Depends(get_db)):
     u,s,redirect=auth_page(request,db)
     if redirect:return redirect
     presets=db.query(Preset).filter_by(user_id=u.id).order_by(Preset.created_at.desc()).all()
-    models=[m for m in db.query(Model).join(Provider).filter(Model.enabled==True,Provider.enabled==True).all()
-            if m.provider.kind!='openai-oauth' or m.provider.owner_id==u.id]
+    models=db.query(Model).join(Provider).filter(Model.enabled==True,Provider.enabled==True,Provider.kind!='openai-oauth').all()
     return page(request,"project_new.html",db=db,user=u,session=s,presets=presets,models=models,active="projects")
 
 @app.post("/api/projects")
@@ -293,13 +283,13 @@ async def create_project(request:Request,db:Session=Depends(get_db)):
     if not isinstance(profile,dict):raise HTTPException(422,"Profile không hợp lệ")
     if len(json.dumps(profile,ensure_ascii=False).encode('utf-8'))>64*1024:
         raise HTTPException(413,'Project profile exceeds 64 KiB')
+    profile={key:value for key,value in profile.items() if not key.startswith('_')}
     chosen_model=data.get('model_id') or None
     if chosen_model:
         candidate=db.get(Model,chosen_model) if isinstance(chosen_model,str) else None
         if not candidate or not candidate.enabled or not candidate.provider.enabled:
             raise HTTPException(422,'Selected model is unavailable')
-        if candidate.provider.kind=='openai-oauth' and candidate.provider.owner_id!=u.id:
-            raise HTTPException(403,'OpenAI OAuth model belongs to another user')
+        require_model(candidate)
     pr=Project(name=name,slug=slug,description=nonempty(data,"description")[:6000],owner_id=u.id,profile=profile,
                active_model_id=chosen_model,thinking_level=data.get("thinking", "medium"))
     if pr.thinking_level not in ("off","minimal","low","medium","high","xhigh","max"):pr.thinking_level="medium"
@@ -338,8 +328,7 @@ def project_settings(pid:str,request:Request,db:Session=Depends(get_db)):
     u,s,redirect=auth_page(request,db)
     if redirect:return redirect
     pr=acl(db,pid,u,write=True)
-    models=[m for m in db.query(Model).join(Provider).filter(Model.enabled==True,Provider.enabled==True).all()
-            if m.provider.kind!='openai-oauth' or (pr.owner_id==u.id and m.provider.owner_id==u.id)]
+    models=db.query(Model).join(Provider).filter(Model.enabled==True,Provider.enabled==True,Provider.kind!='openai-oauth').all()
     members=db.query(Membership).filter_by(project_id=pid).all()
     users={x.id:x for x in db.query(User).all() if x.id in [m.user_id for m in members]}
     return page(request,"project_settings.html",db=db,user=u,session=s,pr=pr,models=models,members=members,users=users,workflow_active=db.query(WorkflowCheckpoint).filter_by(project_id=pid).count()>0,active="settings")
@@ -348,6 +337,8 @@ def project_settings(pid:str,request:Request,db:Session=Depends(get_db)):
 async def update_project(pid:str,request:Request,db:Session=Depends(get_db)):
     u,s=api_guard(request,db,True);pr=acl(db,pid,u,write=True)
     data=await request.json()
+    lock_project_write(db,pid)
+    db.refresh(pr)
     if "name" in data: pr.name=str(data["name"]).strip()[:200]
     if "description" in data:pr.description=str(data["description"])[:6000]
     if "stage" in data and data["stage"] in STAGES:
@@ -360,17 +351,17 @@ async def update_project(pid:str,request:Request,db:Session=Depends(get_db)):
             candidate=db.get(Model,mid) if isinstance(mid,str) else None
             if not candidate or not candidate.enabled or not candidate.provider.enabled:
                 raise HTTPException(422,'Selected model is unavailable')
-            if candidate.provider.kind=='openai-oauth' and (pr.owner_id!=u.id or candidate.provider.owner_id!=u.id):
-                raise HTTPException(403,'OpenAI OAuth model is private to its owner')
+            require_model(candidate)
         pr.active_model_id=mid
     if "thinking_level" in data and data["thinking_level"] in ("off","minimal","low","medium","high","xhigh","max"):
         pr.thinking_level=data["thinking_level"]
-    pr.agent_backend='pi'  # Pi SDK is the only available agent engine
+    pr.agent_backend='native'
     if "profile" in data:
         if not isinstance(data["profile"],dict):raise HTTPException(422,'Project profile must be an object')
         if len(json.dumps(data["profile"],ensure_ascii=False).encode('utf-8'))>64*1024:
             raise HTTPException(413,'Project profile exceeds 64 KiB')
-        pr.profile=data["profile"]
+        pr.profile={**{key:value for key,value in (pr.profile or {}).items() if key.startswith('_')},
+                    **{key:value for key,value in data['profile'].items() if not key.startswith('_')}}
     if 'quality_review_required' in data:
         if data['quality_review_required'] not in (True,False):raise HTTPException(422,'Invalid quality_review_required')
         p=dict(pr.profile or {});p['quality_review_required']=data['quality_review_required'];pr.profile=p
@@ -395,7 +386,7 @@ def delete_project(pid:str,request:Request,db:Session=Depends(get_db)):
     u,s=api_guard(request,db,True);pr=acl(db,pid,u,owner=True)
     lock_project_write(db,pid)
     if project_has_active_work(db,pid):
-        raise HTTPException(409,'Hãy dừng hoặc chờ các lượt Pi và review kết thúc trước khi chuyển vào thùng rác')
+        raise HTTPException(409,'Hãy dừng hoặc chờ các lượt chạy và review kết thúc trước khi chuyển vào thùng rác')
     pr.status='deleted'
     pr.deleted_at=utcnow()
     audit(db,u,'project_soft_delete',pr)
@@ -1135,6 +1126,7 @@ def discovery_progress(pid:str,request:Request,discussion_id:str,db:Session=Depe
 @app.post("/api/projects/{pid}/planning/questions/{qid}/answer")
 async def submit_planning_answer(pid:str, qid:str, request:Request, db:Session=Depends(get_db)):
     u,s=api_guard(request,db,True);pr=acl(db,pid,u,write=True)
+    lock_project_write(db,pid)
     item=db.get(PlanningQuestion,qid)
     if not item or item.project_id!=pid:raise HTTPException(404,"Question not found")
     data=await request.json()
@@ -1145,7 +1137,7 @@ async def submit_planning_answer(pid:str, qid:str, request:Request, db:Session=D
 
 @app.post("/api/projects/{pid}/planning/questions/suggest")
 async def suggest_planning_question(pid:str,request:Request,db:Session=Depends(get_db)):
-    """Generate a decision card through a one-shot Pi SDK AgentSession.
+    """Generate a decision card through a one-shot model completion.
 
     The output remains a proposal; only humans approve project decisions.
     """
@@ -1159,24 +1151,16 @@ async def suggest_planning_question(pid:str,request:Request,db:Session=Depends(g
     model=db.get(Model,pr.active_model_id) if pr.active_model_id else None
     if not model or not model.enabled or not model.provider.enabled:
         raise HTTPException(409,"Hãy chọn model hoạt động trong Project Settings")
-    openai_oauth_access(pr,model,u.id)
-    history=db.query(Message).filter_by(discussion_id=did).order_by(Message.created_at.desc()).limit(10).all()[::-1]
-    system=plan_prompt(pr,db,"analyst","discovery",discussion_id=did)+"\n"+QUESTION_JSON_INSTRUCTIONS
-    messages=[{"role":"system","content":system}]
-    messages += [{"role":m.role,"content":m.content[:2500]} for m in history]
-    messages.append({"role":"user","content":"Đọc hồ sơ dự án và đề xuất câu hỏi QUAN TRỌNG NHẤT chưa được trả lời. Kèm 2-4 phương án có phân tích và một đề xuất mặc định. Chỉ trả JSON."})
-    from pi_client import complete as pi_complete
+    require_model(model)
+    facts=facts_for(db,pr,did)
+    cap=min(model.max_output_tokens,2400,model.context_window//3)
+    context=facts_text(facts,max(0,min(10000,model.context_window-cap-2000)))
+    from model_runtime import complete as model_complete
     try:
-        outcome=await pi_complete(pr,model,u.id,system_context=system,
-            message='\n\n'.join(f"[{m['role'].upper()}] {m['content']}" for m in messages[1:]),
-            discussion_id=did)
-        content=outcome['text']
-        if isinstance(content,list):
-            content="".join(str(x.get("text", "")) for x in content if isinstance(x,dict))
-        raw=str(content).strip()
-        if raw.startswith("```"):
-            raw=re.sub(r"^```(?:json)?\s*|\s*```$","",raw,flags=re.I).strip()
-        question_data=json.loads(raw)
+        outcome=await model_complete(pr,model,u.id,system_context=SYSTEM,
+            message=QUESTION_JSON_INSTRUCTIONS+'\n\n'+context,discussion_id=did,max_tokens=cap)
+        question_data=validate_plan(outcome['text'],facts,questions_only=True)['question']
+        lock_project_write(db,pid)
         item,created=save_question(db,pid,did,question_data)
         audit(db,u,"planning_question_proposed",pr,{"question_id":item.id})
         db.commit()
@@ -1235,7 +1219,7 @@ def discussion_page(pid:str,request:Request,did:str="",db:Session=Depends(get_db
                 run_notices[run.id]=notice
             cleaned,_=split_incomplete_tool_call(message.content)
             replies[message.id]=parse_model_response(cleaned)[0] if cleaned.strip() != EMPTY_REPLY else ''
-    models=db.query(Model).join(Provider).filter(Model.enabled==True,Provider.enabled==True).all()
+    models=db.query(Model).join(Provider).filter(Model.enabled==True,Provider.enabled==True,Provider.kind!='openai-oauth').all()
     runs=(db.query(AgentRun).filter_by(project_id=pid,discussion_id=selected.id)
           .order_by(AgentRun.created_at.desc()).limit(7).all()) if selected else []
     response=page(request,"discussion.html",db=db,user=u,session=s,pr=pr,discussions=discussions,discussion=selected,messages=messages,
@@ -1262,7 +1246,7 @@ async def chat_stream(pid:str,request:Request,db:Session=Depends(get_db)):
 
 @app.post("/api/projects/{pid}/chat/start")
 async def chat_start(pid:str,request:Request,db:Session=Depends(get_db)):
-    """Start a durable Pi run. The tab is a subscriber, never the job owner."""
+    """Start a durable lượt chạy. The tab is a subscriber, never the job owner."""
     u,s=api_guard(request,db,True);pr=acl(db,pid,u,write=True)
     data=await request.json()
     if not isinstance(data,dict):raise HTTPException(422,'Invalid chat payload')
@@ -1271,7 +1255,7 @@ async def chat_start(pid:str,request:Request,db:Session=Depends(get_db)):
 
 @app.post("/api/projects/{pid}/planning/questions/{qid}/answer-start")
 async def answer_and_start(pid:str,qid:str,request:Request,db:Session=Depends(get_db)):
-    """Atomically accept one answer and enqueue its Pi continuation."""
+    """Atomically accept one answer and enqueue its lượt Discovery tiếp theo."""
     u,s=api_guard(request,db,True);pr=acl(db,pid,u,write=True)
     payload=await request.json()
     if not isinstance(payload,dict) or payload.get('action','answer')!='answer':
@@ -1284,7 +1268,7 @@ async def answer_and_start(pid:str,qid:str,request:Request,db:Session=Depends(ge
     model=db.get(Model,pr.active_model_id) if pr.active_model_id else None
     if not model or not model.enabled or not model.provider.enabled:
         raise HTTPException(409,'Hãy chọn model trước khi trả lời')
-    openai_oauth_access(pr,model,u.id)
+    require_model(model)
     answer_question(db,q,payload,commit=False)
     audit(db,u,'planning_answer_background',pr,{'question_id':qid})
     return await _chat_stream_impl(pid,db,u,pr,{
@@ -1379,7 +1363,7 @@ def detached_run_events(pid:str,run_id:str,request:Request,after:int=0,db:Sessio
 
 @app.post("/api/projects/{pid}/planning/questions/{qid}/answer-stream")
 async def answer_and_stream(pid:str,qid:str,request:Request,db:Session=Depends(get_db)):
-    """One atomic user interaction: persist the choice AND start Pi SSE.
+    """One atomic user interaction: persist the choice AND start SpecWeave SSE.
 
     Previously these were two independent frontend requests; a dropped second
     request left a user answer in chat with no assistant response.
@@ -1395,7 +1379,7 @@ async def answer_and_stream(pid:str,qid:str,request:Request,db:Session=Depends(g
     model=db.get(Model,pr.active_model_id) if pr.active_model_id else None
     if not model or not model.enabled or not model.provider.enabled:
         raise HTTPException(409,'Hãy chọn model hoạt động trước khi trả lời')
-    openai_oauth_access(pr,model,u.id)
+    require_model(model)
     # The question already owns its discussion_id: never trust one from the browser.
     answer_question(db,q,payload)
     audit(db,u,'planning_answer_stream',pr,{'question_id':qid})
@@ -1405,17 +1389,14 @@ async def answer_and_stream(pid:str,qid:str,request:Request,db:Session=Depends(g
         'role':payload.get('role','analyst'), 'mode':'discovery'})
 
 
-async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_run_id=None):
+async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_run_id=None, existing_claim=None):
     did=str(data.get("discussion_id",""))
     discussion=db.get(Discussion,did)
     if not discussion or discussion.project_id!=pid:raise HTTPException(404,"Discussion not found")
     model=db.get(Model,pr.active_model_id) if pr.active_model_id else None
     if not model or not model.enabled or not model.provider.enabled:
         raise HTTPException(409,"Chưa chọn model hoạt động. Vào Settings → Providers rồi chọn model cho dự án.")
-    openai_oauth_access(pr,model,u.id)
-    if model.provider.kind=='openai-oauth':
-        status=await openai_oauth_relay('GET','/oauth/openai/status')
-        if not status.get('connected'):raise HTTPException(409,'OpenAI chưa được kết nối trên Pi runtime')
+    require_model(model)
     content=str(data.get("message","")).strip()
     continue_qid=str(data.get('continue_question_id') or '').strip()
     advance=bool(data.get('advance_planning',False))
@@ -1425,9 +1406,9 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
         if str(data.get('mode',discussion.mode))!='discovery':
             raise HTTPException(422,'Only discovery can advance automatically')
         pending=db.query(PlanningQuestion).filter_by(project_id=pid,discussion_id=did,status='pending').first()
-        if pending:
+        if pending and not existing_run_id:
             raise HTTPException(409,'Hãy trả lời câu hỏi đang chờ trước')
-        if (pr.profile or {}).get('_discovery',{}).get('status')=='draft_ready':
+        if not existing_run_id and (pr.profile or {}).get('_discovery',{}).get('status')=='draft_ready':
             raise HTTPException(409,'Discovery đã hoàn tất; xem tài liệu draft')
     if not existing_run_id:
         lock_project_write(db,pid)
@@ -1448,15 +1429,23 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
     if role not in ROLES:role="analyst"
     if mode not in MODES:mode="discovery"
     if queue_only:
-        # Serialize enqueue by project row. Only one pending/running Pi run per
+        # Serialize enqueue by project row. Only one pending/running lượt chạy per
         # discussion: prevents double clicks and cross-worker race conditions.
         busy=(db.query(AgentRun).filter_by(project_id=pid,discussion_id=did)
               .filter(AgentRun.status.in_(['queued','running'])).first())
-        if busy:raise HTTPException(409,'Phiên đang có Pi run; hãy theo dõi run hiện tại')
+        if busy:raise HTTPException(409,'Phiên đang có lượt chạy; hãy theo dõi run hiện tại')
+    if not existing_run_id:
+        # Only server-owned fields can control recovery and checkpoint state.
+        request_payload={'discussion_id':did,'message':content,'role':role,'mode':mode,
+                         'continue_question_id':continue_qid,'advance_planning':advance,
+                         'auto_next':data.get('auto_next') is True,'_active_model_id':model.id}
+        if queue_only and mode=='discovery' and (pr.profile or {}).get('_discovery',{}).get('status')!='draft_ready':
+            waiting=db.query(PlanningQuestion.id).filter_by(project_id=pid,discussion_id=did,status='pending').first()
+            request_payload['_resume_discovery']=not waiting
     run=(db.get(AgentRun,existing_run_id) if existing_run_id else
          AgentRun(project_id=pid,discussion_id=did,model_name=model.model_id,
            thinking=pr.thinking_level,status='queued' if queue_only else 'running',
-           requester_id=u.id,request_payload={**dict(data),'_active_model_id':model.id}))
+           requester_id=u.id,request_payload=request_payload))
     if not existing_run_id:db.add(run)
     db.flush()
     if continue_qid and not existing_run_id:
@@ -1466,14 +1455,14 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
         if content:
             db.add(Message(discussion_id=did,role='user',content=content,run_id=run.id))
         db.add(ChatStreamEvent(run_id=run.id,event={'type':'status','run_id':run.id,
-               'payload':{'phase':'queued','message':'Pi đã nhận công việc, đang đợi worker…'}},created_at=utcnow()))
+               'payload':{'phase':'queued','message':'SpecWeave đã nhận công việc, đang đợi worker…'}},created_at=utcnow()))
     db.commit()
     run_id=run.id
     if queue_only:
         return {'run_id':run_id,'status':'queued','events_url':f'/api/projects/{pid}/runs/{run_id}/events'}
-    backend='pi'
+    backend='native'
     actor_id=u.id
-    worker_owner=run.worker_owner
+    worker_owner=existing_claim
 
     def locked_run(sdb):
         current=sdb.get(AgentRun,run_id,populate_existing=True,with_for_update=True)
@@ -1507,9 +1496,9 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
                         async for event in events:
                             yield event
             except ChatBusy:
-                # A previous Pi run may have committed its terminal status while
+                # A previous lượt chạy may have committed its terminal status while
                 # still holding the advisory lock. Do NOT fail the next run: the
-                # user has already submitted it and the Pi prompt has not run.
+                # user has already submitted it and the SpecWeave prompt has not run.
                 obj=locked_run(sdb)
                 if not obj:
                     return
@@ -1518,10 +1507,10 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
                     obj.worker_owner=None
                     obj.lease_expires_at=utcnow()+timedelta(seconds=3)
                     sdb.add(ChatStreamEvent(run_id=run_id,event=frame('status',{'phase':'waiting_lock',
-                        'message':'Pi đang hoàn tất lượt trước; tự chờ để tiếp tục…'})))
+                        'message':'SpecWeave đang hoàn tất lượt trước; tự chờ để tiếp tục…'})))
                     sdb.commit()
                     return
-                message='Đã hủy lượt Pi' if obj.cancel_requested else 'Một lượt thảo luận đang chạy'
+                message='Đã hủy lượt chạy' if obj.cancel_requested else 'Một lượt thảo luận đang chạy'
                 obj.status='cancelled' if obj.cancel_requested else 'error'
                 obj.error=message;obj.finished_at=utcnow()
                 clear_chat_continuation(sdb,obj)
@@ -1534,41 +1523,24 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
         first_token_ms=None
         usage={}
         thinking_trace=None
-        document_output_limited=False
         output_limited=False
         was_draft_ready=(p.profile or {}).get('_discovery',{}).get('status')=='draft_ready'
         def emit(event_type,payload=None,**extra):
             return wire(frame(event_type,payload or {},**extra))
         try:
-            if cancellation_requested(run_id):
+            if cancellation_requested(run_id,claim=worker_owner):
                 raise ChatStopped()
             yield emit('start',{'model':m.model_id,'backend':backend,'context_window':m.context_window,
                                 'continued':bool(continue_qid),'automatic':advance})
-            yield emit('status',{'phase':'request','message':'Pi đang tiếp nhận ngữ cảnh dự án…'})
-            advance_prompt=(
-                'Tiếp tục discovery trong CÙNG session. Đọc câu trả lời mới nhất và lịch sử, '
-                'đánh giá những vấn đề chưa rõ. Nếu chưa đủ thông tin, gọi tool '
-                'propose_planning_question cho MỘT câu hỏi quan trọng tiếp theo, có các phương án cụ thể. '
-                'Nếu thực sự đã đủ dữ liệu để soạn đặc tả có giá trị, sử dụng tool '
-                'write_document, mỗi lệnh chỉ ghi một phần 400–800 ký tự. Nối phần sau bằng '
-                'append_to_revision theo revision đã lưu. Khi đủ bản nháp, gọi finish_discovery. '
-                'Không tự phê duyệt tài liệu. Nếu model không gọi được tool, hãy trả về '
-                'DUY NHẤT một JSON object cho câu hỏi theo schema sau: '
-                + QUESTION_JSON_INSTRUCTIONS
-            )
-
-            async def stream_attempt(prompt):
-                nonlocal first_token_ms, thinking_trace, full, document_output_limited, output_limited
-                output_limited=False
+            yield emit('status',{'phase':'request','message':'SpecWeave đang tiếp nhận ngữ cảnh dự án…'})
+            async def stream_attempt():
+                nonlocal first_token_ms, thinking_trace, full, output_limited
                 attempt_usage={}
-                pi_kwargs={'role':role,'mode':mode,'run_id':run_id,'actor_id':actor_id}
-                if prompt is not None:
-                    pi_kwargs['prompt_override']=prompt
-                stream=pi_stream(p,d,sdb,m,**pi_kwargs)
-                async with aclosing(stream), aclosing(with_heartbeat(stream)) as events:
+                stream=harness_stream(p,d,sdb,m,role=role,mode=mode,run_id=run_id,actor_id=actor_id,claim=worker_owner)
+                async with aclosing(stream), aclosing(with_heartbeat(
+                    stream, check=lambda: cancellation_requested(run_id,claim=worker_owner)
+                )) as events:
                     async for typ,payload in events:
-                        if cancellation_requested(run_id):
-                            raise ChatStopped()
                         if typ in ('delta','thinking'):
                             part=payload.get('text','')
                             if typ=='delta':
@@ -1593,11 +1565,9 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
                                 if v is not None:
                                     attempt_usage[k]=v
                         elif typ=='error':
-                            raise RuntimeError(payload.get('message','Lỗi Pi Runner'))
+                            raise RuntimeError(payload.get('message','Lỗi model'))
                         if typ=='status' and payload.get('phase') in OUTPUT_LIMIT_PHASES:
                             output_limited=True
-                            if payload['phase']=='document_output_limit':
-                                document_output_limited=True
                         is_trace_event=typ=='status' or (typ=='tool' and payload.get('status') not in ('toolcall_delta','update'))
                         if is_trace_event and len(trace)<64:
                             item={'type':typ,'at_ms':int((time.monotonic()-clock)*1000)}
@@ -1621,68 +1591,22 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
 
             def resolve_planning_output():
                 raw,incomplete_tool=split_incomplete_tool_call(''.join(full).strip())
-                output, brief=parse_model_response(raw,interactive=bool(existing_run_id and mode=='discovery'))
+                output=parse_model_response(raw)[0]
                 sdb.expire_all()
                 pending=sdb.query(PlanningQuestion).filter_by(
                     project_id=pid,discussion_id=did,status='pending').order_by(PlanningQuestion.created_at.desc()).first()
                 discovery=(sdb.get(Project,pid).profile or {}).get('_discovery',{})
-                if brief and not pending and discovery.get('status')!='draft_ready':
-                    try:
-                        pending,_=save_question(sdb,pid,did,brief)
-                    except (ValueError,TypeError,KeyError):
-                        output=parse_model_response(raw)[0]
                 return output, pending, discovery, incomplete_tool
 
-            async with aclosing(stream_attempt(advance_prompt if advance else None)) as events:
+            async with aclosing(stream_attempt()) as events:
                 async for event in events:
                     yield event
             output,pending,discovery,incomplete_tool=resolve_planning_output()
-            auto_next=bool(existing_run_id and data.get('auto_next') is True and mode=='discovery' and not advance)
-            retry_document=bool(existing_run_id and advance and document_output_limited)
-            if (auto_next or retry_document) and not pending and discovery.get('status')!='draft_ready':
-                next_prompt=advance_prompt
-                next_status='Pi đang chuẩn bị câu hỏi tiếp theo…'
-                if document_output_limited:
-                    paths=requested_draft_paths(sdb.get(Project,pid))
-                    stored=named_draft_records(sdb,pid,paths)
-                    missing=', '.join(path.rsplit('/',1)[-1] for path in paths if path.lower() not in stored)
-                    next_prompt=(
-                        'Lệnh bàn giao trước bị cắt do giới hạn đầu ra. Tiếp tục trong cùng phiên từ các kết quả đã lưu. '
-                        f'Bản nháp được yêu cầu còn thiếu: {missing or "không có tên nào được liệt kê"}. '
-                        'Gọi từng lệnh write_document với đúng một phần Markdown dài 400–800 ký tự, '
-                        'sau đó dùng append_to_revision để nối phần tiếp theo. Giữ nội dung đã lưu. '
-                        'Khi đủ bản nháp và không còn vấn đề quan trọng, gọi finish_discovery với tóm tắt và bằng chứng ngắn.'
-                    )
-                    next_status='Pi đang thử lại với phần tài liệu ngắn hơn…'
-                # Keep the follow-up in this durable run and Pi session.
-                first_output=output
-                first_output_limited=output_limited
-                yield emit('final',{'text':first_output+'\n\n' if first_output else ''})
-                yield emit('status',{'phase':'request','message':next_status})
-                full=[]
-                thinking_trace=None
-                try:
-                    async with aclosing(stream_attempt(next_prompt)) as events:
-                        async for event in events:
-                            yield event
-                except ChatStopped:
-                    raise
-                except Exception:
-                    # The first prompt already ran. Keep its result instead of
-                    # making the saved answer retryable and repeating tool calls.
-                    full=[]
-                    output_limited=first_output_limited
-                    yield emit('status',{'phase':'request','message':'Pi chưa thể tiếp tục Discovery.'})
-                next_output,pending,discovery,next_incomplete=resolve_planning_output()
-                incomplete_tool=next_incomplete or (incomplete_tool and not next_output)
-                output='\n\n'.join(part for part in (first_output,next_output) if part)
             draft_ready=discovery.get('status')=='draft_ready'
             notice=turn_notice(output,trace,limited=output_limited,pending=bool(pending),
                                handoff=draft_ready and not was_draft_ready,incomplete_tool=incomplete_tool)
-            # Persist even a null notice so a recovered retry does not inherit
-            # a limit warning from the previous attempt on reload.
             trace.append({'type':'outcome','notice':notice})
-            if (advance or auto_next) and not pending and discovery.get('status')!='draft_ready':
+            if mode=='discovery' and not pending and not draft_ready:
                 yield emit('planning_needs_input')
             if pending:
                 yield emit('planning_question',question_payload(pending))
@@ -1710,7 +1634,7 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
             if run:
                 stopped=run.cancel_requested or not existing_run_id and isinstance(exc,(asyncio.CancelledError,GeneratorExit))
                 message=('Đã dừng lượt chạy' if stopped else
-                         'Pi worker bị gián đoạn' if isinstance(exc,(asyncio.CancelledError,GeneratorExit))
+                         'Worker bị gián đoạn' if isinstance(exc,(asyncio.CancelledError,GeneratorExit))
                          else str(exc)[:500])
                 run.status='cancelled' if stopped else 'error'
                 run.events=trace;run.error=message;run.finished_at=utcnow()
@@ -1724,55 +1648,6 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
     return StreamingResponse(produce(),media_type="text/event-stream",headers={"Cache-Control":"no-cache, no-transform","X-Accel-Buffering":"no"})
 
 
-# Internal Pi bridge: explicit allowlist and per-run HMAC capability, never arbitrary FS/shell.
-PI_TOOL_ALLOWLIST = {tool["function"]["name"] for tool in TOOLS}
-
-@app.post("/api/internal/pi-tool",include_in_schema=False)
-async def internal_pi_tool(request: Request, db: Session = Depends(get_db)):
-    run_id=request.headers.get("x-specweave-run", "")
-    token=request.headers.get("x-specweave-token", "")
-    if not re.fullmatch(r"[0-9a-f-]{36}",run_id) or len(token)!=64:
-        raise HTTPException(401, "Invalid Pi tool capability")
-    run=db.get(AgentRun,run_id)
-    if not run or run.status!="running" or not run.created_at or (utcnow()-run.created_at).total_seconds()>1800:
-        raise HTTPException(401, "Pi run is not active")
-    try:
-        expected=pi_tool_token(run.id,run.project_id,run.discussion_id,run.created_at)
-    except RuntimeError:
-        raise HTTPException(503, "Pi tool bridge is not configured")
-    if not hmac.compare_digest(token,expected):
-        raise HTTPException(401, "Invalid Pi tool capability")
-    project=db.get(Project,run.project_id)
-    if not project or project.status!="active":
-        raise HTTPException(409, "Project is not active")
-    raw=await request.body()
-    if len(raw)>100000:
-        raise HTTPException(413, "Pi tool arguments too large")
-    try:
-        payload=json.loads(raw)
-    except (ValueError,UnicodeError):
-        raise HTTPException(400, "Invalid Pi tool payload")
-    if not isinstance(payload,dict):
-        raise HTTPException(422,"Invalid Pi tool payload")
-    name=payload.get("name", "")
-    args=payload.get("args", {})
-    if name not in PI_TOOL_ALLOWLIST or not isinstance(args,dict):
-        raise HTTPException(403, "Tool is not allowed")
-    if name in ('write_document','finish_discovery'):
-        lock_project_write(db,project.id)
-    # Tool implementation enforces project-scoped paths, draft-only writes, and SSRF protections.
-    try:
-        result=await tool_call(name,args,project=project,db=db,discussion_id=run.discussion_id)
-    except HTTPException as exc:
-        raise HTTPException(exc.status_code,"Pi tool rejected the request")
-    except Exception as exc:
-        # Return exception category without internal server/provider details.
-        raise HTTPException(502, f"Pi tool failed ({type(exc).__name__})")
-    data=json.dumps(result,ensure_ascii=False,default=str)
-    if len(data)>25000:
-        return {"truncated":True,"content":data[:24500]}
-    return result
-
 @app.post("/api/projects/{pid}/runs/{run_id}/cancel")
 async def cancel_run(pid:str,run_id:str,request:Request,db:Session=Depends(get_db)):
     u,s=api_guard(request,db,True);acl(db,pid,u,write=True)
@@ -1784,13 +1659,11 @@ async def cancel_run(pid:str,run_id:str,request:Request,db:Session=Depends(get_d
         run.lease_expires_at=None
         clear_chat_continuation(db,run)
         db.add(ChatStreamEvent(run_id=run.id,event={'type':'error','run_id':run.id,
-             'payload':{'message':'Đã hủy trước khi Pi bắt đầu','status':'cancelled'}},created_at=utcnow()))
+             'payload':{'message':'Đã hủy trước khi SpecWeave bắt đầu','status':'cancelled'}},created_at=utcnow()))
         db.commit()
     elif run.status=='running':
         run.cancel_requested=True
         db.commit()
-        from pi_client import abort as pi_abort
-        await pi_abort(pid,run.discussion_id,run_id)
     return {"ok":True,"status":run.status,"cancel_requested":bool(run.cancel_requested)}
 
 @app.get("/api/projects/{pid}/discussions/{did}/messages")
@@ -1806,96 +1679,10 @@ def providers_page(request:Request,db:Session=Depends(get_db)):
     u,s,redirect=auth_page(request,db)
     if redirect:return redirect
     admin_only(u)
-    providers=[p for p in db.query(Provider).order_by(Provider.created_at).all()
-               if p.kind!='openai-oauth' or p.owner_id==u.id]
+    providers=db.query(Provider).filter(Provider.kind!='openai-oauth').order_by(Provider.created_at).all()
     allowed={p.id for p in providers}
     models=[m for m in db.query(Model).order_by(Model.name).all() if m.provider_id in allowed]
-    return page(request,"providers.html",db=db,user=u,session=s,providers=providers,models=models,oauth_local=openai_oauth_enabled(),active="providers")
-
-# Only OpenAI subscription OAuth is exposed. Other providers remain API-key based.
-def _owner_openai_provider(db,u):
-    found=db.query(Provider).filter_by(kind='openai-oauth').first()
-    if found and found.owner_id!=u.id:
-        raise HTTPException(403,'Local OpenAI OAuth connection belongs to another user')
-    return found
-
-def _oauth_admin(request,db,mutate=False):
-    u,s=api_guard(request,db,mutate)
-    admin_only(u)
-    if not openai_oauth_enabled():
-        raise HTTPException(503,'OpenAI OAuth is enabled only in owner-controlled LOCAL mode')
-    return u
-
-@app.get('/api/openai/oauth/status')
-async def oauth_status(request:Request,db:Session=Depends(get_db)):
-    u=_oauth_admin(request,db)
-    provider=_owner_openai_provider(db,u)
-    state=await openai_oauth_relay('GET','/oauth/openai/status')
-    return {**state,'provider_id':provider.id if provider else None,
-            'provider_enabled':provider.enabled if provider else False}
-
-@app.get('/api/openai/oauth/diagnostics')
-async def oauth_diagnostics(request:Request,db:Session=Depends(get_db)):
-    _oauth_admin(request,db)
-    return await openai_oauth_relay('GET','/oauth/openai/diagnostics',timeout=22)
-
-@app.post('/api/openai/oauth/start')
-async def oauth_start(request:Request,db:Session=Depends(get_db)):
-    u=_oauth_admin(request,db,True)
-    provider=_owner_openai_provider(db,u)
-    result=await openai_oauth_relay('POST','/oauth/openai/start',{},timeout=20)
-    if provider is None:
-        provider=Provider(name='OpenAI (ChatGPT OAuth)',kind='openai-oauth',
-                          base_url='pi://openai',encrypted_key='',owner_id=u.id,enabled=False)
-        db.add(provider);db.flush()
-    audit(db,u,'openai_oauth_login_started',details={'provider_id':provider.id})
-    db.commit()
-    return {**result,'provider_id':provider.id}
-
-@app.get('/api/openai/oauth/login/{login_id}')
-async def oauth_poll(login_id:str,request:Request,offset:int=0,db:Session=Depends(get_db)):
-    u=_oauth_admin(request,db)
-    _owner_openai_provider(db,u)
-    if not re.fullmatch(r'[a-zA-Z0-9_-]{20,80}',login_id):raise HTTPException(404,'Login not found')
-    return await openai_oauth_relay('GET',f'/oauth/openai/login/{login_id}?offset={max(0,min(offset,10000))}')
-
-@app.post('/api/openai/oauth/login/{login_id}/answer')
-async def oauth_answer(login_id:str,request:Request,db:Session=Depends(get_db)):
-    u=_oauth_admin(request,db,True)
-    _owner_openai_provider(db,u)
-    if not re.fullmatch(r'[a-zA-Z0-9_-]{20,80}',login_id):raise HTTPException(404,'Login not found')
-    body=await request.json()
-    return await openai_oauth_relay('POST',f'/oauth/openai/login/{login_id}/answer',
-                                   {'value':str(body.get('value',''))[:8192]})
-
-@app.post('/api/openai/oauth/cancel')
-async def oauth_cancel(request:Request,db:Session=Depends(get_db)):
-    u=_oauth_admin(request,db,True)
-    _owner_openai_provider(db,u)
-    return await openai_oauth_relay('POST','/oauth/openai/cancel',{})
-
-@app.post('/api/openai/oauth/activate')
-async def oauth_activate(request:Request,db:Session=Depends(get_db)):
-    u=_oauth_admin(request,db,True)
-    provider=_owner_openai_provider(db,u)
-    if not provider:raise HTTPException(404,'OpenAI OAuth provider not created')
-    status=await openai_oauth_relay('GET','/oauth/openai/status')
-    if not status.get('connected'):raise HTTPException(409,'OpenAI OAuth is not connected')
-    provider.enabled=True
-    audit(db,u,'openai_oauth_connected',details={'provider_id':provider.id})
-    db.commit()
-    return {'ok':True,'provider_id':provider.id}
-
-@app.post('/api/openai/oauth/disconnect')
-async def oauth_disconnect(request:Request,db:Session=Depends(get_db)):
-    u=_oauth_admin(request,db,True)
-    provider=_owner_openai_provider(db,u)
-    result=await openai_oauth_relay('POST','/oauth/openai/disconnect',{})
-    if provider:
-        provider.enabled=False
-        audit(db,u,'openai_oauth_disconnected',details={'provider_id':provider.id})
-        db.commit()
-    return result
+    return page(request,"providers.html",db=db,user=u,session=s,providers=providers,models=models,active="providers")
 
 @app.post("/api/providers")
 async def add_provider(request:Request,db:Session=Depends(get_db)):
@@ -1915,10 +1702,7 @@ async def update_provider(provider_id:str,request:Request,db:Session=Depends(get
     p=db.get(Provider,provider_id)
     if not p:raise HTTPException(404,"Provider not found")
     data=await request.json()
-    if p.kind=='openai-oauth':
-        if p.owner_id!=u.id:raise HTTPException(403,'Not your OpenAI connection')
-        if any(k in data for k in ('api_key','clear_api_key','kind','base_url')):
-            raise HTTPException(422,'OpenAI OAuth credentials and protocol are managed separately')
+    if p.kind=='openai-oauth':raise HTTPException(410,'Provider OAuth đã ngừng hỗ trợ')
     if "name" in data:
         name=str(data["name"]).strip()[:120]
         if not name:raise HTTPException(422,"Tên provider không được trống")
@@ -1951,12 +1735,7 @@ async def remove_provider(provider_id:str,request:Request,db:Session=Depends(get
     provider=owned_provider(db,provider_id,u)
     body=await request.json()
     if not isinstance(body,dict):raise HTTPException(422,'Invalid delete confirmation')
-    # Local OAuth secrets are NOT stored in Provider. For OAuth connections,
-    # disconnect first to guarantee no credential remains in the local vault.
-    if provider.kind=='openai-oauth':
-        state=await openai_oauth_relay('GET','/oauth/openai/status')
-        if state.get('connected'):
-            raise HTTPException(409,'Ngắt kết nối OpenAI OAuth trước khi xóa provider')
+    if provider.kind=='openai-oauth':raise HTTPException(410,'Provider OAuth đã ngừng hỗ trợ')
     result=perform_provider_deletion(db,provider,u,body.get('confirm_name',''))
     audit(db,u,'provider_delete',details={'provider_id':provider_id,**result})
     db.commit()
@@ -1990,15 +1769,10 @@ async def add_models(provider_id:str,request:Request,db:Session=Depends(get_db))
     p=db.get(Provider,provider_id)
     if not p:raise HTTPException(404,"Provider not found")
     data=await request.json()
-    settings=parse_model_settings(data,custom=p.kind!='openai-oauth')
     models=data.get("model_ids",[])
     if not isinstance(models,list) or len(models)>100:raise HTTPException(422,"Invalid model list")
-    if p.kind=='openai-oauth':
-        if p.owner_id!=u.id:raise HTTPException(403,'Not your OpenAI connection')
-        catalog=await openai_oauth_relay('GET','/oauth/openai/models')
-        known=set(catalog.get('models',[]))
-        if not known or any(not isinstance(x,str) or x.strip() not in known for x in models):
-            raise HTTPException(422,'Choose OpenAI OAuth models from the actual Pi catalog')
+    if p.kind=='openai-oauth':raise HTTPException(410,'Provider OAuth đã ngừng hỗ trợ')
+    settings=parse_model_settings(data)
     created=[]
     for name in models:
         name=str(name).strip()[:300]
@@ -2013,12 +1787,8 @@ async def discover_models(provider_id:str,request:Request,db:Session=Depends(get
     u,s=api_guard(request,db);admin_only(u)
     p=db.get(Provider,provider_id)
     if not p:raise HTTPException(404,"Provider not found")
-    if p.kind=='openai-oauth':
-        if p.owner_id!=u.id:raise HTTPException(403,'Not your OpenAI connection')
-        return await openai_oauth_relay('GET','/oauth/openai/models')
-    base=p.base_url.rstrip("/")
-    if base.endswith("/chat/completions"):base=base[:-len("/chat/completions")]
-    url=base+"/models" if base.endswith("/v1") else base+"/v1/models"
+    if p.kind=='openai-oauth':raise HTTPException(410,'Provider OAuth đã ngừng hỗ trợ')
+    url=provider_endpoint(p.base_url,'models')
     headers={}
     if p.encrypted_key:headers["Authorization"]="Bearer "+decrypt(p.encrypted_key)
     try:
@@ -2044,7 +1814,7 @@ def integrations_page(request:Request,db:Session=Depends(get_db)):
     browser_setting=db.get(SystemSetting,"browser")
     browser=browser_setting.value if browser_setting else {}
     return page(request,"integrations.html",db=db,user=u,session=s,search=search,
-                browser_proxy_set=bool(browser.get("proxy_encrypted")),pi_runner=bool(os.environ.get("PI_RUNNER_URL")),active="integrations")
+                browser_proxy_set=bool(browser.get("proxy_encrypted")),active="integrations")
 
 @app.post("/api/settings/search")
 async def configure_search(request:Request,db:Session=Depends(get_db)):
@@ -2208,8 +1978,7 @@ def quality_page(pid:str,request:Request,db:Session=Depends(get_db)):
     pr=acl(db,pid,u)
     member=db.query(Membership).filter_by(project_id=pid,user_id=u.id).first()
     editable=pr.owner_id==u.id or bool(member and member.role=='editor')
-    role_models=[m for m in db.query(Model).join(Provider).filter(Model.enabled==True,Provider.enabled==True).order_by(Provider.name,Model.name).all()
-                 if m.provider.kind!='openai-oauth' or (pr.owner_id==u.id and m.provider.owner_id==u.id)]
+    role_models=db.query(Model).join(Provider).filter(Model.enabled==True,Provider.enabled==True,Provider.kind!='openai-oauth').order_by(Provider.name,Model.name).all()
     return page(request,'quality.html',db=db,user=u,session=s,pr=pr,editable=editable,
                 role_models=role_models,owner=pr.owner_id==u.id,active='quality')
 
@@ -2259,7 +2028,7 @@ async def quality_enqueue_job(pid:str,request:Request,db:Session=Depends(get_db)
     role_ids=(data.get('role_models') or {})
     if not isinstance(role_ids,dict):raise HTTPException(422,'Invalid role model map')
     for checked in [model]+[db.get(Model,mid) for mid in role_ids.values() if isinstance(mid,str)]:
-        if checked:openai_oauth_access(pr,checked,u.id)
+        if checked:require_model(checked)
     job=create_review_job(db,pr,u.id,model,data.get('output_budget',12000),data.get('role_models'))
     audit(db,u,'review_job_queued',pr,{'job_id':job.id,'model_id':model.id})
     db.commit()
@@ -2320,7 +2089,7 @@ async def quality_run_review(pid:str,request:Request,db:Session=Depends(get_db))
     else:
         model=db.get(Model,pr.active_model_id) if pr.active_model_id else None
         if not model:raise HTTPException(409,'Hãy chọn model trong Project Settings trước khi review AI')
-        openai_oauth_access(pr,model,u.id)
+        require_model(model)
         summary, findings=await (adversarial_review(db,pr,model,actor_id=u.id) if engine=='adversarial' else model_review(db,pr,model,actor_id=u.id))
         db.expire_all()
         if context_fingerprint(db,pid)!=snapshot_before:
@@ -2547,10 +2316,9 @@ async def update_model(provider_id:str,mid:str,request:Request,db:Session=Depend
     u,s=api_guard(request,db,True);admin_only(u)
     model=db.get(Model,mid)
     if not model or model.provider_id!=provider_id:raise HTTPException(404,'Model not found')
-    if model.provider.kind=='openai-oauth' and model.provider.owner_id!=u.id:
-        raise HTTPException(403,'OpenAI OAuth account belongs to another user')
+    if model.provider.kind=='openai-oauth':raise HTTPException(410,'Provider OAuth đã ngừng hỗ trợ')
     data=await request.json()
-    settings=parse_model_settings(data,model=model,custom=model.provider.kind!='openai-oauth')
+    settings=parse_model_settings(data,model=model)
     if 'enabled' in data:
         if not isinstance(data['enabled'],bool):raise HTTPException(422,'Invalid enabled flag')
         model.enabled=data['enabled']
@@ -2566,13 +2334,12 @@ def provider_detail_page(provider_id:str,request:Request,db:Session=Depends(get_
     admin_only(u)
     provider=db.get(Provider,provider_id)
     if not provider:raise HTTPException(404,'Provider not found')
-    if provider.kind=='openai-oauth' and provider.owner_id!=u.id:
-        raise HTTPException(403,'OpenAI OAuth account belongs to another user')
+    if provider.kind=='openai-oauth':raise HTTPException(410,'Provider OAuth đã ngừng hỗ trợ')
     models=db.query(Model).filter_by(provider_id=provider_id).order_by(Model.name).all()
     projects=db.query(Project).filter(Project.active_model_id.in_([m.id for m in models]),
                                      Project.status.not_in(TRASH_STATUSES)).all() if models else []
     return page(request,'provider_detail.html',db=db,user=u,session=s,
-                provider=provider,models=models,affected_projects=projects,oauth_local=openai_oauth_enabled(),active='providers')
+                provider=provider,models=models,affected_projects=projects,active='providers')
 
 @app.get('/settings/appearance',response_class=HTMLResponse)
 def appearance_page(request:Request,db:Session=Depends(get_db)):

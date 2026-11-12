@@ -58,7 +58,7 @@ class Project(Base):
     profile = Column(JSON, default=dict, nullable=False)
     active_model_id = Column(String(36), nullable=True)
     thinking_level = Column(String(20), default="medium")
-    agent_backend = Column(String(20), default="pi")
+    agent_backend = Column(String(20), default="native")
     revision = Column(Integer, default=1)
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
@@ -166,7 +166,7 @@ class AgentRun(Base):
     finished_at = Column(DateTime, nullable=True)
 
 class ChatStreamEvent(Base):
-    """Append-only, cursor-replayable Pi events. A browser is never the job owner."""
+    """Append-only, cursor-replayable harness events. A browser is never the job owner."""
     __tablename__ = 'chat_stream_events'
     id = Column(Integer, primary_key=True, autoincrement=True)
     run_id = Column(String(36), ForeignKey('agent_runs.id'), nullable=False, index=True)

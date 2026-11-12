@@ -174,8 +174,8 @@ async def process_claimed_job(job_id: str, worker_id: str = WORKER_ID) -> bool:
         project=db.get(Project,job.project_id)
         job_project_id=job.project_id
         if model and model.provider.kind=='openai-oauth':
-            from openai_oauth_gateway import require_access
-            try: require_access(project,model,job.requester_id)
+            from model_runtime import require_model
+            try: require_model(model)
             except HTTPException:
                 _terminal(job,'failed','OpenAI OAuth account cannot be shared or authorization was revoked')
                 db.commit();return True

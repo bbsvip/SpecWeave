@@ -1,73 +1,56 @@
-# SpecWeave v1.0.3 — Pi-Native Background Conversations
+# SpecWeave
 
 SpecWeave is a self-hosted workspace for turning project ideas into implementation-ready specifications through guided AI conversations, research, requirements management, a traceability graph, BMAD-inspired workflows, human approvals, and document exports.
 
-**Architecture:** All model inference and agent execution run exclusively through the **in-process Pi SDK** in the Node.js Pi Host inside the `web` container. FastAPI does not call LLMs directly, run a second agent, or maintain a fallback OpenAI-compatible agent. Local and remote OpenAI-compatible models remain available **through Pi's model runtime**. Pi owns agent sessions, context and compaction, thinking and tool events, and usage reporting. The frontend requires no Node.js build step.
+SpecWeave runs its own Python harness. The background worker uses the selected API-key provider for model inference and controls Discovery, document checkpoints and review. PostgreSQL stores the conversation and execution state.
 
-> **Verification:** Local tests exercise the real Pi SDK with a local OpenAI-compatible test provider and the AI Discussion page in Edge. A Brave test against Docker/PostgreSQL verified the Strata model settings and a Discovery handoff with all four requested drafts. Live OAuth remains unverified.
+> **Verification:** Automated tests cover the native transport, three confirmed answers followed by a draft handoff, and worker recovery after a file was written. Local browser testing covers SSE replay, Stop, discussion isolation and history after restarting the worker. Live validation of the new Docker image is pending.
 
 ## Features
 
 - **Accounts and access control:** First-run administrator setup, login, session revocation, CSRF protection, Argon2id password hashing, and project owner/editor/viewer roles.
 - **Project management:** New-project wizard, reusable presets, project CRUD, ownership transfer, and owner-only recovery or permanent deletion from project trash.
 - **AI discussion:** Detached PostgreSQL-backed chat jobs that continue after tabs close, replayable SSE over EventSource (with reconnect and cursor), thinking when exposed by the model, tool-call activity, usage and time-to-first-token (TTFT) metrics, stop controls, persistent discussion history, and guided questions with recommended options.
-- **Providers and models:** OpenAI-compatible API keys/endpoints, owner-scoped OpenAI OAuth, model discovery, per-project model selection, and advanced custom-model limits, protocol, compatibility and sampling settings. Model execution is handled by Pi.
+- **Providers and models:** OpenAI-compatible API keys/endpoints, model discovery, per-project model selection, and advanced limits, protocol, compatibility and sampling settings.
 - **Planning and traceability:** Goals, requirements, acceptance criteria, decisions, coverage checks, a specification graph, and a roadmap.
 - **Quality and deliverables:** BMAD-inspired draft documents, semantic review, background multi-role reviews, quality gates, human approval, Markdown document management, and exports.
 - **Research and files:** SearXNG, HTTP research, Playwright/Chromium, and a project-scoped file manager with quotas and revision history.
 - **Deployment:** Docker Compose with bundled or external PostgreSQL, plus GitHub Actions publishing the `-web` image to GHCR.
 
 
-## Background chat and reconnect
+## Discovery, background chat and recovery
 
-Chat, decision answers and Pi thinking/tool/usage events are now **independent of the browser tab**. The web application creates a PostgreSQL-backed `agent_runs` job and immediately returns its ID. The existing **review-worker** service runs the Pi task, persists event frames in `chat_stream_events`, and the browser subscribes via an `EventSource` GET endpoint. Switching pages, disconnecting from the network or closing the tab only closes the observer connection; it **does not cancel the Pi run**.
+1. The browser submits a message or confirms a decision. Confirming an answer and enqueueing its continuation happen in one transaction.
+2. The worker acquires the discussion lease and builds the next request from its saved answers, approved decisions, project profile and relevant notes. It validates the proposed question and allows only one open question in that discussion.
+3. Once there are at least three confirmed answers and the structured evaluation identifies no material unknowns, the worker prepares each requested draft independently. It retries a truncated or invalid draft once with tighter instructions. Existing and approved documents are preserved.
+4. A checkpoint records the exact draft before its atomic file write. If the worker dies before the database commit, the next claim can reconcile the matching file and register it once. The worker checks the Discovery inputs and verifies all requested files before marking the handoff ready for human review.
 
-The discussion page includes the active run ID and displays a Pi activity card immediately. Its subscriber replays persisted events from that run even if it finishes before the browser connects. Reconnecting uses SSE event IDs and `Last-Event-ID`. The **Stop** button requests cancellation and the subscriber displays the server's result.
-
-Each discussion gets its own Pi SDK `AgentSession`, transcript and active tool capability. Different discussions can run concurrently. `SPECWEAVE_CHAT_CONCURRENCY` defaults to 4 per background worker and accepts values from 1 through 16. A worker or Pi Host restart can interrupt active inference. The interrupted job fails without replaying its prompt or tools.
-
-The worker can make one additional Pi prompt in the same run when Discovery returns neither an interactive question nor a completed handoff. If Pi reports that a document tool call hit the output limit, the retry names the missing drafts and asks for short sections. This uses the same session and the saved answer even if the browser has left. Pi appends sections using the current document revision. Discovery checks for the requested drafts before registering a handoff for human review.
-
-The `0010_detached_chat` Alembic migration creates the event log and lease fields. Back up PostgreSQL before deploying and keep all existing volumes. Tool call input/output JSON is pretty-printed in UTF-8 in the UI, including legacy escaped Unicode strings; the actual tool arguments are not changed. Full details: [`docs/RELEASE_v1.0.3_DETACHED_PI_CHAT.vi.md`](docs/RELEASE_v1.0.3_DETACHED_PI_CHAT.vi.md) (Vietnamese).
+The browser follows persisted `chat_stream_events` over SSE using event IDs and `Last-Event-ID`. Closing the tab leaves the job running. Stop requests cancel the upstream stream. An expired Discovery lease can resume once. Ordinary chat and tool executions with an uncertain outcome are not automatically replayed. `SPECWEAVE_CHAT_CONCURRENCY` defaults to 4 and accepts 1 through 16.
 
 ## Project trash
 
-The project owner has 30 days from the time a project enters trash to restore it. The owner can also choose **Xóa vĩnh viễn** in **Thùng rác dự án**. Permanent deletion removes the project's database records and its directory on `projects_data`, including drafts, uploads, versions and Pi sessions. The system retains a purge audit event with the project ID and actor when available.
+The project owner has 30 days from the time a project enters trash to restore it. The owner can also choose **Xóa vĩnh viễn** in **Thùng rác dự án**. Permanent deletion removes the project's database records and its directory on `projects_data`, including drafts, uploads, versions and legacy session files. The system retains a purge audit event with the project ID and actor when available.
 
 Alembic revision `0011_project_trash` backfills the deletion time from the most recent soft-delete audit event, then uses the last project update when the event is unavailable. Projects already past 30 days become eligible on upgrade. Deploy the updated `web` and `review-worker` together. The worker scans on startup and every five minutes, and retries interrupted purges. Review existing trash before upgrading if it contains a project you still need.
 
-On November 12, 2026, the Strata QA project already had all four requested drafts, but several attempts to close Discovery ended without a visible response. After setting context to 262,144 and max output to 32,768 on the deployed Docker build, Pi completed `finish_discovery` in the same discussion in 14.6 seconds. The drafts were available for human review after reloading Brave.
-
-The discussion UI shows when a turn ran tools without a written reply, reached the output limit, or returned an incomplete tool-call fragment. It retains available run activity and shows the metrics once per turn. Older runs use their recorded events to identify a cause where available.
-
 ## Advanced custom model configuration
 
-Open **Settings → Providers → provider details → model**. API-key models expose separate **Context window** and **Max output** limits. Context is the total available input/output capacity; max output caps one model response, including reasoning when the provider counts it there. Enter the provider's actual supported limits. For example, a 256k context can be configured as `262144`; this does not imply that the provider supports 256k output. Pi may reduce the requested output to fit the remaining context.
+Open **Settings → Providers → provider details → model**. Set **Context window** and **Max output** from the provider's capabilities. SpecWeave reserves output space, prioritizes recent complete exchanges and budgets Discovery and review separately. A 256k context is `262144` tokens. Max output has its own limit.
 
-The expandable advanced section supports **Chat Completions** or **Responses**, a validated compatibility JSON object, and sampling parameters such as `temperature`, `top_p`, `top_k`, `min_p`, penalties and `seed`. For a Chat Completions endpoint that expects `max_tokens`, use `{"maxTokensField":"max_tokens"}` in Compatibility. Leave `{}` to retain Pi's endpoint defaults. Responses accepts only its supported compatibility flags. Unsupported keys and invalid limits return validation errors without saving partial changes. These controls apply only to custom API-key models; OAuth uses Pi's catalog.
+The adapter supports streaming **Chat Completions** and **Responses**. For Strata's Qwen model, use Chat Completions with `{"maxTokensField":"max_tokens","thinkingFormat":"qwen-chat-template"}` if the endpoint accepts the chat-template thinking option. Chat Completions uses configured sampling parameters. Responses sends its supported temperature and top-p fields. A model setting change applies to the next run.
 
-Migration `0012_custom_model_config` preserves existing context values and adds output defaults of 8,192 tokens, reduced for legacy models with smaller contexts. Changing a setting refreshes the model runtime on the next turn while retaining the discussion transcript. An already running turn keeps its current configuration. Both `web` and `review-worker` must run the matching image. The local regression script exercises form persistence and the actual Pi SDK request body across consecutive turns.
-
-## Architecture
+## Runtime architecture
 
 ```text
-Browser (Jinja2 + JavaScript + SSE)
-  ↕
-FastAPI (authentication, authorization, PostgreSQL, documents,
-         approvals, project-scoped tool gateway)
-  ↕
-Pi Agent Host (Node.js process inside web: createAgentSession,
-               ModelRuntime, SessionManager)
-  ↘ scoped tools → FastAPI
+Browser → FastAPI (ACL, enqueue, SSE replay)
+                       ↕
+          PostgreSQL (answers, runs, events)
+                       ↕
+  Python worker → model transport → API-key provider
+       ↳ project tools and versioned draft storage
 ```
 
-The Pi SDK runs without built-in shell/filesystem tools (`noTools: 'builtin'`). Only SpecWeave's project-scoped custom tools are exposed through the FastAPI gateway, protected by HMAC capabilities.
-
-- **Project data:** `/data/projects/<project-uuid>`
-- **Pi sessions:** `<project>/.system/pi-native/<discussion-id>/sessions`
-- **Local OpenAI OAuth vault:** `/auth-local/.pi/agent/auth.json`
-
-Provider API keys are supplied to the model runtime in memory; they are not written into Pi session files or `models.json`.
+The worker chooses the actions it exposes by mode. Discovery uses structured responses and owns every write and handoff. Other modes expose a bounded set of project tools, with external research subject to project policy. Review uses the same model transport and a bounded JSON snapshot. API keys remain encrypted in PostgreSQL and are decrypted for the selected provider request.
 
 ## Quick start: External PostgreSQL
 
@@ -83,9 +66,7 @@ Set at least the following values in `.env`:
 DATABASE_URL=postgresql+psycopg://your_user:your_password@your_db_host:5432/specweave
 ENCRYPTION_KEY=YOUR_VALID_32_BYTE_FERNET_BASE64_KEY
 BOOTSTRAP_TOKEN=YOUR_RANDOM_BOOTSTRAP_SECRET
-PI_RUNNER_KEY=YOUR_RANDOM_SECRET_AT_LEAST_32_CHARACTERS
 COOKIE_SECURE=true
-OPENAI_OAUTH_LOCAL_MODE=false
 ```
 
 **Generate a new Fernet key only for a fresh installation:**
@@ -98,7 +79,7 @@ python3 -c "import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_
 
 ### Build locally
 
-The `web` image includes the Pi SDK and starts the Pi Host alongside FastAPI.
+The same Python image runs FastAPI and the worker with different commands.
 
 ```sh
 docker compose -f compose.external-db.yaml up -d --build
@@ -124,59 +105,28 @@ For **bundled PostgreSQL**, run `docker compose up -d --build`, or use `docker c
 
 Open `http://<server>:8080/first-run` to create the initial administrator account. If you expose SpecWeave through an HTTPS domain (for example, via Cloudflare Tunnel), use `COOKIE_SECURE=true`.
 
-## Upgrading from v0.9.8 or v1.0.x
+## Upgrading from the Pi runtime
 
-1. **Back up** PostgreSQL and the `projects_data` and `openai_oauth_local` volumes. Back up `postgres_data` too if you use bundled PostgreSQL.
-2. Update the source and Compose file together, or use a `-web` image published from the same revision as the updated Compose file.
-3. Preserve `.env`, `ENCRYPTION_KEY`, volumes, and existing project data. Keep `PI_RUNNER_KEY` strong and consistent across services.
-4. Reuse the existing Compose project name so the `projects_data` and `openai_oauth_local` volumes are picked up. Deploy with `docker compose ... up -d --build --remove-orphans`, or pull the updated image and use `up -d --no-build --remove-orphans`. This retires the previous `pi-runner` container. The OAuth volume moves to `web` and keeps its existing data. Remove any obsolete Pi runner URL overrides from custom Compose files.
-5. If upgrading from v0.9.8, Alembic revision `0009_pi_native` converts the old project `agent_backend` setting to `pi`. Existing discussion history is retained and used to seed new Pi sessions. Upgrading from v1.0.x does not require re-creating projects or clearing sessions.
+1. Drain active work and back up PostgreSQL and `projects_data`. Preserve `.env`, `ENCRYPTION_KEY` and the Compose project name.
+2. Update the Compose file and deploy matching images for `web` and `review-worker`. Migration `0013_native_harness` switches existing projects and removes private execution fields from unfinished legacy run payloads. It retains conversations, decisions and files.
+3. The retired ChatGPT subscription OAuth connection is unavailable in the new runtime. Select an API-key model in Project Settings for projects that used it. The migration preserves historical provider rows and the old Docker vault volume for rollback. The new services do not mount that volume.
+4. To roll back this runtime migration, drain new runs, run `python -m alembic downgrade 0012_custom_model_config` with the new image, then restart the previous Compose and image with the original volumes. Retain the backup until validation finishes.
 
-Do **not** use `alembic stamp head` to bypass an unapplied migration. Do **not** delete the `openai_oauth_local` volume.
-
-## Development without Python packaging
-
-Keep code in `source/` and install dependencies at the repository root. Create a local Python environment and install the pinned Pi SDK with Node.js 22 or later.
+## Development and verification
 
 ```sh
 python -m venv venv
 # Windows PowerShell: .\venv\Scripts\Activate.ps1
 # Linux/macOS: . venv/bin/activate
 python -m pip install -r requirements.txt pytest pytest-asyncio
-npm install --prefix . --no-save --no-package-lock --ignore-scripts @earendil-works/pi-coding-agent@1.5.2 @earendil-works/pi-ai@1.5.2 typebox
-```
-
-For a direct local run, set `DATABASE_URL`, `DATA_ROOT`, `ENCRYPTION_KEY`, `BOOTSTRAP_TOKEN`, and `PI_RUNNER_KEY` in the process environment. Point `PROJECTS_ROOT` to `DATA_ROOT/projects`, `PI_RUNNER_URL` to `http://127.0.0.1:8090`, and `PI_TOOL_URL` to `http://127.0.0.1:8080/api/internal/pi-tool`. Use writable directories outside project storage for `SPECWEAVE_PI_SAFE_RESOURCES_DIR` and `OPENAI_OAUTH_LOCAL_HOME`. Run each file in its own terminal with those settings.
-
-```sh
-node source/pi_host.mjs
-python source/app.py
-python source/review_worker.py
-```
-
-Exclude `venv/`, `node_modules/`, caches and runtime storage when scanning the source.
-
-## Automated tests
-
-```sh
 python -m pytest -q tests
 python -m compileall -q source tests migrations
-node --test tests/test_openai_oauth_contract.mjs tests/test_pi_native_host.mjs
+node tests/test_sse_protocol.js
 ```
 
-The Node contract tests stub the SDK boundary. Run `python scripts/e2e_pi_discussion.py` with local Pi dependencies and Playwright Chromium to verify the real SDK, detached worker, and discussion UI against a local provider fixture. Set `CHROMIUM_EXECUTABLE` to use an existing Chromium browser such as Edge.
+For direct development, set `DATABASE_URL`, `DATA_ROOT`, `ENCRYPTION_KEY`, and `BOOTSTRAP_TOKEN`. Run `python source/app.py` and `python source/review_worker.py` with the same database and project storage. The Node command above only tests browser JavaScript.
 
-## Continuous discovery in v1.0.2
-
-The planning workflow is designed to continue within **one discussion and one Pi session**:
-
-1. Pi evaluates the project context and asks a focused question with candidate answers and a recommendation.
-2. The user selects, customizes, or defers an option in the chat interface.
-3. Confirming an answer saves it and **queues the next Pi turn in the same request** via `/planning/questions/{qid}/answer-start`—no additional **Send** or **AI Suggest** click is required.
-4. Pi analyzes the answer in the existing session, explains its implications, and asks the next unresolved question.
-5. Once enough information has been collected, Pi can draft Markdown documents and call `finish_discovery` to generate any missing BMAD artifacts. All generated documents remain **drafts requiring human review**, never automatically approved.
-
-The frontend also supports resuming a previously saved answer that was not yet processed by Pi. See [`docs/RELEASE_v1.0.3_DETACHED_PI_CHAT.vi.md`](docs/RELEASE_v1.0.3_DETACHED_PI_CHAT.vi.md) for the API behavior, edge cases, and test coverage.
+Run `python scripts/e2e_harness_discussion.py` with Playwright Chromium to test the browser against the native worker and an isolated SSE provider. Set `CHROMIUM_EXECUTABLE` to use an existing Chromium browser.
 
 ## Documentation
 
@@ -188,8 +138,6 @@ The frontend also supports resuming a previously saved answer that was not yet p
 
 ## Operational and security notes
 
-- Publish only the FastAPI port. The worker reaches Pi over the Compose network and authenticates with `PI_RUNNER_KEY`. Run a single `web` container for a given session volume.
-- OpenAI OAuth is optional, owner-scoped, and disabled by default. Enable `OPENAI_OAUTH_LOCAL_MODE` only in an explicitly supported, individual user-controlled deployment; follow the provider's applicable terms.
-- Project tools are authorization-checked. Agent-generated decisions, requirements, and documents should be reviewed before approval or external handoff.
-- Preserve PostgreSQL and persistent project/OAuth volumes across image updates.
-- Passing automated tests does not establish production readiness; perform the deployment-specific checks documented above.
+- Publish the web port. The worker connects directly to PostgreSQL, project storage and the configured provider.
+- Limit external research through the project policy and control network egress for browser fetches.
+- Preserve PostgreSQL and persistent project volumes across image updates.

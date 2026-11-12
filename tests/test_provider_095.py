@@ -39,8 +39,8 @@ def test_provider_edit_and_details_visible(client):
     assert client.post(f'/api/providers/{pid}',headers=csrf,json={'name':'   '}).status_code==422
 
 
-def test_custom_model_limits_and_sampling_reach_pi_and_validate(client):
-    from pi_client import model_payload
+def test_custom_model_limits_and_sampling_reach_runtime_and_validate(client):
+    from model_runtime import request_body
 
     csrf=auth(client)
     provider,models=add_provider(client,csrf)
@@ -54,10 +54,12 @@ def test_custom_model_limits_and_sampling_reach_pi_and_validate(client):
     project=create_project(client,csrf)
     with SessionLocal() as session:
         model=session.get(Model,mid)
-        payload=model_payload(session.get(Project,project),model)
-        for key in ('context_window','max_output_tokens','api','compat','sampling_params'):
-            assert payload[key]==settings[key]
-        assert model.reasoning
+        resource,payload=request_body(model,[],max_tokens=model.max_output_tokens,tools=[],thinking='off')
+        assert resource=='chat/completions'
+        assert model.context_window==262144 and payload['max_tokens']==32768
+        assert payload['enable_thinking'] is False
+        for key,value in settings['sampling_params'].items():
+            assert payload[key]==value
     invalid=[{'max_output_tokens':262144},{'max_output_tokens':True},{'context_window':3.5},
              {'sampling_params':{'max_tokens':1}},{'sampling_params':{'temperature':9}},
              {'compat':{'supportsDeveloperRole':'false'}},{'compat':{'headers':{}}},
@@ -75,8 +77,8 @@ def test_custom_model_limits_and_sampling_reach_pi_and_validate(client):
         owner=session.get(Project,project).owner_id
         row=session.get(Provider,provider)
         row.kind='openai-oauth';row.owner_id=owner;session.commit()
-    assert client.post(path,headers=csrf,json={'max_output_tokens':16384}).status_code==422
-    assert 'name="max_output_tokens"' not in client.get(f'/settings/providers/{provider}').text
+    assert client.post(path,headers=csrf,json={'max_output_tokens':16384}).status_code==410
+    assert client.get(f'/settings/providers/{provider}').status_code==410
 
 
 def test_new_custom_model_uses_validated_runtime_settings(client):
@@ -179,15 +181,3 @@ def test_no_deletion_when_active_chat(client):
     assert r.status_code==409
     with SessionLocal() as s:
         assert s.get(Provider,pid) is not None
-
-
-def test_oauth_safe_error_phase_and_hint():
-    from openai_oauth_runtime import safe_event
-    item=safe_event({'type':'error','code':'OAUTH_RUNTIME_FAILURE','phase':'register_provider',
-        'hint':'INCOMPATIBLE_API','access_token':'very-secret','message':'code=secret'})
-    assert item['phase']=='register_provider'
-    assert item['hint']=='INCOMPATIBLE_API'
-    assert 'very-secret' not in str(item) and 'code=secret' not in str(item)
-    item=safe_event({'type':'error','code':'OAUTH_RUNTIME_FAILURE','phase':'token-abc',
-        'hint':'AUTH_CODE=secret','message':'bad'})
-    assert 'phase' not in item and 'hint' not in item

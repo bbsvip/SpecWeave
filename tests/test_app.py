@@ -210,11 +210,11 @@ def test_streaming_chat_persists_response(client, monkeypatch):
     with SessionLocal() as s:
         discussion=s.query(db.Discussion).filter_by(project_id=pid).first()
         did=discussion.id
-    async def stub_compatible(project, discussion, db, model, *, role, mode, run_id=None, actor_id=None):
+    async def stub_compatible(project, discussion, db, model, *, role, mode, run_id=None, actor_id=None, claim=None):
         yield 'delta', {'text':'Spec'}
         yield 'delta', {'text':' confirmed'}
         yield 'final', {'text':'Spec confirmed'}
-    monkeypatch.setattr(application,'pi_stream',stub_compatible)
+    monkeypatch.setattr(application,'harness_stream',stub_compatible)
     response=client.post(f'/api/projects/{pid}/chat',headers=csrf,json={'discussion_id':did,'message':'Please interview me','role':'analyst','mode':'discovery'})
     assert response.status_code==200,response.text[:500]
     assert '"type": "done"' in response.text
@@ -282,7 +282,7 @@ def test_proactive_question_generation_without_pi_tool_calls(client,monkeypatch)
     with SessionLocal() as s:
         mid=s.query(Model).filter_by(model_id='planner-demo').one().id
     pid=create_project(client,csrf)
-    assert client.post(f'/api/projects/{pid}/settings',headers=csrf,json={'active_model_id':mid,'agent_backend':'pi'}).status_code==200
+    assert client.post(f'/api/projects/{pid}/settings',headers=csrf,json={'active_model_id':mid,'agent_backend':'native'}).status_code==200
     with SessionLocal() as s:
         did=s.query(db.Discussion).filter_by(project_id=pid).one().id
     output={
@@ -293,11 +293,11 @@ def test_proactive_question_generation_without_pi_tool_calls(client,monkeypatch)
         'recommended_index':0,'recommendation_reason':'Lower complexity for MVP',
         'assumptions':['Light initial traffic']
     }
-    import pi_client
+    import model_runtime
     async def fake_complete(project,model,actor_id,**kwargs):
-        assert 'JSON' in kwargs['system_context']
+        assert 'JSON' in kwargs['message']
         return {'text':json.dumps(output),'usage':{}}
-    monkeypatch.setattr(pi_client,'complete',fake_complete)
+    monkeypatch.setattr(model_runtime,'complete',fake_complete)
     first=client.post(f'/api/projects/{pid}/planning/questions/suggest',headers=csrf,json={'discussion_id':did})
     assert first.status_code==200,first.text
     assert first.json()['created'] and first.json()['question']['recommended_id']=='o1'
@@ -971,7 +971,7 @@ def test_login_throttle_is_db_backed_and_does_not_store_usernames(client):
 @pytest.mark.asyncio
 async def test_model_review_usage_and_cross_role_context(client,monkeypatch):
     import planning_engine
-    import pi_client
+    import model_runtime
     from db import Requirement
     csrf=auth(client)
     pid=configured_review_project(client,csrf)
@@ -982,12 +982,12 @@ async def test_model_review_usage_and_cross_role_context(client,monkeypatch):
     seen=[]
     async def fake_complete(project,model,actor_id,**kwargs):
         seen.append(kwargs)
-        assert 'PRIOR_REVIEW_OBSERVATIONS' in kwargs['message']
+        assert json.loads(kwargs['message'].split('\n',1)[1])['prior_reviews'][0]['role']=='analyst'
         return {'text':json.dumps({'summary':'Sources were checked','findings':[
             {'severity':'warning','category':'risk','description':'Retry policy is not fully specified',
             'source_type':'requirement','source_id':rid}]}),
             'usage':{'output_tokens':66}}
-    monkeypatch.setattr(pi_client,'complete',fake_complete)
+    monkeypatch.setattr(model_runtime,'complete',fake_complete)
     with SessionLocal() as s:
         project=s.get(Project,pid)
         model=s.get(Model,project.active_model_id)
@@ -1024,59 +1024,9 @@ def test_0003_migration_creates_review_queue_without_deleting_old_data(tmp_path,
     assert set(inspect(eng).get_table_names())>=missing
     with eng.connect() as conn:
         assert conn.execute(text("SELECT username FROM users WHERE username='legacy'")).scalar()=='legacy'
-        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0012_custom_model_config'
+        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0013_native_harness'
         assert 'cancel_requested' in [x['name'] for x in inspect(eng).get_columns('agent_runs')]
     eng.dispose()
-
-@pytest.mark.asyncio
-async def test_pi_tool_bridge_caps_and_project_scope(client, monkeypatch):
-    """Pi can only call allowlisted tools for an active project run: no shell or cross-project access."""
-    from ai import pi_tool_token
-    monkeypatch.setenv("PI_RUNNER_KEY", "bridge-test-key-must-be-at-least-32-characters-long")
-    csrf=auth(client)
-    p1=create_project(client,csrf,"Trusted project")
-    p2=create_project(client,csrf,"Different project")
-    with SessionLocal() as session:
-        discussion=db.Discussion(project_id=p1,title="Pi session")
-        session.add(discussion);session.flush()
-        run=db.AgentRun(project_id=p1,discussion_id=discussion.id,model_name="test-model")
-        session.add(run);session.commit()
-        rid=run.id
-        did=discussion.id
-        created=run.created_at
-        token=pi_tool_token(rid,p1,did,created)
-    target="/api/internal/pi-tool"
-    h={"X-Specweave-Run":rid,"X-Specweave-Token":token}
-    assert client.post(target,headers={**h,"X-Specweave-Token":"bad"},json={"name":"list_project_files","args":{}}).status_code==401
-    assert client.post(target,headers=h,json={"name":"bash","args":{"command":"whoami"}}).status_code==403
-    result=client.post(target,headers=h,json={"name":"list_project_files","args":{"folder":"inputs"}})
-    assert result.status_code==200,result.text
-    result=client.post(target,headers=h,json={"name":"propose_decision","args":{"title":"Use SQLite for prototype","description":"Discussion proposal"}})
-    assert result.status_code==200,result.text
-    assert result.json()["status"]=="proposed"
-    with SessionLocal() as session:
-        assert session.query(Decision).filter_by(project_id=p1).count()==1
-        assert session.query(Decision).filter_by(project_id=p2).count()==0
-        assert session.query(Decision).filter_by(project_id=p1,status="approved").count()==0
-        run=session.get(db.AgentRun,rid)
-        run.status="cancelled"
-        session.commit()
-    assert client.post(target,headers=h,json={"name":"list_project_files","args":{}}).status_code==401
-
-
-def test_pi_runner_has_custom_only_allowlist_and_project_restricted_env():
-    """Pi SDK is the only agent; no built-in shell or independent completion loop."""
-    host=(ROOT/'source/pi_host.mjs').read_text(encoding='utf-8')
-    tools=(ROOT/'source/pi_host_tools.mjs').read_text()
-    ai=(ROOT/'source/ai.py').read_text()
-    assert 'createAgentSession(' in host and 'SessionManager.continueRecent' in host
-    assert "noTools:withTools?'builtin':'all'" in host
-    assert 'tools:[]' not in host and 'customTools:withTools?createScopedTools(active):[]' in host
-    assert 'X-Specweave-Token' in tools and 'X-Specweave-Run' in tools
-    assert 'propose_planning_question' in tools and 'tool_token' in ai
-    assert 'compatible_stream' not in ai
-    assert 'pi --mode rpc' not in (ROOT/'Dockerfile').read_text(encoding='utf-8')
-
 
 @pytest.mark.asyncio
 async def test_chat_coordination_lease_and_cancel_persistence(client):
@@ -1142,7 +1092,7 @@ def test_0004_fresh_database_migration_is_idempotent(tmp_path, monkeypatch):
     command.upgrade(cfg,'head')
     eng=create_engine(url)
     with eng.connect() as conn:
-        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0012_custom_model_config'
+        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0013_native_harness'
         assert any(col['name']=='cancel_requested' for col in __import__('sqlalchemy').inspect(eng).get_columns('agent_runs'))
     eng.dispose()
 
@@ -1475,158 +1425,7 @@ def test_project_profile_and_model_guard(client):
 
 # v0.9 OpenAI-only, owner-scoped OAuth: no token enters PostgreSQL or the browser.
 
-def test_openai_oauth_disabled_by_default(client,monkeypatch):
-    monkeypatch.delenv('OPENAI_OAUTH_LOCAL_MODE',raising=False)
-    csrf=auth(client)
-    assert client.get('/api/openai/oauth/status').status_code==503
-    assert client.post('/api/openai/oauth/start',headers=csrf,json={}).status_code==503
-    assert client.post('/api/providers',headers=csrf,json={
-        'name':'Try OAuth through generic endpoint','base_url':'pi://openai',
-        'kind':'openai-oauth','api_key':'untrusted'}).status_code==422
-
-
-def test_openai_oauth_login_owner_scoped_and_no_token_db(client,monkeypatch):
-    import importlib
-    web=importlib.import_module('app')
-    monkeypatch.setenv('OPENAI_OAUTH_LOCAL_MODE','true')
-    calls=[]
-    async def fake_relay(method,path,body=None,timeout=30):
-        calls.append((method,path,body))
-        if path=='/oauth/openai/start':return {'id':'login-ticket-example-1234567890','status':'running'}
-        if path=='/oauth/openai/status':return {'connected':True,'provider':'openai','storage':'local-pi-vault','shared':False}
-        if path=='/oauth/openai/models':return {'models':['model-from-pi-catalog']}
-        if path=='/oauth/openai/disconnect':return {'ok':True,'revoked_remotely':False}
-        if path.startswith('/oauth/openai/login/'):
-            return {'status':'done','events':[],'next_offset':0,'connected':True}
-        return {'ok':True}
-    monkeypatch.setattr(web,'openai_oauth_relay',fake_relay)
-    csrf=auth(client)
-    begun=client.post('/api/openai/oauth/start',headers=csrf,json={})
-    assert begun.status_code==200,begun.text
-    provider_id=begun.json()['provider_id']
-    with SessionLocal() as dbs:
-        provider=dbs.get(db.Provider,provider_id)
-        assert provider.kind=='openai-oauth'
-        assert provider.base_url=='pi://openai'
-        assert provider.encrypted_key==''
-        assert not provider.enabled
-        assert provider.owner_id==dbs.query(User).filter_by(username='admin').first().id
-    assert client.post('/api/openai/oauth/activate',headers=csrf,json={}).status_code==200
-    discovered=client.get(f'/api/providers/{provider_id}/discover')
-    assert discovered.json()=={'models':['model-from-pi-catalog']}
-    assert client.post(f'/api/providers/{provider_id}',headers=csrf,json={
-        'kind':'openai','base_url':'https://api.openai.com/v1'}).status_code==422
-    assert client.post(f'/api/providers/{provider_id}',headers=csrf,json={'api_key':'steal'}).status_code==422
-    assert client.post(f'/api/providers/{provider_id}/models',headers=csrf,json={
-        'model_ids':['model-from-pi-catalog'],'reasoning':True}).status_code==200
-    assert client.get('/settings/providers').status_code==200
-    assert client.get(f'/settings/providers/{provider_id}').status_code==200
-    assert client.post('/api/openai/oauth/disconnect',headers=csrf,json={}).json()['ok']
-    with SessionLocal() as dbs:
-        assert not dbs.get(db.Provider,provider_id).enabled
-    assert all('token' not in str(c).lower() for c in calls)
-
-
-def test_openai_oauth_project_owner_only(client,monkeypatch):
-    monkeypatch.setenv('OPENAI_OAUTH_LOCAL_MODE','true')
-    csrf=auth(client)
-    with SessionLocal() as session:
-        admin=session.query(User).filter_by(username='admin').first()
-        provider=db.Provider(name='OpenAI private',kind='openai-oauth',base_url='pi://openai',
-                            encrypted_key='',owner_id=admin.id,enabled=True)
-        session.add(provider);session.flush()
-        m=Model(provider_id=provider.id,model_id='private-model',name='Private Model',enabled=True)
-        session.add(m);session.commit();model_id=m.id
-    pid=client.post('/api/projects',headers=csrf,json={'name':'Owned OAuth Project',
-                    'model_id':model_id,'profile':{}}).json()['id']
-    with SessionLocal() as session:
-        from openai_oauth_gateway import require_access
-        project=session.get(Project,pid)
-        model=session.get(Model,model_id)
-        require_access(project,model,project.owner_id)
-        with pytest.raises(Exception):require_access(project,model,'different-user')
-    client.post('/api/admin/users',headers=csrf,json={'username':'member2',
-            'email':'m2@example.org','password':'another-strong-password'})
-    with SessionLocal() as session:
-        member=session.query(User).filter_by(username='member2').one()
-        member.must_change_password=False;session.commit()
-    client.cookies.clear()
-    member_csrf=auth(client,'member2','another-strong-password')
-    res=client.post('/api/projects',headers=member_csrf,json={'name':'Private Model Escalation',
-            'model_id':model_id,'profile':{}})
-    assert res.status_code==403,res.text
-
-
-@pytest.mark.asyncio
-async def test_openai_oauth_local_vault_status_disconnection(tmp_path,monkeypatch):
-    import openai_oauth_runtime as runtime
-    auth_file=tmp_path/'.pi'/'agent'/'auth.json'
-    auth_file.parent.mkdir(parents=True)
-    auth_file.write_text(json.dumps({'openai':{'type':'oauth','access':'SECRET_ACCESS',
-                         'refresh':'SECRET_REFRESH'},'another-provider':{'type':'api_key','key':'KEEP'}}))
-    monkeypatch.setattr(runtime,'AUTH_PATH',auth_file)
-    monkeypatch.setattr(runtime,'LOCAL_HOME',tmp_path)
-    monkeypatch.setenv('OPENAI_OAUTH_LOCAL_MODE','true')
-    status=runtime.public_status()
-    assert status['connected'] and 'access' not in json.dumps(status)
-    assert await runtime.disconnect()=={'ok':True,'revoked_remotely':False}
-    stored=json.loads(auth_file.read_text())
-    assert 'openai' not in stored and stored['another-provider']['key']=='KEEP'
-    assert not runtime.public_status()['connected']
-    assert auth_file.stat().st_mode & 0o777==0o600
-
-
-def test_openai_oauth_event_whitelist_and_redaction():
-    import openai_oauth_runtime as runtime
-    assert runtime.safe_event({'type':'auth_url','url':'https://evil.example/steal'})['type']=='error'
-    assert runtime.safe_event({'type':'auth_url','url':'http://auth.openai.com/code'})['type']=='error'
-    valid=runtime.safe_event({'type':'auth_url','url':'https://auth.openai.com/oauth/authorize?state=abc','access_token':'HIDDEN'})
-    assert valid['type']=='auth_url' and 'access_token' not in valid
-    assert runtime.safe_event({'type':'error','message':'secret token abc'})=={
-        'type':'error','code':'OAUTH_RUNTIME_FAILURE',
-        'message':runtime.ERROR_DESCRIPTIONS['OAUTH_RUNTIME_FAILURE']}
-
-
-@pytest.mark.asyncio
-async def test_openai_oauth_completion_never_relays_credentials(monkeypatch):
-    from types import SimpleNamespace
-    import pi_client
-    monkeypatch.setenv('OPENAI_OAUTH_LOCAL_MODE','true')
-    project=SimpleNamespace(id='project-one',owner_id='owner-one',thinking_level='medium')
-    provider=SimpleNamespace(kind='openai-oauth',owner_id='owner-one',enabled=True,
-                             encrypted_key='DO_NOT_SEND',base_url='pi://openai')
-    model=SimpleNamespace(provider=provider,enabled=True,model_id='known-openai-model',
-                          reasoning=True,context_window=32768)
-    payload=pi_client.model_payload(project,model,'owner-one')
-    assert payload['auth_mode']=='openai-oauth'
-    assert payload['provider_key']=='' and 'DO_NOT_SEND' not in json.dumps(payload)
-    with pytest.raises(Exception):pi_client.model_payload(project,model,'other-user')
-
-
-def test_openai_oauth_model_catalog_is_enforced(client, monkeypatch):
-    import importlib
-    application=importlib.import_module('app')
-    monkeypatch.setenv('OPENAI_OAUTH_LOCAL_MODE','true')
-    async def relay(method,path,body=None,timeout=30):
-        assert path=='/oauth/openai/models'
-        return {'models':['catalog-available-model']}
-    monkeypatch.setattr(application,'openai_oauth_relay',relay)
-    csrf=auth(client)
-    with SessionLocal() as session:
-        uid=session.query(User).filter_by(username='admin').first().id
-        provider=db.Provider(name='Owner OAuth catalog',kind='openai-oauth',base_url='pi://openai',
-                             encrypted_key='',owner_id=uid,enabled=True)
-        session.add(provider);session.commit();provider_id=provider.id
-    uri=f'/api/providers/{provider_id}/models'
-    assert client.post(uri,headers=csrf,json={'model_ids':['invented-model']}).status_code==422
-    valid=client.post(uri,headers=csrf,json={'model_ids':['catalog-available-model']})
-    assert valid.status_code==200 and valid.json()['created']==['catalog-available-model']
-    with SessionLocal() as session:
-        assert session.query(Model).filter_by(provider_id=provider_id).count()==1
-
-
-def test_openai_oauth_owner_transfer_clears_private_model(client,monkeypatch):
-    monkeypatch.setenv('OPENAI_OAUTH_LOCAL_MODE','true')
+def test_retired_oauth_model_cannot_be_selected_or_transferred(client):
     csrf=auth(client)
     with SessionLocal() as session:
         owner=session.query(User).filter_by(username='admin').first()
@@ -1638,7 +1437,10 @@ def test_openai_oauth_owner_transfer_clears_private_model(client,monkeypatch):
         session.add(model);session.commit();model_id=model.id
     project=create_project(client,csrf,'Transfer private project')
     assert client.post(f'/api/projects/{project}/settings',headers=csrf,
-                       json={'active_model_id':model_id}).status_code==200
+                       json={'active_model_id':model_id}).status_code==409
+    with SessionLocal() as session:
+        session.get(Project,project).active_model_id=model_id
+        session.commit()
     res=client.post('/api/admin/users',headers=csrf,json={'username':'newowner',
          'email':'owner@example.org','password':'another-strong-password'})
     assert res.status_code==200,res.text
@@ -1658,20 +1460,8 @@ def test_openai_oauth_owner_transfer_clears_private_model(client,monkeypatch):
     newer=auth(client,'newowner','another-strong-password')
     attempt=client.post(f'/api/projects/{project}/settings',headers=newer,
                         json={'active_model_id':model_id})
-    assert attempt.status_code==403
+    assert attempt.status_code==409
 
-
-@pytest.mark.asyncio
-async def test_openai_oauth_vault_lock_prevents_disconnect(tmp_path,monkeypatch):
-    from fastapi import HTTPException
-    import openai_oauth_runtime as runtime
-    monkeypatch.setenv('OPENAI_OAUTH_LOCAL_MODE','true')
-    monkeypatch.setattr(runtime,'AUTH_PATH',tmp_path/'auth.json')
-    monkeypatch.setattr(runtime,'AUTH_USE_LOCK',__import__('asyncio').Lock())
-    async with runtime.AUTH_USE_LOCK:
-        with pytest.raises(HTTPException) as exc:
-            await runtime.disconnect()
-        assert exc.value.status_code==409
 
 # v0.9.6 ThinkRail-inspired conversation continuity and observable SSE
 
@@ -1700,13 +1490,13 @@ def test_chat_continues_answer_once_with_usage_and_no_duplicate_message(client, 
     assert res.status_code==200
     assert 'answered' in res.text
 
-    async def simulated(project, discussion, db, model, *, role, mode, run_id=None, actor_id=None):
+    async def simulated(project, discussion, db, model, *, role, mode, run_id=None, actor_id=None, claim=None):
         assert db.query(Message).filter_by(discussion_id=did,role='user').count()==1
         yield 'status',{'phase':'reasoning','message':'Đang phân tích…'}
         yield 'delta',{'text':'Đã hiểu. Mỗi người có tài khoản riêng.'}
         yield 'usage',{'input_tokens':123,'output_tokens':27,'cache_read_tokens':10,'source':'provider'}
         yield 'final',{'text':'Đã hiểu. Mỗi người có tài khoản riêng.'}
-    monkeypatch.setattr(application,'pi_stream',simulated)
+    monkeypatch.setattr(application,'harness_stream',simulated)
     url=f'/api/projects/{pid}/chat'
     answer=client.post(url,headers=csrf,json={'discussion_id':did,'continue_question_id':qid,'message':'','role':'analyst','mode':'discovery'})
     assert answer.status_code==200,answer.text
@@ -1743,47 +1533,6 @@ def test_usage_normalization_distinguishes_provider_from_estimates():
     assert p['input_tokens']==123 and p['output_tokens']==21 and p['cost_usd']==0.08
     assert accumulate_usage({'input_tokens':5},p)['input_tokens']==128
     assert normalize_usage({'input':'estimated','output':True},source='pi')=={}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('include_final',[True,False])
-async def test_pi_sdk_stream_forwards_native_events(client,monkeypatch,include_final):
-    import pi_client
-    import httpx
-    from fastapi import HTTPException
-    csrf=auth(client)
-    provider=client.post('/api/providers',headers=csrf,json={
-        'name':'Native Pi Stream','base_url':'http://model.internal/v1','api_key':'x'}).json()['id']
-    client.post(f'/api/providers/{provider}/models',headers=csrf,json={'model_ids':['pi-model']})
-    pid=create_project(client,csrf)
-    requests=[]
-    def handler(request):
-        body=json.loads(request.content);requests.append(body)
-        assert request.url.path=='/run'
-        assert body['auth_mode']=='api_key' and body['model_id']=='pi-model'
-        packets=[{'type':'thinking','payload':{'text':'Available model reasoning'}},
-                 {'type':'tool','payload':{'name':'search_web','status':'complete'}},
-                 {'type':'delta','payload':{'text':'Hello'}},
-                 {'type':'usage','payload':{'source':'pi','input_tokens':99,'output_tokens':7}}]
-        if include_final:
-            packets.append({'type':'final','payload':{'text':'Hello'}})
-        data=''.join('data: '+json.dumps(x)+'\n\n' for x in packets)
-        return httpx.Response(200,content=data,headers={'Content-Type':'text/event-stream'})
-    real=httpx.AsyncClient
-    monkeypatch.setattr(pi_client,'runner_config',lambda:('http://pi-runner:8090',{'X-Runner-Key':'x'*32}))
-    monkeypatch.setattr(pi_client.httpx,'AsyncClient',lambda **kw:real(transport=httpx.MockTransport(handler)))
-    with SessionLocal() as db_session:
-        project=db_session.get(Project,pid)
-        model=db_session.query(Model).filter_by(model_id='pi-model').one()
-        if not include_final:
-            with pytest.raises(HTTPException,match='ended before a final event'):
-                _=[x async for x in pi_client.stream(project,model,None,{'message':'Hi','run_id':'run'})]
-            return
-        events=[x async for x in pi_client.stream(project,model,None,{'message':'Hi','run_id':'run'})]
-    assert ('delta',{'text':'Hello'}) in events
-    assert events[-1]==('final',{'text':'Hello'})
-    assert any(k=='usage' and v['output_tokens']==7 for k,v in events)
-    assert requests and requests[0]['provider_base']=='http://model.internal/v1'
 
 
 @pytest.mark.asyncio
@@ -1848,7 +1597,7 @@ def test_answer_stream_atomic_continues_pi_and_surfaces_question(client,monkeypa
                 'options':[{'label':'Append-only ledger','pros':'Traceable','cons':'Storage'},
                            {'label':'Event log','pros':'Lightweight','cons':'Less structured'}],
                 'recommended_index':0,'recommendation_reason':'Auditability matters.'})
-    monkeypatch.setattr(module,'pi_stream',fake_pi)
+    monkeypatch.setattr(module,'harness_stream',fake_pi)
     r=client.post(f'/api/projects/{pid}/planning/questions/{qid}/answer-stream',headers=csrf,json={
         'selected_ids':['o1'],'custom_answer':'Separate accounts per user','note':'No shared credentials'})
     assert r.status_code==200,r.text
@@ -1875,11 +1624,10 @@ def test_auto_advance_stays_in_same_pi_session_and_never_saves_fake_user(client,
     calls=[]
     async def fake_pi(project,discussion,dbs,model,**kw):
         calls.append(kw)
-        assert 'prompt_override' in kw
-        assert 'CÙNG session' in kw['prompt_override']
+        assert 'prompt_override' not in kw
         yield 'status',{'phase':'planning','message':'Pi đang lập câu hỏi'}
         yield 'delta',{'text':'Đang rà những thông tin chưa rõ.'}
-    monkeypatch.setattr(module,'pi_stream',fake_pi)
+    monkeypatch.setattr(module,'harness_stream',fake_pi)
     r=client.post(f'/api/projects/{pid}/chat',headers=csrf,
                   json={'discussion_id':did,'mode':'discovery','advance_planning':True})
     assert r.status_code==200,r.text
@@ -1894,7 +1642,7 @@ def test_auto_advance_stays_in_same_pi_session_and_never_saves_fake_user(client,
 
 
 @pytest.mark.asyncio
-async def test_finish_discovery_creates_unapproved_drafts_with_answers(client):
+async def test_manual_draft_append_respects_revision_and_approval(client):
     from planning import save_question, answer_question
     from artifact_builder import ARTIFACTS
     from storage import read_text, write_text
@@ -1911,16 +1659,6 @@ async def test_finish_discovery_creates_unapproved_drafts_with_answers(client):
                            {'label':'Alternative','pros':'Other benefit','cons':'Risk'}],
                 'recommended_index':0,'recommendation_reason':'Best fit for project scope'})
             answer_question(s,q,{'selected_ids':['o1']})
-        invalid=await tool_call('finish_discovery',{'summary':'short','evidence':'yes','remaining_unknowns':[]},
-                                project=pr,db=s,discussion_id=did)
-        assert invalid['status']=='needs_discovery'
-        completion={
-            'summary':'The scope includes independent users, transactions, an auditable dashboard, separated credentials, and secure reconciliation. All critical cases and boundaries were discussed with the project owner.',
-            'evidence':'Three user-confirmed decisions are recorded in this discussion; open risks are documented in the drafts.',
-            'remaining_unknowns':[]}
-        missing=await tool_call('finish_discovery',completion,project=pr,db=s,discussion_id=did)
-        assert missing['status']=='needs_documents' and missing['missing']==['PRD.md','ARCHITECTURE.md']
-
         legacy_path='docs/drafts/Architecture.md'
         write_text(pid,legacy_path,'# Legacy architecture')
         s.add(Document(project_id=pid,path=legacy_path,title='Architecture'))
@@ -1934,26 +1672,13 @@ async def test_finish_discovery_creates_unapproved_drafts_with_answers(client):
         stale=await tool_call('write_document',{'filename':'PRD.md','content':'Duplicate','append_to_revision':2},
                               project=pr,db=s,discussion_id=did)
         assert 'error' in stale and read_text(pid,'docs/drafts/PRD.md')=='# PRD\n\n## Goals\n\n## Acceptance tests'
-        valid=await tool_call('finish_discovery',completion,project=pr,db=s,discussion_id=did)
-        assert valid['status']=='draft_ready' and len(valid['documents_created'])==len(ARTIFACTS)-2
-        docs=s.query(Document).filter_by(project_id=pid).all()
-        assert len(docs)==len(ARTIFACTS) and all(x.status=='draft' for x in docs)
-        assert read_text(pid,legacy_path)=='# Legacy architecture'
-        assert s.get(Project,pid).profile['_discovery']['status']=='draft_ready'
-        brief=read_text(pid,'docs/drafts/PRODUCT-BRIEF.md')
-        assert 'Selected choice 0' in brief and 'Selected choice 2' in brief
-        # Repeating completion does not overwrite or duplicate drafts.
-        again=await tool_call('finish_discovery',{
-            'summary':'The scope includes independent users, transactions, an auditable dashboard, separated credentials, and secure reconciliation. All critical cases and boundaries were discussed with the project owner.',
-            'evidence':'Three user decisions recorded.', 'remaining_unknowns':[]},
-            project=pr,db=s,discussion_id=did)
-        assert again['status']=='draft_ready' and not again['documents_created']
-        document=s.query(Document).filter_by(project_id=pid,path='docs/drafts/PRODUCT-BRIEF.md').one()
-        document.status='approved';s.commit()
-        protected=await tool_call('write_document',{'filename':'PRODUCT-BRIEF.md','content':'No overwrite'},
+        document=s.query(Document).filter_by(project_id=pid,path='docs/drafts/PRD.md').one()
+        document.status='approved'
+        s.commit()
+        protected=await tool_call('write_document',{'filename':'PRD.md','content':'No overwrite'},
                                   project=pr,db=s,discussion_id=did)
         assert 'error' in protected
-        assert read_text(pid,'docs/drafts/PRODUCT-BRIEF.md')==brief
+        assert read_text(pid,'docs/drafts/PRD.md')=='# PRD\n\n## Goals\n\n## Acceptance tests'
 
 
 def test_answer_stream_failure_allows_retry_and_is_scoped(client,monkeypatch):
@@ -1976,7 +1701,7 @@ def test_answer_stream_failure_allows_retry_and_is_scoped(client,monkeypatch):
     async def broken_pi(*args,**kwargs):
         yield 'status',{'phase':'model','message':'Pi start'}
         raise RuntimeError('Simulated transport interruption')
-    monkeypatch.setattr(application,'pi_stream',broken_pi)
+    monkeypatch.setattr(application,'harness_stream',broken_pi)
     url=f'/api/projects/{pid}/planning/questions/{qid}/answer-stream'
     failure=client.post(url,headers=csrf,json=answer)
     assert failure.status_code==200
@@ -1987,7 +1712,7 @@ def test_answer_stream_failure_allows_retry_and_is_scoped(client,monkeypatch):
         assert s.query(Message).filter_by(discussion_id=did,role='user').count()==1
     async def recovered_pi(*args,**kwargs):
         yield 'delta',{'text':'Recovered without storing another user message.'}
-    monkeypatch.setattr(application,'pi_stream',recovered_pi)
+    monkeypatch.setattr(application,'harness_stream',recovered_pi)
     retry=client.post(f'/api/projects/{pid}/chat',headers=csrf,json={
         'discussion_id':did,'continue_question_id':qid,'mode':'discovery'})
     assert retry.status_code==200 and '"type": "done"' in retry.text
@@ -2011,63 +1736,3 @@ def test_discovery_progress_and_ui_contract(client):
     assert '/answer-start' in code and 'advance_planning:true' in code and 'EventSource' in code
     assert 'planning_complete' in code and 'planning_question' in code
     assert '/planning/questions/suggest' not in code
-
-
-def test_three_round_interview_reaches_draft_handoff_via_pi_tools(client,monkeypatch):
-    """Simulate three sequential user decisions, each followed by Pi's next step."""
-    import importlib
-    from planning import save_question
-    from db import PlanningQuestion
-    from artifact_builder import ARTIFACTS
-    application=importlib.import_module('app')
-    csrf=auth(client)
-    pid,did=_make_discussion_with_model(client,csrf,'multi-round-interview')
-    def create_q(number):
-        with SessionLocal() as s:
-            question,_=save_question(s,pid,did,{
-                'question':f'What is the scope decision number {number}?',
-                'options':[{'label':f'Option {number} A','pros':'Fits MVP','cons':'Work'},
-                           {'label':f'Option {number} B','pros':'Simple','cons':'Risk'}],
-                'recommended_index':0,'recommendation_reason':'Fits the project constraints.'})
-            return question.id
-    qid=create_q(1)
-    seen=[]
-    async def simulated_pi(project, discussion, dbs, model, **kw):
-        assert discussion.id==did
-        answered=dbs.query(PlanningQuestion).filter_by(project_id=pid,discussion_id=did,status='answered').count()
-        seen.append((answered,kw['run_id']))
-        yield 'status',{'phase':'thinking','message':'Pi assessing previous answer'}
-        yield 'delta',{'text':f'Đã phân tích quyết định thứ {answered}.'}
-        if answered<3:
-            create_q(answered+1)
-        else:
-            with SessionLocal() as gateway:
-                result=await tool_call('finish_discovery',{
-                    'summary':'The stakeholders have defined the user-facing scope, account isolation, trade reconciliation, audit trails and operational constraints. The planning record now contains three confirmed decisions and documented risks.',
-                    'evidence':'The owner answered each of the three planning questions and verified the MVP boundary.',
-                    'remaining_unknowns':[]},project=gateway.get(Project,pid),db=gateway,discussion_id=did)
-                assert result['status']=='draft_ready'
-    monkeypatch.setattr(application,'pi_stream',simulated_pi)
-    for step in range(1,4):
-        r=client.post(f'/api/projects/{pid}/planning/questions/{qid}/answer-stream',headers=csrf,
-                      json={'selected_ids':['o1']})
-        assert r.status_code==200,r.text
-        assert '"type": "done"' in r.text
-        if step<3:
-            assert '"type": "planning_question"' in r.text
-            with SessionLocal() as s:
-                q=s.query(PlanningQuestion).filter_by(project_id=pid,discussion_id=did,status='pending').one()
-                qid=q.id
-        else:
-            assert '"type": "planning_complete"' in r.text
-    assert [answered for answered,_run in seen]==[1,2,3]
-    assert len({run for _,run in seen})==3
-    r=client.get(f'/api/projects/{pid}/planning/discovery-progress',params={'discussion_id':did})
-    assert r.json()['status']=='draft_ready'
-    assert r.json()['answered']==3
-    assert r.json()['pending']==0
-    assert r.json()['drafts']==len(ARTIFACTS)
-    # User may still chat, but automatic discovery must no longer create questions.
-    after=client.post(f'/api/projects/{pid}/chat',headers=csrf,json={
-        'discussion_id':did,'mode':'discovery','advance_planning':True})
-    assert after.status_code==409

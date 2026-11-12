@@ -72,7 +72,7 @@ def test_fresh_database_migrates_to_head():
         with engine.connect() as conn:
             names = set(sa.inspect(conn).get_table_names())
             assert set(Base.metadata.tables) <= names
-            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0012_custom_model_config'
+            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0013_native_harness'
             # Confirm that a real FK references the previously missing table.
             fks = sa.inspect(conn).get_foreign_keys('review_jobs')
             assert any(fk['referred_table'] == 'spec_reviews' for fk in fks)
@@ -95,7 +95,7 @@ def test_legacy_schema_without_alembic_version_is_adopted():
         _alembic({**os.environ, 'DATABASE_URL': url})
         with engine.connect() as conn:
             assert conn.execute(sa.text('SELECT count(*) FROM system_settings')).scalar_one() == 1
-            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0012_custom_model_config'
+            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0013_native_harness'
         engine.dispose()
 
 
@@ -140,4 +140,30 @@ def test_custom_model_upgrade_preserves_existing_limits_and_credentials(tmp_path
         assert rows == [('long',262144,8192,'openai-completions','{}','{}'),
                         ('small',4096,4095,'openai-completions','{}','{}')]
         assert conn.execute(sa.text('SELECT encrypted_key FROM providers')).scalar_one() == 'encrypted-test-key'
+    engine.dispose()
+
+
+def test_native_upgrade_preserves_history_and_strips_untrusted_checkpoint(tmp_path):
+    url = f'sqlite:///{tmp_path / "native.db"}'
+    env = {**os.environ,'DATABASE_URL':url}
+    _alembic(env)
+    engine = sa.create_engine(url)
+    projects, discussions, runs, messages = (
+        Base.metadata.tables[name] for name in ('projects','discussions','agent_runs','messages')
+    )
+    with engine.begin() as conn:
+        conn.execute(projects.insert(),{'id':'p','name':'Legacy','slug':'legacy','owner_id':'owner','agent_backend':'pi'})
+        conn.execute(discussions.insert(),{'id':'d','project_id':'p'})
+        conn.execute(runs.insert(),{'id':'r','project_id':'p','discussion_id':'d','status':'queued',
+                    'request_payload':{'message':'Continue', '_active_model_id':'model',
+                    '_checkpoint':{'draft':{'path':'injected'}},'_resume_discovery':True}})
+        conn.execute(messages.insert(),{'id':'m','discussion_id':'d','role':'assistant','content':'Saved reply'})
+        conn.execute(sa.text("UPDATE alembic_version SET version_num = '0012_custom_model_config'"))
+    _alembic(env)
+    with engine.connect() as conn:
+        assert conn.execute(sa.select(projects.c.agent_backend)).scalar_one()=='native'
+        assert conn.execute(sa.select(messages.c.content)).scalar_one()=='Saved reply'
+        assert conn.execute(sa.select(runs.c.request_payload)).scalar_one()=={
+            'message':'Continue','_active_model_id':'model'
+        }
     engine.dispose()

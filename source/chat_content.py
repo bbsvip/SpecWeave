@@ -42,20 +42,20 @@ def turn_notice(text, events, *, limited=None, pending=False, handoff=False,
         for event in events
     )
     if handoff:
-        return {'label':'Bản nháp sẵn sàng', 'message':'Pi đã bàn giao bản nháp để bạn duyệt.'}
+        return {'label':'Bản nháp sẵn sàng', 'message':'SpecWeave đã bàn giao bản nháp để bạn duyệt.'}
     if limited:
         return {'label':'Đầu ra bị cắt',
                 'message':'Model chạm giới hạn đầu ra trước khi kết thúc. Xem hoạt động của lượt chạy để kiểm tra phần đã xử lý.'}
     if incomplete_tool:
         return {'label':'Lệnh công cụ chưa hoàn chỉnh',
-                'message':'Model gửi một phần lệnh gọi công cụ ở dạng văn bản. Pi không thể thực thi phần lệnh đó.'}
+                'message':'Model gửi một phần lệnh gọi công cụ ở dạng văn bản. SpecWeave không thể thực thi phần lệnh đó.'}
     if pending:
         return {'label':'Chờ xác nhận', 'message':'Chọn một phương án trong câu hỏi đang chờ để tiếp tục.'}
     if tool_finished:
         return {'label':'Có hoạt động công cụ',
-                'message':'Pi đã chạy công cụ trong lượt này và chưa gửi thêm câu trả lời.'}
+                'message':'SpecWeave đã chạy công cụ trong lượt này và chưa gửi thêm câu trả lời.'}
     return {'label':'Chưa có câu trả lời',
-            'message':'Lượt Pi đã kết thúc mà chưa có câu trả lời bằng văn bản. Bạn có thể yêu cầu Pi tiếp tục.'}
+            'message':'Lượt SpecWeave đã kết thúc mà chưa có câu trả lời bằng văn bản. Bạn có thể yêu cầu SpecWeave tiếp tục.'}
 
 
 def _options(value):

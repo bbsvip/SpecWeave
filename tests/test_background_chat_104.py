@@ -19,7 +19,7 @@ def test_detached_run_completes_without_any_open_sse_subscriber(client, monkeypa
                       'arguments':r'{"query":"t\\u1eadp trung"}'}
         yield 'delta',{'text':'Một câu trả lời tiếng Việt hoàn chỉnh.'}
         yield 'usage',{'input_tokens':234,'output_tokens':52}
-    monkeypatch.setattr(application,'pi_stream',pi_stub)
+    monkeypatch.setattr(application,'harness_stream',pi_stub)
     result=client.post(f'/api/projects/{pid}/chat/start',headers=csrf,json={
         'discussion_id':did,'message':'Phân tích rủi ro', 'role':'analyst','mode':'discovery'})
     assert result.status_code==200,result.text
@@ -57,7 +57,7 @@ def test_cancel_queued_run_prevents_any_pi_execution(client,monkeypatch):
     async def pi_nope(*args,**kwargs):
         raise AssertionError('Cancelled queue must not invoke Pi')
         yield 'delta',{'text':'never'}
-    monkeypatch.setattr(application,'pi_stream',pi_nope)
+    monkeypatch.setattr(application,'harness_stream',pi_nope)
     r=client.post(f'/api/projects/{pid}/chat/start',headers=csrf,json={
         'discussion_id':did,'message':'Xin chào'})
     assert r.status_code==200
@@ -66,7 +66,7 @@ def test_cancel_queued_run_prevents_any_pi_execution(client,monkeypatch):
     assert cancelled.status_code==200
     assert asyncio.run(run_once()) is None
     replay=client.get(r.json()['events_url'])
-    assert 'Đã hủy trước khi Pi bắt đầu' in replay.text
+    assert 'Đã hủy trước khi SpecWeave bắt đầu' in replay.text
 
 
 def test_turn_without_reply_reports_the_outcome_live_and_on_reload(client, monkeypatch):
@@ -86,7 +86,7 @@ def test_turn_without_reply_reports_the_outcome_live_and_on_reload(client, monke
         for event in next(cases):
             yield event
 
-    monkeypatch.setattr(application, 'pi_stream', pi_stub)
+    monkeypatch.setattr(application, 'harness_stream', pi_stub)
     labels = ('Có hoạt động công cụ', 'Đầu ra bị cắt', 'Lệnh công cụ chưa hoàn chỉnh', 'Chưa có câu trả lời')
     for index, label in enumerate(labels, start=1):
         result = client.post(f'/api/projects/{pid}/chat/start', headers=csrf, json={
@@ -156,7 +156,7 @@ def test_decision_answer_enqueues_same_pi_session_once(client,monkeypatch):
         with SessionLocal() as current:
             assert current.get(db.PlanningQuestion,qid).status=='answered'
         yield 'delta',{'text':'Đã hiểu lựa chọn của anh, tiếp tục làm rõ phạm vi.'}
-    monkeypatch.setattr(application,'pi_stream',pi_stub)
+    monkeypatch.setattr(application,'harness_stream',pi_stub)
     answer=client.post(f'/api/projects/{pid}/planning/questions/{qid}/answer-start',headers=csrf,
                        json={'selected_ids':['o1'],'custom_answer':'','note':'Cần audit'})
     assert answer.status_code==200,answer.text
@@ -188,87 +188,6 @@ def test_reconnect_uses_eventsource_without_issuing_new_prompt():
     assert 'window.addEventListener(\'beforeunload\'' not in code
 
 
-def test_discovery_fallback_runs_on_worker_once_per_saved_answer(client, monkeypatch):
-    import app as application
-    from planning import save_question
-
-    csrf = auth(client)
-    pid, did = _make_discussion_with_model(client, csrf, 'durable-discovery')
-    brief = {
-        'question': 'Phương án lưu trữ nào phù hợp?',
-        'options': [{'label':'PostgreSQL','pros':'Nhất quán','cons':'Cần vận hành'},
-                    {'label':'Tệp cục bộ','pros':'Dễ triển khai','cons':'Khó truy vấn'}],
-        'recommended_index':0, 'recommendation_reason':'Cần đối soát và kiểm toán',
-    }
-    with SessionLocal() as sess:
-        first, _ = save_question(sess, pid, did, brief)
-        question_id = first.id
-
-    attempts = []
-
-    async def pi_stub(project, discussion, sess, model, **kwargs):
-        attempts.append((discussion.id, kwargs['run_id'], 'prompt_override' in kwargs))
-        with SessionLocal() as current:
-            answered = current.query(db.PlanningQuestion).filter_by(discussion_id=did, status='answered').count()
-        if 'prompt_override' not in kwargs:
-            yield 'delta', {'text':'Đã ghi nhận lựa chọn.'}
-        else:
-            next_brief = {**brief, 'question':f'Câu hỏi kế tiếp về giới hạn số {answered}?'}
-            yield 'final', {'text':'```json\n'+json.dumps(next_brief, ensure_ascii=False)+'\n```'}
-        yield 'usage', {'input_tokens':10, 'output_tokens':5}
-
-    monkeypatch.setattr(application, 'pi_stream', pi_stub)
-    for answered in (1, 2):
-        response = client.post(f'/api/projects/{pid}/planning/questions/{question_id}/answer-start',
-                               headers=csrf, json={'selected_ids':['o1'], 'auto_next':True})
-        assert response.status_code == 200, response.text
-        job = response.json()
-        run_id = job['run_id']
-        assert asyncio.run(run_once()) == run_id  # No browser or SSE subscriber.
-        assert attempts[-2:] == [(did, run_id, False), (did, run_id, True)]
-        replay = client.get(job['events_url']).text
-        assert replay.count('"type": "planning_question"') == 1
-        assert '"type": "done"' in replay
-        with SessionLocal() as sess:
-            pending = sess.query(db.PlanningQuestion).filter_by(discussion_id=did, status='pending').one()
-            assert pending.question.endswith(f'số {answered}?')
-            assert sess.query(db.Message).filter_by(discussion_id=did, role='user').count() == answered
-            assert sess.query(db.Message).filter_by(run_id=run_id, role='assistant').one().content == 'Đã ghi nhận lựa chọn.'
-            assert sess.get(db.AgentRun, run_id).usage == {'input_tokens':20, 'output_tokens':10}
-            question_id = pending.id
-
-
-def test_advance_retries_truncated_document_once_on_the_worker(client, monkeypatch):
-    import app as application
-
-    csrf = auth(client)
-    pid, did = _make_discussion_with_model(client, csrf, 'truncated-document')
-    with SessionLocal() as sess:
-        sess.get(db.Project,pid).profile={'documents':['Roadmap','UX / UI Design']}
-        sess.add(db.Document(project_id=pid,path='docs/drafts/ROADMAP.md',title='Roadmap'))
-        sess.commit()
-    attempts = []
-
-    async def pi_stub(project, discussion, sess, model, **kwargs):
-        attempts.append((discussion.id, kwargs['run_id'], kwargs['prompt_override']))
-        yield 'status', {'phase':'document_output_limit','message':'Tool output limit'}
-
-    monkeypatch.setattr(application, 'pi_stream', pi_stub)
-    result = client.post(f'/api/projects/{pid}/chat/start',headers=csrf,json={
-        'discussion_id':did,'mode':'discovery','advance_planning':True})
-    assert result.status_code==200,result.text
-    job = result.json()
-    assert asyncio.run(run_once())==job['run_id']
-    assert [(discussion,run_id) for discussion,run_id,_ in attempts]==[(did,job['run_id'])]*2
-    retry_prompt = attempts[1][2]
-    assert 'UX-SPEC.md' in retry_prompt and 'ROADMAP.md' not in retry_prompt
-    assert '400–800' in retry_prompt and 'append_to_revision' in retry_prompt
-    replay = client.get(job['events_url']).text
-    assert '"type": "planning_needs_input"' in replay and '"type": "done"' in replay
-    with SessionLocal() as sess:
-        assert sess.query(db.Message).filter_by(discussion_id=did,role='user').count()==0
-
-
 def test_page_keeps_the_run_id_when_it_finishes_before_subscription(client, monkeypatch):
     import app as application
     csrf=auth(client)
@@ -276,7 +195,7 @@ def test_page_keeps_the_run_id_when_it_finishes_before_subscription(client, monk
     async def pi_stub(*args, **kwargs):
         yield 'thinking',{'text':'Thinking already streamed'}
         yield 'delta',{'text':'Durable response'}
-    monkeypatch.setattr(application,'pi_stream',pi_stub)
+    monkeypatch.setattr(application,'harness_stream',pi_stub)
     job=client.post(f'/api/projects/{pid}/chat/start',headers=csrf,json={
         'discussion_id':did,'message':'Original prompt'}).json()
     run_id=job['run_id']
@@ -321,7 +240,7 @@ def test_workers_overlap_between_discussions_and_retry_same_id_after_lock(client
                 overlap.set()
             await asyncio.wait_for(overlap.wait(),5)
             yield 'delta',{'text':discussion.id}
-        monkeypatch.setattr(application,'pi_stream',pi_stub)
+        monkeypatch.setattr(application,'harness_stream',pi_stub)
         async with discussion_lease(did):
             assert await run_once()==first
             assert entered==set()
@@ -351,7 +270,7 @@ def test_workers_overlap_between_discussions_and_retry_same_id_after_lock(client
 
 
 def test_prompt_includes_only_questions_from_its_discussion(client):
-    from ai import plan_prompt
+    from harness import facts_for, facts_text
     from planning import save_question
     csrf=auth(client)
     pid,did=_make_discussion_with_model(client,csrf,'scoped-planning-context')
@@ -364,7 +283,7 @@ def test_prompt_includes_only_questions_from_its_discussion(client):
                            {'label':'Second approach','pros':'Flexible','cons':'Complex'}],
                 'recommended_index':0,'recommendation_reason':'First is enough for now'})
         project=sess.get(db.Project,pid)
-        alpha=plan_prompt(project,sess,'analyst','discovery',discussion_id=did)
-        bravo=plan_prompt(project,sess,'analyst','discovery',discussion_id=other)
+        alpha=facts_text(facts_for(sess,project,did),10000)
+        bravo=facts_text(facts_for(sess,project,other),10000)
         assert 'Question specific to Alpha' in alpha and 'Question specific to Bravo' not in alpha
         assert 'Question specific to Bravo' in bravo and 'Question specific to Alpha' not in bravo

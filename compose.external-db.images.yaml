@@ -13,13 +13,8 @@ services:
       BOOTSTRAP_TOKEN: ${BOOTSTRAP_TOKEN:?Set BOOTSTRAP_TOKEN in .env}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       SEARXNG_URL: ${SEARXNG_URL:-}
-      PI_RUNNER_URL: http://127.0.0.1:8090
-      PI_RUNNER_KEY: ${PI_RUNNER_KEY:-}
-      PI_TOOL_URL: http://127.0.0.1:8080/api/internal/pi-tool
-      OPENAI_OAUTH_LOCAL_MODE: ${OPENAI_OAUTH_LOCAL_MODE:-false}
     volumes:
       - projects_data:/data
-      - openai_oauth_local:/auth-local
     shm_size: "1gb"
     security_opt: ["no-new-privileges:true"]
   review-worker:
@@ -33,9 +28,6 @@ services:
       DATA_ROOT: /data
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY in .env}
       SPECWEAVE_MIGRATIONS_MANAGED: "true"
-      OPENAI_OAUTH_LOCAL_MODE: ${OPENAI_OAUTH_LOCAL_MODE:-false}
-      PI_RUNNER_URL: http://web:8090
-      PI_RUNNER_KEY: ${PI_RUNNER_KEY:-}
       SPECWEAVE_CHAT_CONCURRENCY: ${SPECWEAVE_CHAT_CONCURRENCY:-4}
     depends_on:
       web: {condition: service_healthy}
@@ -44,4 +36,3 @@ services:
     security_opt: ["no-new-privileges:true"]
 volumes:
   projects_data:
-  openai_oauth_local:

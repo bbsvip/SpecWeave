@@ -1,6 +1,6 @@
-"""Local regression for Pi Activity, F5 replay and independent discussion sessions.
+"""Local regression for harness activity, F5 replay and isolated discussions.
 
-Run with the pinned Pi SDK and Playwright Chromium installed.
+Run with project requirements and Playwright Chromium installed.
 CHROMIUM_EXECUTABLE can point to an existing Chromium-based browser.
 """
 from contextlib import ExitStack, closing
@@ -45,7 +45,7 @@ class Provider(BaseHTTPRequestHandler):
                        'model':'local-test','choices':[{'index':0,'delta':delta,'finish_reason':reason}]}
             self.wfile.write(('data: '+json.dumps(payload,ensure_ascii=False)+'\n\n').encode())
             self.wfile.flush()
-        chunk({'role':'assistant','content':f'Pi {name} đang chạy'})
+        chunk({'role':'assistant','content':f'SpecWeave {name} đang chạy'})
         if name in releases and not releases[name].wait(40):
             return
         try:
@@ -59,17 +59,12 @@ class Provider(BaseHTTPRequestHandler):
 
 def run(scratch):
     web = f'http://127.0.0.1:{free_port()}'
-    pi = f'http://127.0.0.1:{free_port()}'
     provider = ThreadingHTTPServer(('127.0.0.1', 0), Provider)
     threading.Thread(target=provider.serve_forever, daemon=True).start()
     env = {**os.environ, 'DATA_ROOT':str(scratch/'data'), 'DATABASE_URL':'sqlite:///'+(scratch/'data.sqlite').as_posix(),
            'ENCRYPTION_KEY':Fernet.generate_key().decode(), 'BOOTSTRAP_TOKEN':'isolated-test-bootstrap-token-000',
            'COOKIE_SECURE':'false', 'SPECWEAVE_MIGRATIONS_MANAGED':'false',
-           'OPENAI_OAUTH_LOCAL_MODE':'false', 'OPENAI_OAUTH_LOCAL_HOME':str(scratch/'vault'),
-           'PI_RUNNER_URL':pi,'PI_RUNNER_KEY':'isolated-test-runner-key-00000000000000','PI_TOOL_URL':web+'/api/internal/pi-tool',
-           'PI_HOST_PORT':pi.rsplit(':',1)[-1], 'PORT':web.rsplit(':',1)[-1],
-           'PI_HOST_BIND':'127.0.0.1','PROJECTS_ROOT':str(scratch/'data'/'projects'),
-           'SPECWEAVE_PI_SAFE_RESOURCES_DIR':str(scratch/'resources'), 'SPECWEAVE_CHAT_CONCURRENCY':'2'}
+           'PORT':web.rsplit(':',1)[-1], 'SPECWEAVE_CHAT_CONCURRENCY':'2'}
     with ExitStack() as stack:
         stack.callback(provider.server_close)
         stack.callback(provider.shutdown)
@@ -91,13 +86,10 @@ def run(scratch):
                     proc.wait()
             stack.callback(stop)
             return proc
-        host=start('pi', ['node','source/pi_host.mjs'])
         start('web', [sys.executable,'source/app.py'])
         client = stack.enter_context(httpx.Client(base_url=web, trust_env=False, timeout=15))
         def wait_until_healthy(url):
             for _ in range(100):
-                if url==pi and host.poll() is not None:
-                    raise RuntimeError('Pi host exited; check the pinned SDK dependencies')
                 try:
                     if client.get(url+'/health',timeout=1).is_success:
                         break
@@ -106,9 +98,8 @@ def run(scratch):
                 time.sleep(.1)
             else:
                 raise RuntimeError(f'{url} failed health check')
-        for url in (web,pi):
-            wait_until_healthy(url)
-        start('worker',[sys.executable,'source/review_worker.py'])
+        wait_until_healthy(web)
+        worker=start('worker',[sys.executable,'source/review_worker.py'])
         boot=client.post('/first-run',data={'username':'admin','email':'admin@example.org','password':'local-test-password','bootstrap_token':env['BOOTSTRAP_TOKEN']})
         assert boot.status_code==303,boot.text
         assert client.post('/login',data={'username':'admin','password':'local-test-password'}).status_code==303
@@ -119,7 +110,7 @@ def run(scratch):
             return res.json()
         provider_id=post('/api/providers',{'name':'Local smoke','base_url':f'http://127.0.0.1:{provider.server_port}/v1','api_key':'fake'})['id']
         post(f'/api/providers/{provider_id}/models',{'model_ids':['local-test']})
-        pid=post('/api/projects',{'name':'Pi smoke','description':'Local test'})['id']
+        pid=post('/api/projects',{'name':'SpecWeave smoke','description':'Local test'})['id']
         with closing(sqlite3.connect(scratch/'data.sqlite')) as db:
             mid=db.execute('select id from models where model_id=?',('local-test',)).fetchone()[0]
             did=db.execute('select id from discussions where project_id=?',(pid,)).fetchone()[0]
@@ -172,7 +163,7 @@ def run(scratch):
                     page.route('**/static/js/discussion.js?v=*',before_load,times=1)
                 page.goto(discussion(key))
                 expect(page.locator('#chatInput')).to_be_enabled()
-                page.locator('#autoNextPlanning').uncheck()
+                page.locator('#agentMode').select_option('discuss')
                 return page
             def send(page,text):
                 page.locator('#chatInput').fill(text)
@@ -182,19 +173,19 @@ def run(scratch):
                 expect(page.locator('.turn-live')).to_be_visible()
             a=visit(did)
             send(a,'alpha')
-            live(a,'Pi alpha đang chạy')
+            live(a,'SpecWeave alpha đang chạy')
             assert provider_requests[-1]['max_tokens']==32768, provider_requests[-1].keys()
             assert provider_requests[-1]['temperature']==0.7
             assert provider_requests[-1]['top_p']==0.95
             assert 'max_completion_tokens' not in provider_requests[-1]
             a.reload()
-            live(a,'Pi alpha đang chạy')
+            live(a,'SpecWeave alpha đang chạy')
             assert len(posts)==1,posts
             a.goto(f'{web}/projects/{pid}/documents')
             a.close()
             b=visit(bid)
             send(b,'bravo')
-            live(b,'Pi bravo đang chạy')
+            live(b,'SpecWeave bravo đang chạy')
             assert [name for name,_ in calls]==['alpha','bravo'],calls
             assert 'alpha' not in json.dumps(calls[-1][1])
             def wait_until_idle(discussion_id):
@@ -212,36 +203,36 @@ def run(scratch):
 
             # The HTML sees the active run, but JS only starts after it finishes.
             a=visit(did,finish_before_javascript)
-            expect(a.locator('.message-agent .message-content').filter(has_text='Pi alpha đang chạy · hoàn tất')).to_have_count(1)
+            expect(a.locator('.message-agent .message-content').filter(has_text='SpecWeave alpha đang chạy · hoàn tất')).to_have_count(1)
             expect(a.locator('.turn-live-label')).to_have_text('Hoàn thành')
             b.close()
             releases['bravo'].set()
             wait_until_idle(bid)
             b=visit(bid)
-            expect(b.locator('.message-agent .message-content').filter(has_text='Pi bravo đang chạy · hoàn tất')).to_have_count(1)
+            expect(b.locator('.message-agent .message-content').filter(has_text='SpecWeave bravo đang chạy · hoàn tất')).to_have_count(1)
 
             a.locator('#agentRole').select_option('architect')
             configure_model(65536,0.3)
             send(a,'charlie')
-            expect(a.locator('.message-agent .message-content').filter(has_text='Pi charlie đang chạy · hoàn tất')).to_have_count(1,timeout=15000)
+            expect(a.locator('.message-agent .message-content').filter(has_text='SpecWeave charlie đang chạy · hoàn tất')).to_have_count(1,timeout=15000)
             sent=json.dumps(calls[-1][1],ensure_ascii=False)
             assert 'alpha' in sent and 'bravo' not in sent
             assert 'BMAD Architect' in sent
             assert provider_requests[-1]['max_tokens']==65536
             assert provider_requests[-1]['temperature']==0.3
 
-            host.terminate()
-            host.wait(5)
-            host=start('pi-restarted',['node','source/pi_host.mjs'])
-            wait_until_healthy(pi)
+            wait_until_idle(did)
+            worker.terminate()
+            worker.wait(5)
+            worker=start('worker-restarted',[sys.executable,'source/review_worker.py'])
             send(a,'delta')
-            expect(a.locator('.message-agent .message-content').filter(has_text='Pi delta đang chạy · hoàn tất')).to_have_count(1,timeout=15000)
+            expect(a.locator('.message-agent .message-content').filter(has_text='SpecWeave delta đang chạy · hoàn tất')).to_have_count(1,timeout=15000)
             sent=json.dumps(calls[-1][1],ensure_ascii=False)
             assert 'alpha' in sent and 'charlie' in sent and 'bravo' not in sent
             assert provider_requests[-1]['max_tokens']==65536
 
             send(b,'stop-test')
-            live(b,'Pi stop-test đang chạy')
+            live(b,'SpecWeave stop-test đang chạy')
             b.locator('#stopChat').click()
             expect(b.locator('.turn-live-label')).to_have_text('Đã dừng',timeout=15000)
             releases['stop-test'].set()
@@ -250,9 +241,9 @@ def run(scratch):
             assert sum(url.endswith('/cancel') for url in posts)==1
             assert not errors,errors
             browser.close()
-        print('Passed Pi discussion E2E with the real SDK and a local provider fixture.')
+        print('Passed SpecWeave discussion E2E against the native harness and a local provider fixture.')
 
 
 if __name__=='__main__':
-    with tempfile.TemporaryDirectory(prefix='specweave-pi-e2e-') as path:
+    with tempfile.TemporaryDirectory(prefix='specweave-native-e2e-') as path:
         run(Path(path))

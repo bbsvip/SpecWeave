@@ -24,27 +24,6 @@ def test_fernet_configuration_fails_early_and_without_leaking(monkeypatch):
     assert cipher.decrypt(cipher.encrypt(b'safe')) == b'safe'
 
 
-def test_oauth_failure_message_redacts_arbitrary_credentials():
-    from openai_oauth_runtime import safe_event, ERROR_DESCRIPTIONS
-    entry=safe_event({'type':'error','code':'OAUTH_NETWORK','message':'access_token=secret123'})
-    assert entry['code']=='OAUTH_NETWORK'
-    assert entry['message']==ERROR_DESCRIPTIONS['OAUTH_NETWORK']
-    assert 'secret123' not in json.dumps(entry)
-    unknown=safe_event({'type':'error','code':'EVIL_UNTRUSTED_CODE','message':'test secret'})
-    assert unknown['code']=='OAUTH_RUNTIME_FAILURE'
-
-
-@pytest.mark.asyncio
-async def test_oauth_terminal_login_is_conflict(monkeypatch):
-    import openai_oauth_runtime as runtime
-    monkeypatch.setenv('OPENAI_OAUTH_LOCAL_MODE','true')
-    monkeypatch.setattr(runtime,'LOGIN',{'id':'test-session','state':'error','events':[runtime._oauth_error('OAUTH_MODULE_ERROR')]})
-    with pytest.raises(HTTPException) as exc:
-        await runtime.answer_login('test-session','callback-code')
-    assert exc.value.status_code==409
-    assert 'OAUTH_MODULE_ERROR' in str(exc.value.detail)
-
-
 def test_project_trash_active_nav_and_json_profile(client):
     from test_app import auth, create_project
     from db import Project, SessionLocal

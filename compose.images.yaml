@@ -33,15 +33,10 @@ services:
       MAX_PROJECT_FILES: ${MAX_PROJECT_FILES:-50000}
       SPECWEAVE_MIGRATIONS_MANAGED: "true"
       SEARXNG_URL: ${SEARXNG_URL:-}
-      PI_RUNNER_URL: http://127.0.0.1:8090
-      PI_RUNNER_KEY: ${PI_RUNNER_KEY:-}
-      PI_TOOL_URL: http://127.0.0.1:8080/api/internal/pi-tool
-      OPENAI_OAUTH_LOCAL_MODE: ${OPENAI_OAUTH_LOCAL_MODE:-false}
     depends_on:
       db: {condition: service_healthy}
     volumes:
       - projects_data:/data
-      - openai_oauth_local:/auth-local
     security_opt:
       - no-new-privileges:true
     shm_size: "1gb"
@@ -57,9 +52,6 @@ services:
       DATA_ROOT: /data
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY in .env}
       SPECWEAVE_MIGRATIONS_MANAGED: "true"
-      OPENAI_OAUTH_LOCAL_MODE: ${OPENAI_OAUTH_LOCAL_MODE:-false}
-      PI_RUNNER_URL: http://web:8090
-      PI_RUNNER_KEY: ${PI_RUNNER_KEY:-}
       SPECWEAVE_CHAT_CONCURRENCY: ${SPECWEAVE_CHAT_CONCURRENCY:-4}
     depends_on:
       db: {condition: service_healthy}
@@ -72,7 +64,6 @@ services:
 volumes:
   postgres_data:
   projects_data:
-  openai_oauth_local:
 networks:
   private:
     internal: true

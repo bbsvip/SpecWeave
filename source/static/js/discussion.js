@@ -9,7 +9,6 @@
   const suggestButton=document.getElementById('suggestPlanningQuestion');
   const questionSlot=document.getElementById('planningQuestion');
   const headerUsage=document.getElementById('sessionUsage');
-  const autoNext=document.getElementById('autoNextPlanning');
   const progressElement=document.getElementById('discoveryProgress');
   let controller=null,runId=null,openQuestion=null,selectedIds=new Set();
   let discoveryDone=root.dataset.discoveryReady==='true';
@@ -42,7 +41,7 @@
     return value;
   }
   function formatToolValue(value){
-    // Display only. Pi receives the original arguments unchanged.
+    // Display only. The provider receives the original arguments unchanged.
     if(value===null||value===undefined)return '';
     let parsed=value;
     if(typeof parsed==='string'){
@@ -114,7 +113,7 @@
     const surface=make('section','turn-live');
     const live=make('div','turn-live-heading');
     const spinner=make('span','turn-loader');spinner.setAttribute('aria-hidden','true');
-    const heading=make('span','turn-live-label','Pi Agent đang chuẩn bị phiên…');live.append(spinner,heading);
+    const heading=make('span','turn-live-label','SpecWeave đang chuẩn bị phiên…');live.append(spinner,heading);
     const details=make('details','turn-activity');
     const summary=make('summary','','Hoạt động của agent · đang chạy');
     const inner=make('div','turn-activity-body');
@@ -204,20 +203,19 @@
     },350);
     try{
       // Start a durable job; the browser owns only its EventSource subscriber.
-      // Closing/navigating the tab never aborts the Pi run.
+      // Closing/navigating the tab never aborts the lượt chạy.
       const target=answerQuestion?
         `/api/projects/${pid}/planning/questions/${encodeURIComponent(answerQuestion.question.id)}/answer-start`:
         `/api/projects/${pid}/chat/start`;
-      const automaticNext=Boolean(autoNext?.checked);
       const payload=answerQuestion?
-        {...answerQuestion.data,role,mode:'discovery',auto_next:automaticNext}:
-        {discussion_id:did,message,role,mode:continueQuestionId||advancePlanning?'discovery':mode,auto_next:automaticNext,
+        {...answerQuestion.data,role,mode:'discovery'}:
+        {discussion_id:did,message,role,mode:continueQuestionId||advancePlanning?'discovery':mode,
          ...(continueQuestionId?{continue_question_id:continueQuestionId}:{}),
          ...(advancePlanning?{advance_planning:true}: {})};
       let queued;
       if(resumeRunId){
         queued={run_id:resumeRunId,events_url:`/api/projects/${pid}/runs/${encodeURIComponent(resumeRunId)}/events`};
-        addTimeline(panel.timeline,'status','Đã nối lại Pi run trên server');
+        addTimeline(panel.timeline,'status','Đã nối lại lượt chạy trên server');
       }else{
         const body=JSON.stringify(payload);
         const keepalive=new TextEncoder().encode(body).length<60000;
@@ -228,7 +226,7 @@
         });
         const data=await response.json().catch(()=>({}));
         if(response.status===409){
-          // F5/double-submit race: a durable Pi run may already have been
+          // F5/double-submit race: a durable lượt chạy may already have been
           // committed by the preceding tab. Attach it; do NOT send a second
           // prompt or create a second run on this discussion.
           const active=await fetch(`/api/projects/${pid}/discussions/${did}/active-run`,{
@@ -241,10 +239,10 @@
                 events_url:`/api/projects/${pid}/runs/${encodeURIComponent(existing.run_id)}/events`};
               observing=true;
               // The new message was NOT accepted. Remove its optimistic bubble
-              // and restore the input while observing the earlier Pi run.
+              // and restore the input while observing the earlier lượt chạy.
               if(optimistic){optimistic.article.remove();optimistic=null;}
               if(message&&!input.value.trim())input.value=message;
-              addTimeline(panel.timeline,'status','Đã nối lại lượt Pi có sẵn; tin nhắn mới chưa được gửi');
+              addTimeline(panel.timeline,'status','Đã nối lại lượt SpecWeave có sẵn; tin nhắn mới chưa được gửi');
             }
           }
         }
@@ -253,9 +251,9 @@
           queued=data;
         }
       }
-      if(!queued.run_id)throw new Error('Server chưa trả về Pi run ID');
+      if(!queued.run_id)throw new Error('Server chưa trả về lượt chạy ID');
       runId=queued.run_id;
-      setBusy(true,'Đang kết nối với Pi…');
+      setBusy(true,'Đang kết nối với SpecWeave…');
       answerAccepted=Boolean(answerQuestion&&!observing);
       if(answerAccepted){renderPlanningQuestion(null);refreshDiscoveryProgress();}
       const historyStatus=document.querySelector(`[data-run-status="${CSS.escape(runId)}"]`);
@@ -387,7 +385,7 @@
           controller?.signal.removeEventListener('abort',onAbort);
           error?reject(error):resolve();
         };
-        const onAbort=()=>finish(new DOMException('Đã ngắt theo dõi; Pi chỉ hủy khi bấm Dừng','AbortError'));
+        const onAbort=()=>finish(new DOMException('Đã ngắt theo dõi; SpecWeave chỉ hủy khi bấm Dừng','AbortError'));
         controller.signal.addEventListener('abort',onAbort,{once:true});
         source.onmessage=(raw)=>{
           if(settled)return;
@@ -400,27 +398,27 @@
             handleFrame(frame);
             if(frame.type==='done')finish();
             else if(frame.type==='error'){
-              const error=new Error(frame.payload?.message||'Pi run failed');
+              const error=new Error(frame.payload?.message||'lượt chạy failed');
               if(terminalStatus==='cancelled')error.name='AbortError';
               finish(error);
             }
           }catch(e){finish(e);}
         };
         source.onopen=()=>{
-          if(!settled)state.textContent='Đang theo dõi Pi…';
+          if(!settled)state.textContent='Đang theo dõi SpecWeave…';
         };
         source.onerror=()=>{
           if(settled)return;
           if(source.readyState===EventSource.CLOSED){
-            finish(new Error('Không thể mở luồng Pi. Anh có thể thử kết nối lại.'));
+            finish(new Error('Không thể mở luồng SpecWeave. Anh có thể thử kết nối lại.'));
             return;
           }
-          // EventSource reconnects with Last-Event-ID, so no duplicate Pi call.
+          // EventSource reconnects with Last-Event-ID, so no duplicate SpecWeave call.
           panel.heading.textContent='Mất kết nối, đang nối lại và tải các sự kiện còn thiếu…';
           state.textContent='Đang kết nối lại…';
         };
       });
-      if(!completed)throw new Error('Pi run đã kết thúc nhưng thiếu sự kiện done');
+      if(!completed)throw new Error('lượt chạy đã kết thúc nhưng thiếu sự kiện done');
       flushRender();
       panel.metrics.textContent=describeUsage(usage,firstTokenMs,elapsedMs,full.length,outputTps);
       if(headerUsage)headerUsage.textContent=panel.metrics.textContent;
@@ -429,8 +427,8 @@
       if((nextQuestionMissing||advancePlanning)&&!openQuestion&&!discoveryDone){
         if(panel.heading.textContent==='Hoàn thành')panel.heading.textContent='Discovery chưa hoàn tất';
         const note=make('p','turn-error',
-          'Anh có thể bổ sung thông tin trong chat hoặc yêu cầu Pi tiếp tục từ dữ liệu đã lưu.');
-        const retry=actionButton('Tiếp tục với Pi','btn-outline-primary',()=>{
+          'Anh có thể bổ sung thông tin trong chat hoặc yêu cầu SpecWeave tiếp tục từ dữ liệu đã lưu.');
+        const retry=actionButton('Tiếp tục với SpecWeave','btn-outline-primary',()=>{
           if(controller)return;
           talk({advancePlanning:true});
         });
@@ -453,13 +451,13 @@
         sw.toast(msg,'error');
         if(runId&&!terminalStatus){
           const interruptedRun=runId;
-          turn.body.append(actionButton('Kết nối lại với Pi','btn-outline-primary',()=>{
+          turn.body.append(actionButton('Kết nối lại với SpecWeave','btn-outline-primary',()=>{
             if(controller)return;
             turn.article.remove();
             talk({resumeRunId:interruptedRun});
           }));
         }else if(answerQuestion&&answerAccepted){
-          const retry=actionButton('Thử tiếp tục trong cùng phiên Pi','btn-outline-primary',()=>{
+          const retry=actionButton('Thử tiếp tục trong cùng phiên SpecWeave','btn-outline-primary',()=>{
             retry.disabled=true;talk({continueQuestionId:answerQuestion.question.id});
           });turn.body.append(retry);
         }
@@ -537,7 +535,7 @@
       try{
         const data={action,selected_ids:[...selectedIds],custom_answer:custom.value,note:notes.value};
         if(action==='answer'){
-          // The server saves the answer and enqueues Pi in the same transaction.
+          // The server saves the answer and enqueues SpecWeave in the same transaction.
           const ok=await talk({answerQuestion:{question:q,data}});
           if(!ok){
             panel.classList.remove('planning-loading');
@@ -570,7 +568,7 @@
       const finished=progress.status==='draft_ready';
       discoveryDone=finished;
       progressElement.replaceChildren();
-      progressElement.append(make('strong','',finished?'Đủ dữ liệu · đã tạo draft':'Đang làm rõ với Pi'));
+      progressElement.append(make('strong','',finished?'Đủ dữ liệu · đã tạo draft':'Đang làm rõ với SpecWeave'));
       progressElement.append(make('span','',`${progress.answered} đã xác nhận · ${progress.pending} chờ trả lời · ${progress.deferred} hoãn`));
       progressElement.append(make('span','',`${progress.drafts}/${progress.total_artifacts} bản nháp hiện có`));
       if(finished){
@@ -593,8 +591,8 @@
       }
     }catch(e){console.warn('Planning question unavailable:',e.message);}
   }
-  // 'AI đề xuất' now uses the SAME Pi AgentSession and event stream as chat,
-  // never a stateless Pi completion hidden behind a plain JSON API.
+  // 'AI đề xuất' now uses the SAME SpecWeaveSession and event stream as chat,
+  // never a stateless SpecWeave completion hidden behind a plain JSON API.
   suggestButton?.addEventListener('click',()=>{
     if(!did||controller)return;
     if(openQuestion){scrollToQuestion();return;}
@@ -628,7 +626,7 @@
       await talk({resumeRunId:root.dataset.activeRun});
       return;
     }
-    setBusy(true,'Đang kiểm tra Pi run trên server…');
+    setBusy(true,'Đang kiểm tra lượt chạy trên server…');
     try{
       const current=await sw.api(`/api/projects/${pid}/discussions/${did}/active-run`,{},'GET');
       if(current.run_id){
@@ -638,8 +636,8 @@
       setBusy(false);
       await refreshPlanningQuestion();
     }catch(e){
-      console.warn('Pi run reconnect:',e.message);
-      setBusy(false,'Chưa kiểm tra được trạng thái Pi');
+      console.warn('lượt chạy reconnect:',e.message);
+      setBusy(false,'Chưa kiểm tra được trạng thái SpecWeave');
       sw.toast(e.message,'error');
     }
   }

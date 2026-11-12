@@ -1,8 +1,8 @@
-"""Durable Pi chat processing. Browser connections only observe persisted events.
+"""Durable SpecWeave chat processing. Browser connections observe persisted events.
 
 Run directly from the existing review-worker process, never from the web request.
 Multiple workers claim queued jobs with SKIP LOCKED on PostgreSQL. A crashed
-worker does not blindly retry a potentially already-executed Pi prompt.
+worker can resume checkpointed Discovery. Other modes are never replayed.
 """
 import asyncio
 import json
@@ -22,12 +22,11 @@ LEASE_SECONDS=180
 CONCURRENCY=4
 
 
-def record(db, run_id: str, event: dict):
+def record(db, run_id: str, claim: str, event: dict):
     run=db.get(AgentRun,run_id,with_for_update=True)
-    if not run or run.status!='running' or run.worker_owner!=WORKER_ID:
+    if not run or run.status!='running' or run.worker_owner!=claim:
         return False
-    # Store all actual Pi events for replay. Never store credentials or tool
-    # capability headers here (these are not part of forwarded chat frames).
+    # The browser can replay these events after a disconnect.
     db.add(ChatStreamEvent(run_id=run_id,event=event,created_at=utcnow()))
     run.lease_expires_at=utcnow()+timedelta(seconds=LEASE_SECONDS)
     db.commit()
@@ -49,15 +48,24 @@ def fail_run(db, run: AgentRun, message: str):
 def claim_next():
     with SessionLocal() as db:
         now=utcnow()
-        # After a worker restart, fail a lease-expired run instead of retrying
-        # a Pi prompt that may have completed inside the Pi Host already.
+        # Only server-owned Discovery checkpoints allow automatic recovery.
         stale=(db.query(AgentRun).filter(AgentRun.status=='running',
             AgentRun.worker_owner.isnot(None),AgentRun.lease_expires_at < now)
             .with_for_update(skip_locked=True).first())
         if stale:
-            fail_run(db,stale,'Worker mất kết nối; phiên Pi có thể vẫn đang chạy. Kiểm tra trạng thái trước khi gửi lại.')
+            payload = stale.request_payload or {}
+            if payload.get('_resume_discovery') and not payload.get('_recovery_count') and not stale.cancel_requested:
+                stale.status='queued'
+                stale.worker_owner=None
+                stale.lease_expires_at=None
+                stale.request_payload={**payload,'_recovery_count':1}
+                db.add(ChatStreamEvent(run_id=stale.id,event={'type':'status','run_id':stale.id,
+                       'payload':{'phase':'recovering','message':'Worker tiếp tục Discovery từ checkpoint đã lưu…'}}))
+                db.flush()
+            else:
+                fail_run(db,stale,'Worker bị gián đoạn. Kiểm tra kết quả đã lưu trước khi thử lại.')
         row=(db.query(AgentRun).filter(AgentRun.status=='queued')
-            # Requeued jobs back off until the prior Pi session releases its
+            # Requeued jobs back off until the previous run releases its
             # advisory lock; they must not spin or be treated as failures.
             .filter(or_(AgentRun.lease_expires_at.is_(None),AgentRun.lease_expires_at<=now))
             .order_by(AgentRun.created_at,AgentRun.id)
@@ -66,20 +74,21 @@ def claim_next():
             db.commit()
             return None
         row.status='running'
-        row.worker_owner=WORKER_ID
+        row.worker_owner=WORKER_ID+'-'+uuid.uuid4().hex[:12]
         row.lease_expires_at=now+timedelta(seconds=LEASE_SECONDS)
         db.commit()
         return row.id
 
 
 async def process_queued_run(run_id: str):
-    """Consume the existing Pi-native producer without an attached HTTP client."""
+    """Consume the harness producer without an attached HTTP client."""
     # Import only inside worker. The web server never starts a model task.
     from app import _chat_stream_impl, acl
     from db import Project, User
     with SessionLocal() as db:
         run=db.get(AgentRun,run_id)
-        if not run or run.status!='running' or run.worker_owner!=WORKER_ID:return
+        if not run or run.status!='running' or not (run.worker_owner or '').startswith(WORKER_ID+'-'):return
+        claim=run.worker_owner
         project=db.get(Project,run.project_id)
         actor=db.get(User,run.requester_id) if run.requester_id else None
         if not project or not actor or not actor.enabled:
@@ -87,14 +96,14 @@ async def process_queued_run(run_id: str):
             return
         try:acl(db,project.id,actor,write=True)
         except Exception:
-            fail_run(db,run,'Quyền truy cập dự án đã thay đổi; Pi run không được phép tiếp tục')
+            fail_run(db,run,'Quyền truy cập dự án đã thay đổi; lượt chạy không được phép tiếp tục')
             return
         if project.active_model_id!=(run.request_payload or {}).get('_active_model_id'):
             fail_run(db,run,'Model dự án đã thay đổi sau khi xếp hàng; vui lòng gửi lại')
             return
         try:
             response=await _chat_stream_impl(run.project_id,db,actor,project,
-                run.request_payload or {},existing_run_id=run_id)
+                run.request_payload or {},existing_run_id=run_id,existing_claim=claim)
             async with aclosing(response.body_iterator) as frames:
                 async for frame in frames:
                     event=json.loads(frame.removeprefix('data: '))
@@ -103,23 +112,23 @@ async def process_queued_run(run_id: str):
                     if event['type'] in ('done','error'):
                         continue
                     with SessionLocal() as events_db:
-                        if not record(events_db,run_id,event):
+                        if not record(events_db,run_id,claim,event):
                             break
         except BaseException as exc:
             # Catch worker cancellation only to mark durable state, then let the
             # worker shutdown; don't silently re-run a possibly completed prompt.
             with SessionLocal() as err_db:
                 current=err_db.get(AgentRun,run_id,with_for_update=True)
-                if current and current.status=='running' and current.worker_owner==WORKER_ID:
+                if current and current.status=='running' and current.worker_owner==claim:
                     detail=(exc.detail if isinstance(exc,HTTPException) else
-                            'Pi background run interrupted ('+type(exc).__name__+')')
+                            'Background run interrupted ('+type(exc).__name__+')')
                     fail_run(err_db,current,detail)
             if isinstance(exc,asyncio.CancelledError):raise
             return
     with SessionLocal() as db:
         run=db.get(AgentRun,run_id,with_for_update=True)
-        if run and run.status=='running' and run.worker_owner==WORKER_ID:
-            fail_run(db,run,'Pi stream ended without a terminal result')
+        if run and run.status=='running' and run.worker_owner==claim:
+            fail_run(db,run,'Harness stream ended without a terminal result')
 
 
 async def chat_worker_main():

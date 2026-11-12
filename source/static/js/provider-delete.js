@@ -10,7 +10,6 @@
         `• ${preview.active_reviews} review đang chạy/chờ`,
         `• ${preview.active_chats} chat đang chạy`];
       if(preview.project_names.length)details.push('Dự án ảnh hưởng: '+preview.project_names.join(', '));
-      if(preview.kind==='openai-oauth')details.push('Cần Disconnect OpenAI OAuth trước khi xóa.');
       const choice=window.prompt(details.join('\n')+'\n\nNhập CHÍNH XÁC tên provider để xác nhận xóa:');
       if(choice===null)return;
       if(choice!==preview.name)throw Error('Tên xác nhận không trùng với provider.');
