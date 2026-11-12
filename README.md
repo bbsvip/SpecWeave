@@ -194,3 +194,7 @@ PI_RUNNER_KEY=GENERATE_A_STRONG_RANDOM_SECRET_AT_LEAST_32_CHARS
 Start the optional runner with `docker compose --profile pi up -d --build`, then open **Providers & Models → OpenAI · Đăng nhập bằng ChatGPT → Connect** as the owner/admin. Follow browser login (paste the redirect URL/code only if Pi prompts). On success fetch model IDs from Pi and select one in Project Settings. Guided Planning, AI review and chat use the same local OAuth runner with owner checks.
 
 For `compose.external-db.yaml`, use `docker compose -f compose.external-db.yaml --profile pi up -d --build`. Disconnect removes **local** credentials only (not remote provider authorization). See [`docs/RELEASE_v0.9_OPENAI_OAUTH.vi.md`](docs/RELEASE_v0.9_OPENAI_OAUTH.vi.md) for full setup, security and acceptance details.
+
+## v0.9.2 — Fresh PostgreSQL migration fix
+
+Fix an Alembic initialization error on empty PostgreSQL databases (`relation "spec_reviews" does not exist` while creating `review_jobs`). Migration `0001_baseline` now creates only baseline tables; `0002_quality` creates `spec_reviews`, and `0003_review_jobs` creates `review_jobs` after its referenced table exists. No changes to application data or provider/OAuth configuration. See `docs/MIGRATION_FIX.v0.9.2.vi.md`.
