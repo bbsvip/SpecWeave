@@ -136,16 +136,13 @@
     root.classList.toggle('chat-busy',active);
     suggestButton&&(suggestButton.disabled=active);
   }
-  function describeUsage(usage,first,elapsed,contextWindow,outputChars=0,outputTps=null){
+  function describeUsage(usage,first,elapsed,outputChars=0,outputTps=null){
     const parts=[];
     if(typeof usage.input_tokens==='number')parts.push('Input '+formatNumber(usage.input_tokens));
     if(typeof usage.output_tokens==='number')parts.push('Output '+formatNumber(usage.output_tokens));
     if(typeof usage.cache_read_tokens==='number')parts.push('Cache read '+formatNumber(usage.cache_read_tokens));
     if(typeof usage.cache_write_tokens==='number')parts.push('Cache write '+formatNumber(usage.cache_write_tokens));
     if(typeof usage.cost_usd==='number')parts.push('$'+usage.cost_usd.toFixed(5));
-    if(typeof usage.input_tokens==='number'&&contextWindow>0){
-      parts.push('Context '+(100*usage.input_tokens/contextWindow).toFixed(1)+'%');
-    }
     if(typeof first==='number')parts.push('TTFT '+(first/1000).toFixed(2)+'s');
     if(typeof elapsed==='number')parts.push('Thời gian '+(elapsed/1000).toFixed(1)+'s');
     if(typeof outputTps==='number'&&Number.isFinite(outputTps)){
@@ -181,7 +178,7 @@
     document.getElementById('piRunPlaceholder')?.remove();
     const turn=addMessage('assistant','');const panel=buildTurnActivity(turn);
     const role=sw.val('agentRole'),mode=sw.val('agentMode');
-    let full='',usage={},contextWindow=0,firstTokenMs=null,elapsedMs=0,completed=false,outputTps=null;
+    let full='',usage={},firstTokenMs=null,elapsedMs=0,completed=false,outputTps=null;
     let thinkingFull='',lastPhase='request',answerAccepted=false,nextQuestionMissing=false;
     let observing=Boolean(resumeRunId), terminalStatus=null;
     const started=performance.now();let renderScheduled=false,renderHandle=null;
@@ -201,7 +198,7 @@
     streamingTimer=setInterval(()=>{
       if(terminalStatus)return;
       elapsedMs=performance.now()-started;
-      panel.metrics.textContent=describeUsage(usage,firstTokenMs,elapsedMs,contextWindow,full.length,outputTps);
+      panel.metrics.textContent=describeUsage(usage,firstTokenMs,elapsedMs,full.length,outputTps);
       if(headerUsage)headerUsage.textContent=panel.metrics.textContent;
     },350);
     try{
@@ -272,7 +269,6 @@
         const p=ev.payload||{};
         if(ev.type==='start'){
           showStatus('running');
-          contextWindow=Number(p.context_window)||0;
           const message=`${p.model||'Agent'} · ${p.backend||'model'}`;
           panel.summary.textContent='Hoạt động · '+message;
           panel.heading.textContent='Đang phân tích với '+String(p.model||'model')+'…';
@@ -342,7 +338,7 @@
           }
         }else if(ev.type==='usage'){
           usage={...usage,...p};
-          panel.metrics.textContent=describeUsage(usage,firstTokenMs,elapsedMs,contextWindow,full.length,outputTps);
+          panel.metrics.textContent=describeUsage(usage,firstTokenMs,elapsedMs,full.length,outputTps);
           if(headerUsage)headerUsage.textContent=panel.metrics.textContent;
         }else if(ev.type==='final'&&typeof p.text==='string'){
           full=p.text;scheduleRender();
@@ -421,7 +417,7 @@
       });
       if(!completed)throw new Error('Pi run đã kết thúc nhưng thiếu sự kiện done');
       flushRender();
-      panel.metrics.textContent=describeUsage(usage,firstTokenMs,elapsedMs,contextWindow,full.length,outputTps);
+      panel.metrics.textContent=describeUsage(usage,firstTokenMs,elapsedMs,full.length,outputTps);
       if(headerUsage)headerUsage.textContent=panel.metrics.textContent;
       await refreshPlanningQuestion();
       await refreshDiscoveryProgress();

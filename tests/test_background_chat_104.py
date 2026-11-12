@@ -189,6 +189,37 @@ def test_discovery_fallback_runs_on_worker_once_per_saved_answer(client, monkeyp
             question_id = pending.id
 
 
+def test_advance_retries_truncated_document_once_on_the_worker(client, monkeypatch):
+    import app as application
+
+    csrf = auth(client)
+    pid, did = _make_discussion_with_model(client, csrf, 'truncated-document')
+    with SessionLocal() as sess:
+        sess.get(db.Project,pid).profile={'documents':['Roadmap','UX / UI Design']}
+        sess.add(db.Document(project_id=pid,path='docs/drafts/ROADMAP.md',title='Roadmap'))
+        sess.commit()
+    attempts = []
+
+    async def pi_stub(project, discussion, sess, model, **kwargs):
+        attempts.append((discussion.id, kwargs['run_id'], kwargs['prompt_override']))
+        yield 'status', {'phase':'document_output_limit','message':'Tool output limit'}
+
+    monkeypatch.setattr(application, 'pi_stream', pi_stub)
+    result = client.post(f'/api/projects/{pid}/chat/start',headers=csrf,json={
+        'discussion_id':did,'mode':'discovery','advance_planning':True})
+    assert result.status_code==200,result.text
+    job = result.json()
+    assert asyncio.run(run_once())==job['run_id']
+    assert [(discussion,run_id) for discussion,run_id,_ in attempts]==[(did,job['run_id'])]*2
+    retry_prompt = attempts[1][2]
+    assert 'UX-SPEC.md' in retry_prompt and 'ROADMAP.md' not in retry_prompt
+    assert '400–800' in retry_prompt and 'append_to_revision' in retry_prompt
+    replay = client.get(job['events_url']).text
+    assert '"type": "planning_needs_input"' in replay and '"type": "done"' in replay
+    with SessionLocal() as sess:
+        assert sess.query(db.Message).filter_by(discussion_id=did,role='user').count()==0
+
+
 def test_page_keeps_the_run_id_when_it_finishes_before_subscription(client, monkeypatch):
     import app as application
     csrf=auth(client)

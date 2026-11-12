@@ -41,6 +41,10 @@ export async function createAgentSession(options){
      const text=user==='report'?'Turn '+(session.messages.length+1)+': '+beforeStart().systemPrompt:'Native Pi output';
      emit({type:'message_update',assistantMessageEvent:{type:'text_delta',delta:text}});
      const message={role:'assistant',content:[{type:'text',text}],usage:{input:12,output:4}};
+     if(user==='truncated draft'){
+       message.stopReason='length';
+       message.content.push({type:'toolCall',name:'write_document'});
+     }
      session.messages.push(message);emit({type:'message_end',message});emit({type:'agent_settled'});
    },getLastAssistantText:()=> 'Native Pi output'};
  return {session};
@@ -98,6 +102,8 @@ test('Pi Host handles chat and planning through same SDK and exposes native SSE'
    assert.match(stream,/"type":"thinking"/);
    assert.match(stream,/"type":"tool"/);assert.match(stream,/"type":"usage"/);
    assert.match(stream,/"type":"final"/);assert.match(stream,/Native Pi output/);
+   const truncated=await post(x.base,'/run',{...requestData,message:'truncated draft'});
+   assert.match(await truncated.text(),/"phase":"document_output_limit"/);
    assert.equal((await post(x.base,'/run',{...requestData,project_id:'../x'})).status,422);
    assert.equal((await post(x.base,'/oauth/openai/start',{})).status,503);
  }finally{await stopSandbox(x);}

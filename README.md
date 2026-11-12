@@ -26,7 +26,7 @@ The discussion page includes the active run ID and displays a Pi activity card i
 
 Each discussion gets its own Pi SDK `AgentSession`, transcript and active tool capability. Different discussions can run concurrently. `SPECWEAVE_CHAT_CONCURRENCY` defaults to 4 per background worker and accepts values from 1 through 16. A worker or Pi Host restart can interrupt active inference. The interrupted job fails without replaying its prompt or tools.
 
-The worker can make one additional Pi prompt in the same run when Discovery returns neither an interactive question nor a completed handoff. This uses the same session and the saved answer even if the browser has left. Pi can append short sections to drafts using the current document revision. Discovery checks for the requested drafts before registering a handoff for human review.
+The worker can make one additional Pi prompt in the same run when Discovery returns neither an interactive question nor a completed handoff. If Pi reports that a document tool call hit the output limit, the retry names the missing drafts and asks for short sections. This uses the same session and the saved answer even if the browser has left. Pi appends sections using the current document revision. Discovery checks for the requested drafts before registering a handoff for human review.
 
 The `0010_detached_chat` Alembic migration creates the event log and lease fields. Back up PostgreSQL before deploying and keep all existing volumes. Tool call input/output JSON is pretty-printed in UTF-8 in the UI, including legacy escaped Unicode strings; the actual tool arguments are not changed. Full details: [`docs/RELEASE_v1.0.3_DETACHED_PI_CHAT.vi.md`](docs/RELEASE_v1.0.3_DETACHED_PI_CHAT.vi.md) (Vietnamese).
 

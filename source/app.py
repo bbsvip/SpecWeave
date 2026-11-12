@@ -1505,6 +1505,7 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
         first_token_ms=None
         usage={}
         thinking_trace=None
+        document_output_limited=False
         def emit(event_type,payload=None,**extra):
             return wire(frame(event_type,payload or {},**extra))
         try:
@@ -1518,14 +1519,15 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
                 'đánh giá những vấn đề chưa rõ. Nếu chưa đủ thông tin, gọi tool '
                 'propose_planning_question cho MỘT câu hỏi quan trọng tiếp theo, có các phương án cụ thể. '
                 'Nếu thực sự đã đủ dữ liệu để soạn đặc tả có giá trị, sử dụng tool '
-                'write_document để soạn các bản draft chi tiết rồi gọi finish_discovery. '
+                'write_document, mỗi lệnh chỉ ghi một phần 400–800 ký tự. Nối phần sau bằng '
+                'append_to_revision theo revision đã lưu. Khi đủ bản nháp, gọi finish_discovery. '
                 'Không tự phê duyệt tài liệu. Nếu model không gọi được tool, hãy trả về '
                 'DUY NHẤT một JSON object cho câu hỏi theo schema sau: '
                 + QUESTION_JSON_INSTRUCTIONS
             )
 
             async def stream_attempt(prompt):
-                nonlocal first_token_ms, thinking_trace, full
+                nonlocal first_token_ms, thinking_trace, full, document_output_limited
                 attempt_usage={}
                 pi_kwargs={'role':role,'mode':mode,'run_id':run_id,'actor_id':actor_id}
                 if prompt is not None:
@@ -1558,6 +1560,8 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
                                     attempt_usage[k]=v
                         elif typ=='error':
                             raise RuntimeError(payload.get('message','Lỗi Pi Runner'))
+                        if typ=='status' and payload.get('phase')=='document_output_limit':
+                            document_output_limited=True
                         if typ in ('status','tool') and len(trace)<64:
                             item={'type':typ,'at_ms':int((time.monotonic()-clock)*1000)}
                             if typ=='status':item['message']=str(payload.get('message',''))[:220]
@@ -1595,15 +1599,30 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
                     yield event
             output,pending,discovery=resolve_planning_output()
             auto_next=bool(existing_run_id and data.get('auto_next') is True and mode=='discovery' and not advance)
-            if auto_next and not pending and discovery.get('status')!='draft_ready':
+            retry_document=bool(existing_run_id and advance and document_output_limited)
+            if (auto_next or retry_document) and not pending and discovery.get('status')!='draft_ready':
+                next_prompt=advance_prompt
+                next_status='Pi đang chuẩn bị câu hỏi tiếp theo…'
+                if document_output_limited:
+                    paths=requested_draft_paths(sdb.get(Project,pid))
+                    stored=named_draft_records(sdb,pid,paths)
+                    missing=', '.join(path.rsplit('/',1)[-1] for path in paths if path.lower() not in stored)
+                    next_prompt=(
+                        'Lệnh bàn giao trước bị cắt do giới hạn đầu ra. Tiếp tục trong cùng phiên từ các kết quả đã lưu. '
+                        f'Bản nháp được yêu cầu còn thiếu: {missing or "không có tên nào được liệt kê"}. '
+                        'Gọi từng lệnh write_document với đúng một phần Markdown dài 400–800 ký tự, '
+                        'sau đó dùng append_to_revision để nối phần tiếp theo. Giữ nội dung đã lưu. '
+                        'Khi đủ bản nháp và không còn vấn đề quan trọng, gọi finish_discovery với tóm tắt và bằng chứng ngắn.'
+                    )
+                    next_status='Pi đang thử lại với phần tài liệu ngắn hơn…'
                 # Keep the follow-up in this durable run and Pi session.
                 first_output=output
                 yield emit('final',{'text':first_output+'\n\n' if first_output else ''})
-                yield emit('status',{'phase':'request','message':'Pi đang chuẩn bị câu hỏi tiếp theo…'})
+                yield emit('status',{'phase':'request','message':next_status})
                 full=[]
                 thinking_trace=None
                 try:
-                    async with aclosing(stream_attempt(advance_prompt)) as events:
+                    async with aclosing(stream_attempt(next_prompt)) as events:
                         async for event in events:
                             yield event
                 except ChatStopped:
@@ -1612,7 +1631,7 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
                     # The first prompt already ran. Keep its result instead of
                     # making the saved answer retryable and repeating tool calls.
                     full=[]
-                    yield emit('status',{'phase':'request','message':'Chưa thể tạo câu hỏi tiếp theo.'})
+                    yield emit('status',{'phase':'request','message':'Pi chưa thể tiếp tục Discovery.'})
                 next_output,pending,discovery=resolve_planning_output()
                 output='\n\n'.join(part for part in (first_output,next_output) if part)
             if not output:

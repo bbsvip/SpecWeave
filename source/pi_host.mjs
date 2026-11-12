@@ -195,6 +195,10 @@ async function streamSession(current,data,res){
     if(event.type==='tool_execution_end')sse(res,'tool',{name:event.toolName,id:event.toolCallId,status:event.isError?'error':'complete',
       result:JSON.stringify(event.result||{}).slice(0,8000)});
     if(event.type==='message_end'&&event.message?.role==='assistant'){
+      if(event.message.stopReason==='length'&&event.message.content?.some(block=>
+        block.type==='toolCall'&&['write_document','finish_discovery'].includes(block.name))){
+        sse(res,'status',{phase:'document_output_limit',message:'Lệnh ghi tài liệu bị cắt do giới hạn đầu ra.'});
+      }
       output+=assistantText(event.message)||partial;
       partial='';
       const stats=normalizeUsage(event.message.usage);
