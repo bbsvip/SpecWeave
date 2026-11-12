@@ -30,6 +30,8 @@ def create_review_job(db: Session, project: Project, requester_id: str, model: M
     """Caller must check ACL, CSRF and serialize project mutations."""
     if not model or not model.enabled or not model.provider.enabled:
         raise HTTPException(409, "Model đã tắt hoặc chưa cấu hình")
+    from model_runtime import require_model
+    require_model(model,project=project,actor_id=requester_id)
     if type(output_budget) is not int or not 2048 <= output_budget <= 24000:
         raise HTTPException(422, "Output budget phải từ 2048 đến 24000 tokens")
     role_models = role_models or {}
@@ -41,6 +43,7 @@ def create_review_job(db: Session, project: Project, requester_id: str, model: M
         candidate=db.get(Model,mid)
         if not candidate or not candidate.enabled or not candidate.provider.enabled:
             raise HTTPException(422,f'Role model unavailable: {role}')
+        require_model(candidate,project=project,actor_id=requester_id)
         checked[role]=candidate.id
     running = db.query(ReviewJob).filter(ReviewJob.project_id == project.id,
                ReviewJob.status.in_(ACTIVE)).first()
@@ -175,7 +178,7 @@ async def process_claimed_job(job_id: str, worker_id: str = WORKER_ID) -> bool:
         job_project_id=job.project_id
         if model and model.provider.kind=='openai-oauth':
             from model_runtime import require_model
-            try: require_model(model)
+            try: require_model(model,project=project,actor_id=job.requester_id)
             except HTTPException:
                 _terminal(job,'failed','OpenAI OAuth account cannot be shared or authorization was revoked')
                 db.commit();return True

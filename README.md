@@ -2,7 +2,7 @@
 
 SpecWeave is a self-hosted workspace for turning project ideas into implementation-ready specifications through guided AI conversations, research, requirements management, a traceability graph, BMAD-inspired workflows, human approvals, and document exports.
 
-SpecWeave runs its own Python harness. The background worker uses the selected API-key provider for model inference and controls Discovery, document checkpoints and review. PostgreSQL stores the conversation and execution state.
+SpecWeave runs its own Python harness. The background worker uses the selected API-key or ChatGPT OAuth provider for model inference and controls Discovery, document checkpoints and review. PostgreSQL stores the conversation and execution state.
 
 > **Verification:** The native harness image `7591f78` was deployed and tested in Brave against Strata. A fresh room-booking QA project completed three confirmed questions and handed off all four requested draft documents at revision 1. Automated tests cover transport, draft handoff, answer branch changes and recovery after a versioned file write. Local browser tests cover SSE replay, Stop, discussion isolation, scroll intent, docked questions, persistent history and reopening answers on desktop and mobile. Production validation of the follow-up history and composer changes remains pending.
 
@@ -11,7 +11,7 @@ SpecWeave runs its own Python harness. The background worker uses the selected A
 - **Accounts and access control:** First-run administrator setup, login, session revocation, CSRF protection, Argon2id password hashing, and project owner/editor/viewer roles.
 - **Project management:** New-project wizard, reusable presets, project CRUD, ownership transfer, and owner-only recovery or permanent deletion from project trash.
 - **AI discussion:** Detached PostgreSQL-backed chat jobs that continue after tabs close, replayable SSE over EventSource (with reconnect and cursor), thinking when exposed by the model, tool-call activity, usage and time-to-first-token (TTFT) metrics, stop controls, persistent discussion history, and guided questions with recommended options.
-- **Providers and models:** OpenAI-compatible API keys/endpoints, model discovery, per-project model selection, and advanced limits, protocol, compatibility and sampling settings.
+- **Providers and models:** Native ChatGPT / Codex OAuth sign-in, OpenAI-compatible API keys/endpoints, model discovery, per-project model selection, and advanced limits, protocol, compatibility and sampling settings.
 - **Planning and traceability:** Goals, requirements, acceptance criteria, decisions, coverage checks, a specification graph, and a roadmap.
 - **Quality and deliverables:** BMAD-inspired draft documents, semantic review, background multi-role reviews, quality gates, human approval, Markdown document management, and exports.
 - **Research and files:** SearXNG, HTTP research, Playwright/Chromium, and a project-scoped file manager with quotas and revision history.
@@ -27,11 +27,11 @@ SpecWeave runs its own Python harness. The background worker uses the selected A
 
 ### Question history and changing an answer
 
-Open **Lịch sử câu hỏi và trả lời** above the composer to review saved questions, options, recommendations and answer versions. **Quay lại trả lời** reopens an answered or deferred question. Later questions move to the previous branch, whose questions and answers remain available in history. Each replacement answer is recorded separately. Existing pre-upgrade answers are captured when first reopened.
+Each question and its answer share one card in the conversation timeline. The card shows the selected answer and notes, expandable options and recommendations, and prior answer versions. **Quay lại trả lời** reopens an answered or deferred question. Later questions move to the previous branch, whose questions and answers remain available in history. Each replacement answer is recorded separately. Existing pre-upgrade answers are captured when first reopened.
 
 The project must be idle before changing its branch. After confirming a replacement answer, Discovery evaluates the updated branch and refreshes affected unapproved drafts using versioned writes and revision checks. Approved documents retain their approval and require human review against the changed answers. The progress panel marks the changed branch until the new handoff.
 
-The current question stays above the composer while messages scroll independently. Context and tradeoffs can be expanded in that panel. Chat follows incoming output until the user scrolls up. Sending a message, selecting an option or pressing the down arrow resumes following. Opening history and reading older messages retain the reading position.
+The current question stays above the composer while messages scroll independently. Context and tradeoffs can be expanded in that panel. Chat follows incoming output until the user scrolls up. Sending a message, selecting an option or pressing the down arrow resumes following. Reading older question–answer cards retains the reading position.
 
 Deploy web and worker together with Alembic revision `0014_planning_history`. This adds answer history to the existing questions. Production validation of these follow-up UI changes remains pending.
 
@@ -49,6 +49,14 @@ Open **Settings → Providers → provider details → model**. Set **Context wi
 
 The adapter supports streaming **Chat Completions** and **Responses**. For Strata's Qwen model, use Chat Completions with `{"maxTokensField":"max_tokens","thinkingFormat":"qwen-chat-template"}` if the endpoint accepts the chat-template thinking option. Chat Completions uses configured sampling parameters. Responses sends its supported temperature and top-p fields. A model setting change applies to the next run.
 
+## ChatGPT / Codex OAuth
+
+Open **Settings → Providers → Continue with ChatGPT**. Complete the authorization in the linked ChatGPT page and paste its complete loopback redirect URL into the provider form. On a remote Docker host, the redirect can show an unavailable localhost page; its address bar still contains the URL for the form. The connected provider supports model discovery and selection for native chat, Discovery and background reviews.
+
+The native OAuth implementation follows OpenAI's public-client Authorization Code flow with PKCE and dynamic registration. It verifies state, nonce, ID-token signatures, issuer, audience and the ChatGPT-plan scope before activating the connection. Models stream through the Responses API. Provider-row locks serialize refresh-token rotation across web and worker. Credentials are encrypted with `ENCRYPTION_KEY` in the shared `openai_oauth_local` volume. `OPENAI_OAUTH_LOCAL_MODE` enables the feature and defaults to true in Compose. Each connection belongs to its owner.
+
+Automated HTTP fixtures verify authorization, invalid callbacks, signature rejection, token refresh and native inference. Interactive authorization with a real ChatGPT account and production deployment of this restoration are pending. [OpenAI sign-in documentation](https://developers.openai.com/siwc/token-sharing-open-source/sign-in), [models and inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference).
+
 ## Runtime architecture
 
 ```text
@@ -56,11 +64,11 @@ Browser → FastAPI (ACL, enqueue, SSE replay)
                        ↕
           PostgreSQL (answers, runs, events)
                        ↕
-  Python worker → model transport → API-key provider
+  Python worker → model transport → selected provider
        ↳ project tools and versioned draft storage
 ```
 
-The worker chooses the actions it exposes by mode. Discovery uses structured responses and owns every write and handoff. Other modes expose a bounded set of project tools, with external research subject to project policy. Review uses the same model transport and a bounded JSON snapshot. API keys remain encrypted in PostgreSQL and are decrypted for the selected provider request.
+The worker chooses the actions it exposes by mode. Discovery uses structured responses and owns every write and handoff. Other modes expose a bounded set of project tools, with external research subject to project policy. Review uses the same model transport and a bounded JSON snapshot. API keys remain encrypted in PostgreSQL and are decrypted for the selected provider request. ChatGPT OAuth credentials reside in an encrypted local vault shared by web and worker.
 
 ## Quick start: External PostgreSQL
 
@@ -119,7 +127,7 @@ Open `http://<server>:8080/first-run` to create the initial administrator accoun
 
 1. Drain active work and back up PostgreSQL and `projects_data`. Preserve `.env`, `ENCRYPTION_KEY` and the Compose project name.
 2. Update the Compose file and deploy matching images for `web` and `review-worker`. Migration `0013_native_harness` switches existing projects and removes private execution fields from unfinished legacy run payloads. It retains conversations, decisions and files.
-3. The retired ChatGPT subscription OAuth connection is unavailable in the new runtime. Select an API-key model in Project Settings for projects that used it. The migration preserves historical provider rows and the old Docker vault volume for rollback. The new services do not mount that volume.
+3. ChatGPT / Codex OAuth is available through the native harness. Existing provider/model records remain selectable by their owner. Sign in once through **Settings → Providers → Continue with ChatGPT** to grant the native connection permission to use the ChatGPT plan. Both services mount the existing `openai_oauth_local` volume. Its earlier Pi credentials remain available for rollback.
 4. To roll back this runtime migration, drain new runs, run `python -m alembic downgrade 0012_custom_model_config` with the new image, then restart the previous Compose and image with the original volumes. Retain the backup until validation finishes.
 
 ## Development and verification

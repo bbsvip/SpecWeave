@@ -1425,7 +1425,7 @@ def test_project_profile_and_model_guard(client):
 
 # v0.9 OpenAI-only, owner-scoped OAuth: no token enters PostgreSQL or the browser.
 
-def test_retired_oauth_model_cannot_be_selected_or_transferred(client):
+def test_oauth_model_can_be_selected_only_by_its_owner_and_is_cleared_on_transfer(client):
     csrf=auth(client)
     with SessionLocal() as session:
         owner=session.query(User).filter_by(username='admin').first()
@@ -1437,7 +1437,7 @@ def test_retired_oauth_model_cannot_be_selected_or_transferred(client):
         session.add(model);session.commit();model_id=model.id
     project=create_project(client,csrf,'Transfer private project')
     assert client.post(f'/api/projects/{project}/settings',headers=csrf,
-                       json={'active_model_id':model_id}).status_code==409
+                       json={'active_model_id':model_id}).status_code==200
     with SessionLocal() as session:
         session.get(Project,project).active_model_id=model_id
         session.commit()
@@ -1460,7 +1460,7 @@ def test_retired_oauth_model_cannot_be_selected_or_transferred(client):
     newer=auth(client,'newowner','another-strong-password')
     attempt=client.post(f'/api/projects/{project}/settings',headers=newer,
                         json={'active_model_id':model_id})
-    assert attempt.status_code==409
+    assert attempt.status_code==403
 
 
 # v0.9.6 ThinkRail-inspired conversation continuity and observable SSE

@@ -270,7 +270,8 @@ def run(scratch):
             before=a.locator('#messageList').evaluate('(el)=>el.scrollTop')
             releases['scroll-test'].set()
             expect(a.locator('.turn-live-label').last).to_have_text('Hoàn thành',timeout=15000)
-            assert abs(a.locator('#messageList').evaluate('(el)=>el.scrollTop')-before)<3, 'Streaming must preserve the reading position'
+            after=a.locator('#messageList').evaluate('(el)=>el.scrollTop')
+            assert abs(after-before)<3, f'Streaming must preserve the reading position: {before} -> {after}'
             send(a,'scroll-finished')
             expect(a.locator('.turn-live-label').last).to_have_text('Hoàn thành',timeout=15000)
             assert bottom()<5, 'A new user message must resume following'
@@ -283,19 +284,26 @@ def run(scratch):
             assert bottom()<5, 'Selecting an answer must resume following'
             a.locator('#planningQuestion').get_by_role('button',name='Xác nhận & tiếp tục với AI').click()
             expect(a.locator('.turn-live-label').last).to_have_text('Chờ xác nhận',timeout=15000)
-            expect(a.locator('#planningHistoryCount')).to_have_text('(1)')
-            a.locator('#planningHistory > summary').click()
-            a.locator('.planning-history-item > summary').click()
-            expect(a.locator('.planning-answer-record')).to_contain_text('Lưu đầy đủ')
+            expect(a.locator('.qa-card .qa-answer-choice')).to_have_text('Lưu đầy đủ')
+            expect(a.locator('#planningHistory')).to_have_count(0)
+            expect(a.locator('.message-user').filter(has_text='Tôi chọn: Lưu đầy đủ')).to_have_count(0)
+            a.reload()
+            expect(a.locator('.qa-card .qa-answer-choice')).to_have_text('Lưu đầy đủ')
+            for width,height,label in ((1440,1000,'desktop'),(390,844,'mobile')):
+                a.set_viewport_size({'width':width,'height':height})
+                a.locator('.message-question').first.scroll_into_view_if_needed()
+                screenshot_dir=os.getenv('E2E_SCREENSHOT_DIR')
+                if screenshot_dir:
+                    a.screenshot(path=str(Path(screenshot_dir)/f'planning-qa-answered-{label}.png'),full_page=False,animations='disabled')
+            a.set_viewport_size({'width':1440,'height':1000})
             a.get_by_role('button',name='Quay lại trả lời',exact=True).click()
             a.get_by_role('button',name='Quay lại câu hỏi này',exact=True).click()
-            expect(a.locator('#planningHistory')).not_to_have_attribute('open','')
             expect(a.locator('#planningQuestion')).to_be_visible()
             a.reload()
             expect(a.locator('#planningQuestion')).to_be_visible()
-            a.locator('#planningHistory > summary').click()
-            expect(a.locator('#planningHistoryList')).to_contain_text('Đang trả lời lại')
-            a.locator('#planningHistory > summary').click()
+            expect(a.locator('.qa-card .qa-answer-choice')).to_have_text('Lưu đầy đủ')
+            expect(a.locator('.message-user').filter(has_text='Tôi chọn: Lưu đầy đủ')).to_have_count(0)
+            expect(a.locator('.qa-card')).to_have_count(2)
             for width,height,label in ((1440,1000,'desktop'),(390,844,'mobile')):
                 a.set_viewport_size({'width':width,'height':height})
                 a.locator('#messageList').evaluate('(el)=>{el.scrollTop=80}')
@@ -307,7 +315,23 @@ def run(scratch):
                 assert a.evaluate('document.documentElement.scrollWidth <= innerWidth')
                 screenshot_dir=os.getenv('E2E_SCREENSHOT_DIR')
                 if screenshot_dir:
-                    a.screenshot(path=str(Path(screenshot_dir)/f'planning-history-{label}.png'),full_page=False,animations='disabled')
+                    a.locator('.message-question').first.scroll_into_view_if_needed()
+                    a.screenshot(path=str(Path(screenshot_dir)/f'planning-qa-card-{label}.png'),full_page=False,animations='disabled')
+            oauth_page=context.new_page()
+            oauth_page.goto(f'{web}/settings/providers')
+            expect(oauth_page.get_by_role('button',name='Continue with ChatGPT')).to_be_visible()
+            for width,height,label in ((1440,1000,'desktop'),(390,844,'mobile')):
+                oauth_page.set_viewport_size({'width':width,'height':height})
+                oauth_page.locator('#openaiOAuthApp').scroll_into_view_if_needed()
+                assert oauth_page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+                if screenshot_dir:
+                    oauth_page.screenshot(path=str(Path(screenshot_dir)/f'native-chatgpt-oauth-{label}.png'),full_page=False,animations='disabled')
+            oauth_page.get_by_role('button',name='Continue with ChatGPT').click()
+            expect(oauth_page.locator('#openaiOAuthFlow')).to_be_visible()
+            oauth_page.reload()
+            expect(oauth_page.locator('#openaiOAuthFlow')).to_be_visible()
+            oauth_page.get_by_role('button',name='Hủy',exact=True).click()
+            expect(oauth_page.locator('#openaiOAuthFlow')).not_to_be_visible()
             assert not errors,errors
             browser.close()
         print('Passed SpecWeave discussion E2E against the native harness and a local provider fixture.')

@@ -77,8 +77,8 @@ def test_custom_model_limits_and_sampling_reach_runtime_and_validate(client):
         owner=session.get(Project,project).owner_id
         row=session.get(Provider,provider)
         row.kind='openai-oauth';row.owner_id=owner;session.commit()
-    assert client.post(path,headers=csrf,json={'max_output_tokens':16384}).status_code==410
-    assert client.get(f'/settings/providers/{provider}').status_code==410
+    assert client.post(path,headers=csrf,json={'max_output_tokens':16384}).status_code==200
+    assert client.get(f'/settings/providers/{provider}').status_code==200
 
 
 def test_new_custom_model_uses_validated_runtime_settings(client):

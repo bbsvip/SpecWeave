@@ -161,17 +161,9 @@
 .planning-explanation{font-size:12px;color:var(--sw-muted)}
 .planning-explanation>summary{cursor:pointer;width:fit-content;padding:3px 0}
 .planning-comparison{margin:10px 0;padding-bottom:8px;border-bottom:1px solid var(--sw-line)}
-.planning-history{flex:0 0 auto;border-top:1px solid var(--sw-line);padding:8px 16px;font-size:12px;max-height:35vh;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}
-.planning-history>summary{cursor:pointer;color:var(--sw-accent);width:fit-content;padding:3px 0}
-.planning-history-item{padding:12px 0;border-bottom:1px solid var(--sw-line)}
-.planning-history-item>summary{font-size:13px;cursor:pointer;line-height:1.5;overflow-wrap:anywhere}
-.planning-history-item p{white-space:pre-wrap;overflow-wrap:anywhere;margin:6px 0}
-.planning-history-option,.planning-answer-record{margin:10px 0;padding:8px 0;border-top:1px solid var(--sw-line)}
-.planning-answer-record strong{color:var(--sw-muted);font-size:11px}
 .planning-reopen-confirm{margin-top:10px}.planning-reopen-confirm .btn{margin:5px 7px 0 0}
-.conversation:has(.planning-history[open]) .planning-question-slot{max-height:24vh}
 .discussion-layout .messages{overflow-anchor:none;scroll-behavior:auto;min-height:90px}
-@media(max-width:600px){.discussion-layout{height:calc(100dvh - 65px);min-height:0}.discussion-layout .planning-question-slot{max-height:40dvh;padding:8px 12px 0}.discussion-layout .planning-question-slot .planning-options{grid-template-columns:1fr}.planning-history{padding:6px 12px}.discussion-layout .composer-caption{display:none}.discussion-layout .composer-box textarea{min-height:35px;max-height:90px}.discussion-layout .planning-actions{gap:6px}.discussion-layout .planning-actions .btn{min-height:34px}}
+@media(max-width:600px){.discussion-layout{height:calc(100dvh - 65px);min-height:0}.discussion-layout .planning-question-slot{max-height:40dvh;padding:8px 12px 0}.discussion-layout .planning-question-slot .planning-options{grid-template-columns:1fr}.discussion-layout .composer-caption{display:none}.discussion-layout .composer-box textarea{min-height:35px;max-height:90px}.discussion-layout .planning-actions{gap:6px}.discussion-layout .planning-actions .btn{min-height:34px}}
 .planning-brief{border:1px solid var(--sw-accent);border-radius:16px;padding:20px;background:var(--sw-surface);box-shadow:0 10px 28px rgba(40,45,85,.06)}
 .planning-brief h3{font-size:16px;line-height:1.55}
 .planning-header{font-size:10px;font-weight:760;letter-spacing:.08em;color:var(--sw-accent);margin-bottom:8px}
@@ -272,3 +264,20 @@
   .discussion-layout .conversation-tools{justify-content:space-between;width:100%;flex-wrap:wrap}
   .discussion-layout .composer-send{margin-left:auto}
 }
+
+/* Questions and their saved answers share one conversation card. */
+.discussion-layout .qa-card{border:1px solid var(--sw-line);border-radius:14px;background:var(--sw-canvas);padding:16px 18px;overflow-wrap:anywhere}
+.qa-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.qa-heading h3{font-size:15px;line-height:1.6;margin:0;font-weight:700;letter-spacing:-.015em}
+.qa-status{color:var(--sw-muted);font-size:11px;flex-shrink:0;padding-top:4px}
+.qa-context{font-size:13px;line-height:1.65;margin:9px 0;color:var(--sw-muted)}
+.qa-options,.qa-revisions{font-size:12px;margin-top:12px;color:var(--sw-muted)}
+.qa-options>summary,.qa-revisions>summary{cursor:pointer;width:fit-content;padding:4px 0;color:var(--sw-accent)}
+.qa-option{padding:10px 0;border-bottom:1px solid var(--sw-line)}
+.qa-option strong{color:var(--sw-ink)}.qa-option.chosen strong{color:var(--sw-accent)}
+.qa-option p{margin:4px 0;white-space:pre-wrap;line-height:1.65}
+.qa-answer{border-top:1px solid var(--sw-line);padding-top:13px;margin-top:13px;white-space:pre-wrap;font-size:13px}
+.qa-answer-label{font-size:11px;color:var(--sw-muted);font-weight:550}
+.qa-answer p{margin:6px 0;line-height:1.7}.qa-answer-choice{font-weight:650;color:var(--sw-ink)}
+.qa-card>.btn{margin-top:12px}.qa-revisions .qa-answer{font-size:12px}
+@media(max-width:600px){.discussion-layout .qa-card{padding:13px}.qa-heading{flex-direction:column;gap:4px}.qa-status{padding:0}.qa-heading h3{font-size:14px}}

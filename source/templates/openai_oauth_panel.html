@@ -1,0 +1,19 @@
+<section class="content-card mb-3" id="openaiOAuthApp" data-enabled="{{'true' if oauth_local else 'false'}}">
+  <div class="card-heading"><h3>ChatGPT / Codex</h3><span id="openaiOAuthStatus" class="status-chip" role="status">Đang kiểm tra…</span></div>
+  <p class="text-secondary">Đăng nhập ChatGPT để sử dụng model từ gói của tài khoản trong SpecWeave.</p>
+  {% if oauth_local %}
+  <div class="d-flex gap-2 flex-wrap">
+    <button type="button" id="openaiOAuthConnect" class="btn btn-primary">Continue with ChatGPT</button>
+    <button type="button" id="openaiOAuthDisconnect" class="btn btn-outline-secondary" disabled>Ngắt kết nối</button>
+  </div>
+  <div id="openaiOAuthFlow" class="d-none mt-3">
+    <p class="text-secondary" id="openaiOAuthProgress" role="status"></p>
+    <a id="openaiOAuthLink" class="btn btn-outline-primary" target="_blank" rel="noopener noreferrer">Mở trang đăng nhập ChatGPT</a>
+    <p class="small text-secondary mt-3">Sau khi xác nhận, trình duyệt chuyển về 127.0.0.1. Nếu máy chủ ở xa và trang đó không mở được, sao chép đầy đủ URL trên thanh địa chỉ vào ô bên dưới.</p>
+    <label class="field">URL chuyển hướng sau đăng nhập<input id="openaiOAuthAnswer" class="form-control" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:8080/auth/callback?…"></label>
+    <div class="d-flex gap-2 flex-wrap"><button id="openaiOAuthSend" type="button" class="btn btn-primary">Hoàn tất đăng nhập</button><button id="openaiOAuthCancel" type="button" class="btn btn-outline-secondary">Hủy</button></div>
+  </div>
+  {% else %}
+  <p class="text-secondary">Bật OPENAI_OAUTH_LOCAL_MODE trong cấu hình Docker để kết nối tài khoản.</p>
+  {% endif %}
+</section>

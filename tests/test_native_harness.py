@@ -199,7 +199,8 @@ def test_no_pi_runtime_in_any_docker_variant():
     assert '@earendil-works' not in (root/'Dockerfile').read_text(encoding='utf-8')
     for filename in ('compose.yaml','compose.external-db.yaml','compose.images.yaml','compose.external-db.images.yaml'):
         text=(root/filename).read_text(encoding='utf-8')
-        assert 'PI_RUNNER' not in text and '/auth-local' not in text
+        assert 'PI_RUNNER' not in text
+        assert 'openai_oauth_local:/auth-local' in text
         compose=yaml.safe_load(text)
         assert set(compose['services']) <= {'web','review-worker','db'}
         assert compose['services']['review-worker']['depends_on']['web']['condition']=='service_healthy'

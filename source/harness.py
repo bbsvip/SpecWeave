@@ -514,6 +514,8 @@ class Harness:
 
 
 async def harness_stream(project, discussion, db, model, *, role, mode, run_id, actor_id=None, claim=None):
+    from model_runtime import require_model
+    require_model(model,project=project,actor_id=actor_id)
     run = db.get(AgentRun,run_id)
     if not run or run.project_id!=project.id or run.discussion_id!=discussion.id:
         raise ModelError('Lượt chạy không thuộc cuộc thảo luận này',403)

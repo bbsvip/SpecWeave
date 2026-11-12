@@ -35,7 +35,7 @@ from storage import (DATA_ROOT, PROJECTS_ROOT, project_root, resolve, init_proje
 from ai import ROLES, MODES
 from harness import SYSTEM, facts_for, facts_text, harness_stream, validate_plan
 from model_runtime import require_model, endpoint as provider_endpoint
-from planning import save_question, question_payload, answer_question, reopen_question, QUESTION_JSON_INSTRUCTIONS
+from planning import save_question, question_payload, question_threads, answer_question, reopen_question, QUESTION_JSON_INSTRUCTIONS
 from intelligence import (coverage_report, graph_payload, report_markdown, link_nodes,
                           project_node, add_phase_dependency, phase_review_blockers)
 from research import search_searxng, fetch_web
@@ -49,6 +49,7 @@ from chat_coordination import discussion_lease, ChatBusy, ChatStopped, cancellat
 from chat_content import (EMPTY_REPLY, OUTPUT_LIMIT_PHASES, display_user_message, parse_model_response,
                           split_incomplete_tool_call, turn_notice)
 from chat_events import with_heartbeat
+import openai_oauth
 from model_config import parse_model_settings
 from project_trash import (TRASH_RETENTION, TRASH_STATUSES, lock_trash_project, logger as trash_logger,
                            project_has_active_work, purge_project)
@@ -269,7 +270,7 @@ def new_project_page(request:Request,db:Session=Depends(get_db)):
     u,s,redirect=auth_page(request,db)
     if redirect:return redirect
     presets=db.query(Preset).filter_by(user_id=u.id).order_by(Preset.created_at.desc()).all()
-    models=db.query(Model).join(Provider).filter(Model.enabled==True,Provider.enabled==True,Provider.kind!='openai-oauth').all()
+    models=db.query(Model).join(Provider).filter(Model.enabled==True,Provider.enabled==True,or_(Provider.kind!='openai-oauth',Provider.owner_id==u.id)).all()
     return page(request,"project_new.html",db=db,user=u,session=s,presets=presets,models=models,active="projects")
 
 @app.post("/api/projects")
@@ -289,7 +290,7 @@ async def create_project(request:Request,db:Session=Depends(get_db)):
         candidate=db.get(Model,chosen_model) if isinstance(chosen_model,str) else None
         if not candidate or not candidate.enabled or not candidate.provider.enabled:
             raise HTTPException(422,'Selected model is unavailable')
-        require_model(candidate)
+        require_model(candidate,actor_id=u.id)
     pr=Project(name=name,slug=slug,description=nonempty(data,"description")[:6000],owner_id=u.id,profile=profile,
                active_model_id=chosen_model,thinking_level=data.get("thinking", "medium"))
     if pr.thinking_level not in ("off","minimal","low","medium","high","xhigh","max"):pr.thinking_level="medium"
@@ -328,7 +329,7 @@ def project_settings(pid:str,request:Request,db:Session=Depends(get_db)):
     u,s,redirect=auth_page(request,db)
     if redirect:return redirect
     pr=acl(db,pid,u,write=True)
-    models=db.query(Model).join(Provider).filter(Model.enabled==True,Provider.enabled==True,Provider.kind!='openai-oauth').all()
+    models=db.query(Model).join(Provider).filter(Model.enabled==True,Provider.enabled==True,or_(Provider.kind!='openai-oauth',Provider.owner_id==u.id)).all()
     members=db.query(Membership).filter_by(project_id=pid).all()
     users={x.id:x for x in db.query(User).all() if x.id in [m.user_id for m in members]}
     return page(request,"project_settings.html",db=db,user=u,session=s,pr=pr,models=models,members=members,users=users,workflow_active=db.query(WorkflowCheckpoint).filter_by(project_id=pid).count()>0,active="settings")
@@ -351,7 +352,7 @@ async def update_project(pid:str,request:Request,db:Session=Depends(get_db)):
             candidate=db.get(Model,mid) if isinstance(mid,str) else None
             if not candidate or not candidate.enabled or not candidate.provider.enabled:
                 raise HTTPException(422,'Selected model is unavailable')
-            require_model(candidate)
+            require_model(candidate,project=pr,actor_id=u.id)
         pr.active_model_id=mid
     if "thinking_level" in data and data["thinking_level"] in ("off","minimal","low","medium","high","xhigh","max"):
         pr.thinking_level=data["thinking_level"]
@@ -1102,9 +1103,9 @@ def get_planning_questions(pid:str, request:Request, discussion_id:str, db:Sessi
     u,s=api_guard(request,db);acl(db,pid,u)
     discussion=db.get(Discussion,discussion_id)
     if not discussion or discussion.project_id!=pid:raise HTTPException(404,"Discussion not found")
-    questions=db.query(PlanningQuestion).filter_by(project_id=pid,discussion_id=discussion_id).order_by(PlanningQuestion.created_at.desc(),PlanningQuestion.id.desc()).all()
-    return {"pending":next((question_payload(q) for q in questions if q.status=="pending"),None),
-            "history":[question_payload(q) for q in questions if q.status!="pending" or q.answer_history]}
+    questions=question_threads(db,pid,discussion_id)
+    return {"pending":next((q for q in questions if q['status']=="pending"),None),
+            "history":[q for q in reversed(questions) if q['status']!="pending" or q['answer_history']]}
 
 @app.post('/api/projects/{pid}/planning/questions/{qid}/reopen')
 def reopen_planning_question(pid:str, qid:str, request:Request, db:Session=Depends(get_db)):
@@ -1163,7 +1164,7 @@ async def suggest_planning_question(pid:str,request:Request,db:Session=Depends(g
     model=db.get(Model,pr.active_model_id) if pr.active_model_id else None
     if not model or not model.enabled or not model.provider.enabled:
         raise HTTPException(409,"Hãy chọn model hoạt động trong Project Settings")
-    require_model(model)
+    require_model(model,project=pr,actor_id=u.id)
     facts=facts_for(db,pr,did)
     cap=min(model.max_output_tokens,2400,model.context_window//3)
     context=facts_text(facts,max(0,min(10000,model.context_window-cap-2000)))
@@ -1231,10 +1232,11 @@ def discussion_page(pid:str,request:Request,did:str="",db:Session=Depends(get_db
                 run_notices[run.id]=notice
             cleaned,_=split_incomplete_tool_call(message.content)
             replies[message.id]=parse_model_response(cleaned)[0] if cleaned.strip() != EMPTY_REPLY else ''
-    models=db.query(Model).join(Provider).filter(Model.enabled==True,Provider.enabled==True,Provider.kind!='openai-oauth').all()
+    models=db.query(Model).join(Provider).filter(Model.enabled==True,Provider.enabled==True,or_(Provider.kind!='openai-oauth',Provider.owner_id==u.id)).all()
     runs=(db.query(AgentRun).filter_by(project_id=pid,discussion_id=selected.id)
           .order_by(AgentRun.created_at.desc()).limit(7).all()) if selected else []
     response=page(request,"discussion.html",db=db,user=u,session=s,pr=pr,discussions=discussions,discussion=selected,messages=messages,
+                planning_threads=question_threads(db,pid,selected.id) if selected else [],
                 models=models,runs=runs,trace_runs=trace_runs,active_run=active_run,
                 assistant_run_ids=assistant_run_ids,notices=notices,replies=replies,run_notices=run_notices,
                 modes=MODES,roles=ROLES,active="discussion")
@@ -1280,7 +1282,7 @@ async def answer_and_start(pid:str,qid:str,request:Request,db:Session=Depends(ge
     model=db.get(Model,pr.active_model_id) if pr.active_model_id else None
     if not model or not model.enabled or not model.provider.enabled:
         raise HTTPException(409,'Hãy chọn model trước khi trả lời')
-    require_model(model)
+    require_model(model,project=pr,actor_id=u.id)
     answer_question(db,q,payload,commit=False)
     db.flush()
     audit(db,u,'planning_answer_background',pr,{'question_id':qid})
@@ -1392,7 +1394,7 @@ async def answer_and_stream(pid:str,qid:str,request:Request,db:Session=Depends(g
     model=db.get(Model,pr.active_model_id) if pr.active_model_id else None
     if not model or not model.enabled or not model.provider.enabled:
         raise HTTPException(409,'Hãy chọn model hoạt động trước khi trả lời')
-    require_model(model)
+    require_model(model,project=pr,actor_id=u.id)
     # The question already owns its discussion_id: never trust one from the browser.
     answer_question(db,q,payload)
     audit(db,u,'planning_answer_stream',pr,{'question_id':qid})
@@ -1409,7 +1411,7 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
     model=db.get(Model,pr.active_model_id) if pr.active_model_id else None
     if not model or not model.enabled or not model.provider.enabled:
         raise HTTPException(409,"Chưa chọn model hoạt động. Vào Settings → Providers rồi chọn model cho dự án.")
-    require_model(model)
+    require_model(model,project=pr,actor_id=u.id)
     content=str(data.get("message","")).strip()
     continue_qid=str(data.get('continue_question_id') or '').strip()
     advance=bool(data.get('advance_planning',False))
@@ -1692,10 +1694,104 @@ def providers_page(request:Request,db:Session=Depends(get_db)):
     u,s,redirect=auth_page(request,db)
     if redirect:return redirect
     admin_only(u)
-    providers=db.query(Provider).filter(Provider.kind!='openai-oauth').order_by(Provider.created_at).all()
+    providers=db.query(Provider).filter(or_(Provider.kind!='openai-oauth',Provider.owner_id==u.id)).order_by(Provider.created_at).all()
     allowed={p.id for p in providers}
     models=[m for m in db.query(Model).order_by(Model.name).all() if m.provider_id in allowed]
-    return page(request,"providers.html",db=db,user=u,session=s,providers=providers,models=models,active="providers")
+    return page(request,"providers.html",db=db,user=u,session=s,providers=providers,models=models,oauth_local=openai_oauth.enabled(),active="providers")
+
+def owner_oauth_provider(db, user, *, lock=False):
+    query=db.query(Provider).filter_by(kind='openai-oauth',owner_id=user.id)
+    return (query.with_for_update() if lock else query).first()
+
+
+def oauth_guard(request,db,mutate=False):
+    user,session=api_guard(request,db,mutate)
+    admin_only(user)
+    if not openai_oauth.enabled():raise HTTPException(503,'OAuth ChatGPT đang tắt trong cấu hình máy chủ')
+    return user
+
+
+@app.get('/api/openai/oauth/status')
+def oauth_status(request:Request,db:Session=Depends(get_db)):
+    user=oauth_guard(request,db)
+    return openai_oauth.public_status(owner_oauth_provider(db,user))
+
+
+@app.post('/api/openai/oauth/start')
+def oauth_start(request:Request,db:Session=Depends(get_db)):
+    user=oauth_guard(request,db,True)
+    db.get(User,user.id,with_for_update=True)
+    provider=owner_oauth_provider(db,user,lock=True)
+    if not provider:
+        provider=Provider(name='ChatGPT / Codex OAuth',kind='openai-oauth',base_url=openai_oauth.API,owner_id=user.id,enabled=False)
+        db.add(provider);db.flush()
+    result=openai_oauth.start_login(provider)
+    audit(db,user,'openai_oauth_login_started',details={'provider_id':provider.id})
+    db.commit()
+    return result
+
+
+@app.get('/api/openai/oauth/login/{login_id}')
+def oauth_poll(login_id:str,request:Request,db:Session=Depends(get_db)):
+    user=oauth_guard(request,db)
+    provider=owner_oauth_provider(db,user)
+    if not provider:raise HTTPException(404,'Login not found')
+    data,login=openai_oauth.login_state(provider,login_id)
+    return {'id':login_id,'url':login['url'],'status':'running'}
+
+
+@app.post('/api/openai/oauth/login/{login_id}/answer')
+async def oauth_answer(login_id:str,request:Request,db:Session=Depends(get_db)):
+    user=oauth_guard(request,db,True)
+    provider=owner_oauth_provider(db,user,lock=True)
+    if not provider:raise HTTPException(404,'Login not found')
+    body=await request.json()
+    if not isinstance(body,dict):raise HTTPException(422,'Invalid OAuth callback')
+    result=await openai_oauth.finish_login(provider,login_id,body.get('value'))
+    for model in db.query(Model).filter_by(provider_id=provider.id):
+        model.api='openai-responses'
+        model.compat={key:value for key,value in (model.compat or {}).items() if key in ('supportsDeveloperRole','supportsStrictMode')}
+    audit(db,user,'openai_oauth_connected',details={'provider_id':provider.id})
+    db.commit()
+    return result
+
+
+@app.post('/api/openai/oauth/cancel')
+def oauth_cancel(request:Request,db:Session=Depends(get_db)):
+    user=oauth_guard(request,db,True)
+    provider=owner_oauth_provider(db,user,lock=True)
+    if provider:
+        data=openai_oauth.read_vault(provider.id)
+        data.pop('login',None)
+        openai_oauth.write_vault(provider.id,data)
+    db.commit()
+    return {'ok':True}
+
+
+@app.post('/api/openai/oauth/disconnect')
+def oauth_disconnect(request:Request,db:Session=Depends(get_db)):
+    user=oauth_guard(request,db,True)
+    provider=owner_oauth_provider(db,user,lock=True)
+    if provider:
+        data=openai_oauth.read_vault(provider.id)
+        openai_oauth.write_vault(provider.id,{'host_id':data.get('host_id')})
+        provider.enabled=False
+        audit(db,user,'openai_oauth_disconnected',details={'provider_id':provider.id})
+    db.commit()
+    return {'ok':True}
+
+
+@app.post('/api/openai/oauth/activate')
+def oauth_activate(request:Request,db:Session=Depends(get_db)):
+    user=oauth_guard(request,db,True)
+    provider=owner_oauth_provider(db,user,lock=True)
+    if not provider or not openai_oauth.public_status(provider)['connected']:
+        raise HTTPException(409,'Hãy đăng nhập ChatGPT trước khi kích hoạt provider')
+    provider.enabled=True;provider.base_url=openai_oauth.API
+    audit(db,user,'openai_oauth_connected',details={'provider_id':provider.id})
+    db.commit()
+    return {'ok':True,'provider_id':provider.id}
+
 
 @app.post("/api/providers")
 async def add_provider(request:Request,db:Session=Depends(get_db)):
@@ -1715,7 +1811,9 @@ async def update_provider(provider_id:str,request:Request,db:Session=Depends(get
     p=db.get(Provider,provider_id)
     if not p:raise HTTPException(404,"Provider not found")
     data=await request.json()
-    if p.kind=='openai-oauth':raise HTTPException(410,'Provider OAuth đã ngừng hỗ trợ')
+    if p.kind=='openai-oauth' and p.owner_id!=u.id:raise HTTPException(403,'Kết nối ChatGPT thuộc tài khoản khác')
+    if p.kind=='openai-oauth' and any(key in data for key in ('api_key','clear_api_key','kind','base_url')):
+        raise HTTPException(422,'Kết nối ChatGPT quản lý giao thức và OAuth riêng')
     if "name" in data:
         name=str(data["name"]).strip()[:120]
         if not name:raise HTTPException(422,"Tên provider không được trống")
@@ -1748,7 +1846,7 @@ async def remove_provider(provider_id:str,request:Request,db:Session=Depends(get
     provider=owned_provider(db,provider_id,u)
     body=await request.json()
     if not isinstance(body,dict):raise HTTPException(422,'Invalid delete confirmation')
-    if provider.kind=='openai-oauth':raise HTTPException(410,'Provider OAuth đã ngừng hỗ trợ')
+    if provider.kind=='openai-oauth' and provider.owner_id!=u.id:raise HTTPException(403,'Kết nối ChatGPT thuộc tài khoản khác')
     result=perform_provider_deletion(db,provider,u,body.get('confirm_name',''))
     audit(db,u,'provider_delete',details={'provider_id':provider_id,**result})
     db.commit()
@@ -1784,8 +1882,9 @@ async def add_models(provider_id:str,request:Request,db:Session=Depends(get_db))
     data=await request.json()
     models=data.get("model_ids",[])
     if not isinstance(models,list) or len(models)>100:raise HTTPException(422,"Invalid model list")
-    if p.kind=='openai-oauth':raise HTTPException(410,'Provider OAuth đã ngừng hỗ trợ')
+    if p.kind=='openai-oauth' and p.owner_id!=u.id:raise HTTPException(403,'Kết nối ChatGPT thuộc tài khoản khác')
     settings=parse_model_settings(data)
+    if p.kind=='openai-oauth':settings['api']='openai-responses'
     created=[]
     for name in models:
         name=str(name).strip()[:300]
@@ -1800,10 +1899,10 @@ async def discover_models(provider_id:str,request:Request,db:Session=Depends(get
     u,s=api_guard(request,db);admin_only(u)
     p=db.get(Provider,provider_id)
     if not p:raise HTTPException(404,"Provider not found")
-    if p.kind=='openai-oauth':raise HTTPException(410,'Provider OAuth đã ngừng hỗ trợ')
-    url=provider_endpoint(p.base_url,'models')
-    headers={}
-    if p.encrypted_key:headers["Authorization"]="Bearer "+decrypt(p.encrypted_key)
+    if p.kind=='openai-oauth' and p.owner_id!=u.id:raise HTTPException(403,'Kết nối ChatGPT thuộc tài khoản khác')
+    url=provider_endpoint(openai_oauth.API if p.kind=='openai-oauth' else p.base_url,'models')
+    headers=await openai_oauth.authorization(p.id,u.id) if p.kind=='openai-oauth' else {}
+    if p.encrypted_key and p.kind!='openai-oauth':headers["Authorization"]="Bearer "+decrypt(p.encrypted_key)
     try:
         async with httpx.AsyncClient(timeout=18,trust_env=False) as client:
             resp=await client.get(url,headers=headers);resp.raise_for_status()
@@ -1991,7 +2090,7 @@ def quality_page(pid:str,request:Request,db:Session=Depends(get_db)):
     pr=acl(db,pid,u)
     member=db.query(Membership).filter_by(project_id=pid,user_id=u.id).first()
     editable=pr.owner_id==u.id or bool(member and member.role=='editor')
-    role_models=db.query(Model).join(Provider).filter(Model.enabled==True,Provider.enabled==True,Provider.kind!='openai-oauth').order_by(Provider.name,Model.name).all()
+    role_models=db.query(Model).join(Provider).filter(Model.enabled==True,Provider.enabled==True,or_(Provider.kind!='openai-oauth',Provider.owner_id==u.id)).order_by(Provider.name,Model.name).all()
     return page(request,'quality.html',db=db,user=u,session=s,pr=pr,editable=editable,
                 role_models=role_models,owner=pr.owner_id==u.id,active='quality')
 
@@ -2041,7 +2140,7 @@ async def quality_enqueue_job(pid:str,request:Request,db:Session=Depends(get_db)
     role_ids=(data.get('role_models') or {})
     if not isinstance(role_ids,dict):raise HTTPException(422,'Invalid role model map')
     for checked in [model]+[db.get(Model,mid) for mid in role_ids.values() if isinstance(mid,str)]:
-        if checked:require_model(checked)
+        if checked:require_model(checked,project=pr,actor_id=u.id)
     job=create_review_job(db,pr,u.id,model,data.get('output_budget',12000),data.get('role_models'))
     audit(db,u,'review_job_queued',pr,{'job_id':job.id,'model_id':model.id})
     db.commit()
@@ -2102,7 +2201,7 @@ async def quality_run_review(pid:str,request:Request,db:Session=Depends(get_db))
     else:
         model=db.get(Model,pr.active_model_id) if pr.active_model_id else None
         if not model:raise HTTPException(409,'Hãy chọn model trong Project Settings trước khi review AI')
-        require_model(model)
+        require_model(model,project=pr,actor_id=u.id)
         summary, findings=await (adversarial_review(db,pr,model,actor_id=u.id) if engine=='adversarial' else model_review(db,pr,model,actor_id=u.id))
         db.expire_all()
         if context_fingerprint(db,pid)!=snapshot_before:
@@ -2329,8 +2428,13 @@ async def update_model(provider_id:str,mid:str,request:Request,db:Session=Depend
     u,s=api_guard(request,db,True);admin_only(u)
     model=db.get(Model,mid)
     if not model or model.provider_id!=provider_id:raise HTTPException(404,'Model not found')
-    if model.provider.kind=='openai-oauth':raise HTTPException(410,'Provider OAuth đã ngừng hỗ trợ')
+    if model.provider.kind=='openai-oauth' and model.provider.owner_id!=u.id:raise HTTPException(403,'Kết nối ChatGPT thuộc tài khoản khác')
     data=await request.json()
+    if model.provider.kind=='openai-oauth':
+        if not isinstance(data,dict):raise HTTPException(422,'Invalid model settings')
+        if data.get('api','openai-responses')!='openai-responses':
+            raise HTTPException(422,'ChatGPT OAuth sử dụng giao thức Responses')
+        data={**data,'api':'openai-responses'}
     settings=parse_model_settings(data,model=model)
     if 'enabled' in data:
         if not isinstance(data['enabled'],bool):raise HTTPException(422,'Invalid enabled flag')
@@ -2347,12 +2451,12 @@ def provider_detail_page(provider_id:str,request:Request,db:Session=Depends(get_
     admin_only(u)
     provider=db.get(Provider,provider_id)
     if not provider:raise HTTPException(404,'Provider not found')
-    if provider.kind=='openai-oauth':raise HTTPException(410,'Provider OAuth đã ngừng hỗ trợ')
+    if provider.kind=='openai-oauth' and provider.owner_id!=u.id:raise HTTPException(403,'Kết nối ChatGPT thuộc tài khoản khác')
     models=db.query(Model).filter_by(provider_id=provider_id).order_by(Model.name).all()
     projects=db.query(Project).filter(Project.active_model_id.in_([m.id for m in models]),
                                      Project.status.not_in(TRASH_STATUSES)).all() if models else []
     return page(request,'provider_detail.html',db=db,user=u,session=s,
-                provider=provider,models=models,affected_projects=projects,active='providers')
+                provider=provider,models=models,affected_projects=projects,oauth_local=openai_oauth.enabled(),active='providers')
 
 @app.get('/settings/appearance',response_class=HTMLResponse)
 def appearance_page(request:Request,db:Session=Depends(get_db)):

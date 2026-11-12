@@ -1,4 +1,4 @@
-"""Direct, bounded streaming transport for SpecWeave's API-key models."""
+"""Direct, bounded streaming transport for SpecWeave API-key and OAuth models."""
 import json
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -19,11 +19,12 @@ class ModelError(HTTPException):
         return self.detail
 
 
-def require_model(model):
-    if model.provider.kind == 'openai-oauth':
-        raise ModelError('Model ChatGPT OAuth đã ngừng hỗ trợ. Chọn model dùng API key trong Project Settings.', 409)
+def require_model(model, *, project=None, actor_id=None):
     if not model.enabled or not model.provider.enabled:
         raise ModelError('Model hoặc provider đã bị vô hiệu hóa', 409)
+    if model.provider.kind=='openai-oauth' and actor_id is not None:
+        from openai_oauth import require_access
+        require_access(project,model,actor_id)
 
 
 def snapshot_model(model):
@@ -31,10 +32,10 @@ def snapshot_model(model):
     require_model(model)
     provider = model.provider
     return SimpleNamespace(
-        model_id=model.model_id, api=model.api, context_window=model.context_window,
+        model_id=model.model_id, api='openai-responses' if provider.kind=='openai-oauth' else model.api, context_window=model.context_window,
         max_output_tokens=model.max_output_tokens, reasoning=model.reasoning,
         compat=dict(model.compat or {}), sampling_params=dict(model.sampling_params or {}), enabled=True,
-        provider=SimpleNamespace(kind=provider.kind, base_url=provider.base_url,
+        provider=SimpleNamespace(id=getattr(provider,'id',None),owner_id=getattr(provider,'owner_id',None),kind=provider.kind, base_url=provider.base_url,
                                  encrypted_key=provider.encrypted_key, enabled=True),
     )
 
@@ -106,7 +107,7 @@ def tool_definition(tool, *, strict):
 def request_body(model, messages, *, max_tokens, tools, thinking, response_items=None):
     compat = model.compat or {}
     sampling = model.sampling_params or {}
-    api = model.api or 'openai-completions'
+    api = 'openai-responses' if model.provider.kind=='openai-oauth' else (model.api or 'openai-completions')
     body = {'model':model.model_id, 'stream':True}
     strict = compat.get('supportsStrictMode') is True
     def roles(items):
@@ -205,10 +206,15 @@ async def stream_turn(client, model, messages, *, max_tokens, thinking, tools=()
     require_model(model)
     resource, body = request_body(model, messages, max_tokens=max_tokens, tools=tools,
                                   thinking=thinking, response_items=response_items)
-    url = endpoint(model.provider.base_url, resource)
-    key = decrypt(model.provider.encrypted_key) if model.provider.encrypted_key else ''
-    headers = {'Accept':'text/event-stream'}
-    if key:
+    if model.provider.kind=='openai-oauth':
+        from openai_oauth import API, authorization
+        url=API+'/responses'
+        headers={'Accept':'text/event-stream',**await authorization(model.provider.id,model.provider.owner_id)}
+    else:
+        url=endpoint(model.provider.base_url,resource)
+        headers={'Accept':'text/event-stream'}
+    key = decrypt(model.provider.encrypted_key) if model.provider.encrypted_key and model.provider.kind!='openai-oauth' else ''
+    if key and model.provider.kind!='openai-oauth':
         headers['Authorization'] = 'Bearer ' + key
     turn = ModelTurn()
     calls = {}
@@ -297,7 +303,8 @@ def model_client():
 
 async def complete(project, model, actor_id, *, system_context, message, discussion_id=None, max_tokens=None):
     """One-shot planning and review completion through the same native transport."""
-    require_model(model)
+    require_model(model,project=project,actor_id=actor_id)
+    model=snapshot_model(model)
     limit = min(model.max_output_tokens, max_tokens or 4096, model.context_window // 2)
     messages = budget_messages(system_context, message, [], context_window=model.context_window, output_budget=limit)
     async with model_client() as client:

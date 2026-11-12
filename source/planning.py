@@ -4,7 +4,7 @@ No framework package install is required: app.py imports this file directly.
 """
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
-from db import PlanningQuestion, Message, ResearchItem, AgentRun, ReviewJob, utcnow
+from db import PlanningQuestion, Message, ResearchItem, AgentRun, ChatStreamEvent, ReviewJob, utcnow
 
 
 def tradeoff_text(value):
@@ -86,6 +86,36 @@ def question_payload(item):
         'status': item.status, 'answer': item.answer or {},
         'answer_history': item.answer_history or [], 'created_at': item.created_at.isoformat(),
     }
+
+
+def question_threads(db, project_id, discussion_id):
+    """Join saved briefs to their original chat turn and answer messages for display."""
+    questions = db.query(PlanningQuestion).filter_by(
+        project_id=project_id, discussion_id=discussion_id
+    ).order_by(PlanningQuestion.created_at, PlanningQuestion.id).all()
+    messages = db.query(Message).filter_by(discussion_id=discussion_id).order_by(Message.created_at, Message.id).all()
+    events = db.query(ChatStreamEvent).join(AgentRun).filter(
+        AgentRun.project_id==project_id, AgentRun.discussion_id==discussion_id,
+        ChatStreamEvent.event['type'].as_string()=='planning_question'
+    ).order_by(ChatStreamEvent.id).all()
+    payloads = {question.id:{**question_payload(question), 'message_ids':[], 'run_id':None,
+                            'timeline_at':question.created_at.isoformat()} for question in questions}
+    for event in events:
+        question_id = (event.event.get('payload') or {}).get('id')
+        if question_id in payloads and payloads[question_id]['run_id'] is None:
+            payloads[question_id]['run_id'] = event.run_id
+    for message in messages:
+        if message.role=='assistant':
+            for payload in payloads.values():
+                if payload['run_id'] and payload['run_id']==message.run_id:
+                    payload['message_ids'].append(message.id)
+                    payload['timeline_at'] = message.created_at.isoformat()
+        elif message.role=='user' and message.content.startswith('[TRẢ LỜI CÂU HỎI LẬP KẾ HOẠCH]\nCâu hỏi: '):
+            candidates = [question for question in questions if question.created_at<=message.created_at
+                          and message.content.startswith(f'[TRẢ LỜI CÂU HỎI LẬP KẾ HOẠCH]\nCâu hỏi: {question.question}\nPhương án người dùng chọn: ')]
+            if candidates:
+                payloads[candidates[-1].id]['message_ids'].append(message.id)
+    return list(payloads.values())
 
 
 def answer_question(db: Session, question: PlanningQuestion, data: dict, *, commit: bool = True):

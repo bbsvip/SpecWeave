@@ -23,6 +23,7 @@
   const make=(tag,cls='',txt)=>{const node=document.createElement(tag);if(cls)node.className=cls;if(txt!==undefined)node.textContent=txt;return node;};
   function followIfNearBottom(force=false){
     if(force)following=true;
+    else if(list.scrollTop<lastScrollTop-0.5)following=false;
     if(following){list.scrollTop=list.scrollHeight;lastScrollTop=list.scrollTop;}
   }
   new ResizeObserver(()=>followIfNearBottom()).observe(list);
@@ -107,6 +108,7 @@
   function addMessage(who,text=''){
     list.querySelector('.conversation-intro')?.remove();
     const article=make('article','message '+(who==='user'?'message-user':'message-agent'));
+    article.dataset.createdAt=new Date().toISOString().replace('Z','');
     const avatar=make('div','message-avatar',who==='user'?'A':'✦');
     const body=make('div','message-body');
     const meta=make('div','message-meta',who==='user'?'Anh':'SpecWeave AI');
@@ -174,15 +176,7 @@
     if(!continueQuestionId&&!answerQuestion&&!advancePlanning&&!resumeRunId&&!message)return false;
     let optimistic=null;
     if(message){followIfNearBottom(true);input.value='';input.style.height='auto';optimistic=addMessage('user',message);}
-    if(answerQuestion){
-      followIfNearBottom(true);
-      const q=answerQuestion.question;
-      const chosen=q.options.filter(o=>answerQuestion.data.selected_ids.includes(o.id)).map(o=>o.label);
-      const text='Tôi chọn: '+(chosen.join(', ')||answerQuestion.data.custom_answer)+
-        (chosen.length&&answerQuestion.data.custom_answer?'\nĐiều chỉnh: '+answerQuestion.data.custom_answer:'')+
-        (answerQuestion.data.note?'\nGhi chú: '+answerQuestion.data.note:'');
-      optimistic=addMessage('user',text);
-    }
+    if(answerQuestion)followIfNearBottom(true);
     document.getElementById('piRunPlaceholder')?.remove();
     const turn=addMessage('assistant','');const panel=buildTurnActivity(turn);
     followIfNearBottom();
@@ -353,7 +347,7 @@
           full=p.text;scheduleRender();
         }else if(ev.type==='planning_question'){
           // Tool-created questions are first-class chat events, not a hidden sidebar operation.
-          renderPlanningQuestion(p);addTimeline(panel.timeline,'status','AI đã đưa ra câu hỏi để anh xác nhận');
+          renderPlanningQuestion(p);renderQuestionTimeline([{...p,run_id:runId}],turn);addTimeline(panel.timeline,'status','AI đã đưa ra câu hỏi để anh xác nhận');
         }else if(ev.type==='planning_needs_input'){
           nextQuestionMissing=true;
         }else if(ev.type==='planning_complete'){
@@ -376,7 +370,7 @@
           const label=notice?.label||'Hoàn thành';
           panel.summary.textContent='Hoạt động · '+(elapsedMs/1000).toFixed(1)+'s';
           panel.heading.textContent=label;panel.spinner.classList.add('completed');
-          if(notice?.message)panel.live.after(make('p','turn-live-helper',notice.message));
+          if(notice?.message&&!turn.article.dataset.questionId)panel.live.after(make('p','turn-live-helper',notice.message));
           panel.details.open=false;
           addTimeline(panel.timeline,'status',label);
         }else if(ev.type==='error'){
@@ -578,58 +572,111 @@
   function scrollToQuestion(){
     questionSlot.querySelector('button')?.focus({preventScroll:true});
   }
-  function renderQuestionHistory(history){
-    const holder=document.getElementById('planningHistoryList');
-    const historyPanel=document.getElementById('planningHistory');
-    const previousTop=historyPanel.scrollTop;
-    const expanded=new Set([...holder.querySelectorAll('details[open]')].map(item=>item.dataset.questionId));
-    holder.replaceChildren();
-    document.getElementById('planningHistoryCount').textContent=history.length?`(${history.length})`:'';
-    if(!history.length){holder.append(make('p','','Chưa có câu trả lời đã lưu.'));return;}
-    const labels={answered:'Đã trả lời',deferred:'Tạm hoãn',superseded:'Nhánh trước',pending:'Đang trả lời lại'};
-    for(const q of history){
-      const item=make('details','planning-history-item');item.dataset.questionId=q.id;
-      item.open=expanded.has(q.id);
-      item.append(make('summary','',`${labels[q.status]||q.status} · ${q.question}`));
-      if(q.context)item.append(make('p','planning-description',q.context));
-      for(const option of q.options){
-        const row=make('div','planning-history-option');
-        row.append(make('strong','',option.label),make('p','',option.description||''),
-          make('p','',`Ưu điểm: ${option.pros} · Hạn chế: ${option.cons}`));item.append(row);
+  function renderQuestionTimeline(questions,liveTurn=null){
+    for(const q of questions){
+      let article=list.querySelector(`[data-question-id="${CSS.escape(q.id)}"]`);
+      const sources=(q.message_ids||[]).map(id=>list.querySelector(`[data-message-id="${CSS.escape(id)}"]`)).filter(Boolean);
+      if(!article){
+        article=sources.find(node=>node.classList.contains('message-agent'));
+        if(!article&&liveTurn&&!liveTurn.article.dataset.questionId)article=liveTurn.article;
+        if(!article){
+          article=addMessage('assistant').article;
+          article.dataset.createdAt=q.timeline_at||q.created_at;
+          const next=[...list.querySelectorAll(':scope > article[data-created-at]')].find(node=>
+            node!==article&&node.dataset.createdAt>article.dataset.createdAt);
+          if(next)list.insertBefore(article,next);
+        }
+        article.dataset.questionId=q.id;
+        article.dataset.questionRunId=q.run_id||'';
+        article.classList.add('message-question');
       }
-      if(q.recommendation_reason)item.append(make('p','',`Đề xuất của AI: ${q.recommendation_reason}`));
-      const versions=q.answer_history?.length?q.answer_history:[{status:q.status,answer:q.answer}];
-      for(const version of versions){
-        const record=make('div','planning-answer-record');
-        const date=version.recorded_at?new Date(version.recorded_at+'Z').toLocaleString('vi-VN'):'';
-        record.append(make('strong','',`${labels[version.status]||({reopened:'Đã quay lại',superseded:'Chuyển sang nhánh trước'})[version.status]||version.status} ${date}`));
-        const answer=version.answer||{};
-        record.append(make('p','',[(answer.selected_labels||[]).join(', '),answer.custom_answer,answer.note].filter(Boolean).join('\n')));
-        item.append(record);
+      const body=article.querySelector('.message-body');
+      const meta=body.querySelector('.message-meta');
+      if(q.created_at){
+        const timestamp=meta.querySelector('span')||make('span');
+        timestamp.textContent=new Date(q.created_at+'Z').toLocaleString('vi-VN');
+        if(!timestamp.parentElement)meta.append(timestamp);
+      }
+      if(liveTurn&&liveTurn.article!==article&&article.dataset.questionRunId===q.run_id){
+        body.append(liveTurn.content,...liveTurn.body.querySelectorAll('.turn-live'));
+        liveTurn.article.remove();liveTurn.article=article;liveTurn.body=body;
+      }
+      for(const source of sources)if(source!==article)source.remove();
+      // The brief and saved answer carry the visible content for this turn.
+      for(const content of body.querySelectorAll(':scope > .message-content')){
+        const generic=!content.textContent.trim()||/^(Chọn một phương án trong câu hỏi|Hãy xác nhận câu hỏi đang chờ)/.test(content.textContent.trim());
+        if(generic)content.hidden=true;
+      }
+      body.querySelectorAll(':scope > p.small.text-secondary').forEach(node=>node.remove());
+      const previous=body.querySelector(':scope > .qa-card');
+      const expanded=new Set([...previous?.querySelectorAll('details[open]')||[]].map(node=>node.dataset.section));
+      const card=make('section','qa-card');card.setAttribute('aria-label','Câu hỏi và câu trả lời');
+      const heading=make('div','qa-heading');
+      heading.append(make('h3','',q.question));
+      const statuses={answered:'Đã trả lời',deferred:'Tạm hoãn',superseded:'Nhánh trước',pending:'Chờ trả lời'};
+      heading.append(make('span','qa-status',statuses[q.status]||q.status));card.append(heading);
+      const versions=(q.answer_history||[]).filter(version=>['answered','deferred'].includes(version.status));
+      const latest=versions[versions.length-1];
+      const answer=['answered','deferred'].includes(q.status)?q.answer:(latest?.answer||{});
+      const comparison=make('details','qa-options');comparison.dataset.section='options';comparison.open=expanded.has('options');
+      comparison.append(make('summary','','Các phương án và đề xuất của AI'));
+      if(q.context)comparison.append(make('p','qa-context',q.context));
+      for(const option of q.options){
+        const selected=(answer?.selected_ids||[]).includes(option.id);
+        const row=make('div','qa-option'+(selected?' chosen':''));
+        row.append(make('strong','',option.label+(selected?' · Đã chọn':'')));
+        if(option.description)row.append(make('p','',option.description));
+        row.append(make('p','',`Ưu điểm: ${option.pros}`),make('p','',`Hạn chế: ${option.cons}`));comparison.append(row);
+      }
+      if(q.recommendation_reason)comparison.append(make('p','',`AI đề xuất ${q.options.find(option=>option.id===q.recommended_id)?.label||''}. ${q.recommendation_reason}`));
+      if(q.impact)comparison.append(make('p','',`Tác động: ${q.impact}`));
+      if(q.assumptions?.length)comparison.append(make('p','',`Giả định: ${q.assumptions.join('; ')}`));
+      for(const source of q.sources||[]){
+        if(!/^https?:\/\//i.test(source.url))continue;
+        const link=make('a','planning-source',source.title||source.url);
+        link.href=source.url;link.target='_blank';link.rel='noopener noreferrer';comparison.append(link);
+      }
+      card.append(comparison);
+      function appendAnswer(target,value,label){
+        const section=make('div','qa-answer');section.append(make('strong','qa-answer-label',label));
+        if(value.selected_labels?.length)section.append(make('p','qa-answer-choice',value.selected_labels.join(', ')));
+        if(value.custom_answer)section.append(make('p','',value.custom_answer));
+        if(value.note)section.append(make('p','',value.note));
+        target.append(section);
+      }
+      if(answer&&Object.keys(answer).length)appendAnswer(card,answer,q.status==='pending'?'Câu trả lời trước':'Câu trả lời');
+      if(versions.length>1){
+        const revisions=make('details','qa-revisions');revisions.dataset.section='revisions';revisions.open=expanded.has('revisions');
+        revisions.append(make('summary','',`Các lần trả lời trước (${versions.length-1})`));
+        for(const version of versions.slice(0,-1)){
+          const date=version.recorded_at?new Date(version.recorded_at+'Z').toLocaleString('vi-VN'):'';
+          appendAnswer(revisions,version.answer||{},date||'Câu trả lời trước');
+        }
+        card.append(revisions);
       }
       if(['answered','deferred'].includes(q.status)){
         const reopen=actionButton('Quay lại trả lời','btn-outline-primary',()=>{
           if(controller)return;
           const confirmation=make('div','planning-reopen-confirm');
-          confirmation.append(make('p','','Các câu hỏi phía sau sẽ chuyển vào lịch sử nhánh trước. Bản nháp sẽ cần cập nhật theo câu trả lời mới.'));
+          confirmation.append(make('p','','Các câu hỏi phía sau sẽ chuyển sang nhánh trước. Bản nháp sẽ cần cập nhật theo câu trả lời mới.'));
           const confirm=actionButton('Quay lại câu hỏi này','btn-primary',async()=>{
             confirm.disabled=true;
             try{
               const response=await sw.api(`/api/projects/${pid}/planning/questions/${q.id}/reopen`);
               discoveryDone=false;renderPlanningQuestion(response.question);
-              document.getElementById('planningHistory').open=false;
               await refreshPlanningQuestion();await refreshDiscoveryProgress();scrollToQuestion();
               sw.toast('Đã quay lại câu hỏi. Chọn câu trả lời mới để tiếp tục.','info');
             }catch(error){sw.toast(error.message,'error');confirm.disabled=false;}
           });
           confirmation.append(confirm,actionButton('Giữ câu trả lời hiện tại','btn-outline-secondary',()=>{confirmation.remove();reopen.hidden=false;}));
-          reopen.hidden=true;item.append(confirmation);
+          reopen.hidden=true;card.append(confirmation);
         });
-        reopen.dataset.planningControl='true';reopen.disabled=Boolean(controller);item.append(reopen);
+        reopen.dataset.planningControl='true';reopen.disabled=Boolean(controller);card.append(reopen);
       }
-      holder.append(item);
+      if(previous)previous.replaceWith(card);
+      else body.insertBefore(card,body.querySelector('.turn-live,.turn-history-metrics,.turn-activity'));
     }
-    historyPanel.scrollTop=previousTop;
+    followIfNearBottom();
   }
   async function refreshDiscoveryProgress(){
     if(!progressElement||!did)return;
@@ -655,7 +702,9 @@
     try{
       const data=await sw.api(`/api/projects/${pid}/planning/questions?discussion_id=${encodeURIComponent(did)}`,{},'GET');
       renderPlanningQuestion(data.pending);
-      renderQuestionHistory(data.history||[]);
+      const threads=[...(data.history||[])];
+      if(data.pending&&!threads.some(q=>q.id===data.pending.id))threads.push(data.pending);
+      renderQuestionTimeline(threads);
       const recent=data.history?.[0];
       if(!data.pending&&!discoveryDone&&recent?.status==='answered'&&!recent.answer?.continuation_run_id){
         questionSlot.hidden=false;
@@ -715,6 +764,8 @@
       sw.toast(e.message,'error');
     }
   }
+  const savedThreads=document.getElementById('planningThreads');
+  if(savedThreads)renderQuestionTimeline(JSON.parse(savedThreads.textContent));
   list.scrollTop=list.scrollHeight;
   reconnectActiveRun();refreshDiscoveryProgress();
 })();

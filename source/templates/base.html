@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
   <link href="{{url_for('static',path='/vendor/npm/@tabler/core@1.7.4/dist/css/tabler.min.css') if assets_local else 'https://cdn.jsdelivr.net/npm/@tabler/core@1.7.4/dist/css/tabler.min.css'}}" rel="stylesheet">
   <link href="{{url_for('static',path='/vendor/npm/@tabler/icons-webfont@3.35.0/dist/tabler-icons.min.css') if assets_local else 'https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.35.0/dist/tabler-icons.min.css'}}" rel="stylesheet">
-  <link rel="stylesheet" href="{{ url_for('static', path='/css/app.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', path='/css/app.css') }}?v=8">
   {% block head %}{% endblock %}
 </head>
 <body>

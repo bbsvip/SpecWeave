@@ -24,6 +24,8 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://specweave:${POSTGRES_PASSWORD}@db:5432/specweave
       DATA_ROOT: /data
+      OPENAI_OAUTH_LOCAL_MODE: ${OPENAI_OAUTH_LOCAL_MODE:-true}
+      OPENAI_OAUTH_LOCAL_HOME: /auth-local
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY in .env}
       BOOTSTRAP_TOKEN: ${BOOTSTRAP_TOKEN:?Set BOOTSTRAP_TOKEN in .env}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
@@ -37,6 +39,7 @@ services:
       db: {condition: service_healthy}
     volumes:
       - projects_data:/data
+      - openai_oauth_local:/auth-local
     security_opt:
       - no-new-privileges:true
     shm_size: "1gb"
@@ -50,6 +53,8 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://specweave:${POSTGRES_PASSWORD}@db:5432/specweave
       DATA_ROOT: /data
+      OPENAI_OAUTH_LOCAL_MODE: ${OPENAI_OAUTH_LOCAL_MODE:-true}
+      OPENAI_OAUTH_LOCAL_HOME: /auth-local
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY in .env}
       SPECWEAVE_MIGRATIONS_MANAGED: "true"
       SPECWEAVE_CHAT_CONCURRENCY: ${SPECWEAVE_CHAT_CONCURRENCY:-4}
@@ -58,12 +63,14 @@ services:
       web: {condition: service_healthy}
     volumes:
       - projects_data:/data
+      - openai_oauth_local:/auth-local
     security_opt:
       - no-new-privileges:true
     networks: [private, public]
 volumes:
   postgres_data:
   projects_data:
+  openai_oauth_local:
 networks:
   private:
     internal: true
