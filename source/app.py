@@ -1909,7 +1909,10 @@ async def discover_models(provider_id:str,request:Request,db:Session=Depends(get
             data=resp.json()
     except (httpx.HTTPError,ValueError) as exc:
         raise HTTPException(502,"Không fetch được danh sách models (kiểm tra /v1/models hoặc API key)") from exc
-    names=[x["id"] for x in data.get("data",[]) if isinstance(x,dict) and isinstance(x.get("id"),str)]
+    if p.kind=='openai-oauth':return openai_oauth.model_catalog(data)
+    if not isinstance(data,dict) or not isinstance(data.get('data'),list):
+        raise HTTPException(502,'Endpoint trả về danh mục model không hợp lệ')
+    names=[x["id"] for x in data['data'] if isinstance(x,dict) and isinstance(x.get("id"),str)]
     return {"models":names[:300]}
 
 @app.post("/api/providers/{provider_id}/test")

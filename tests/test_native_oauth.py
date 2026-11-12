@@ -148,3 +148,49 @@ async def test_concurrent_refresh_waits_without_blocking_the_event_loop(monkeypa
     assert results==[{'Authorization':'Bearer new-access'}]*2
     assert len(calls)==1
     assert openai_oauth.read_vault(provider.id)['token']['refresh_token']=='new-refresh'
+
+
+@pytest.mark.parametrize('oauth,catalog,expected,status',[
+    (True,{'models':[
+        {'slug':'model-b','display_name':'Model B','visibility':'list'},
+        {'slug':'hidden-model','display_name':'Hidden','visibility':'hide'},
+        {'slug':'model-a','display_name':'Model A','visibility':'list'},
+        {'slug':'model-b','display_name':'Duplicate','visibility':'list'},
+    ]},['model-b','model-a'],200),
+    (True,{'models':[{'slug':'model-a','visibility':'list'}]},['model-a'],200),
+    (True,{'models':[]},[],200),
+    (True,{'data':[{'id':'wrong-oauth-shape'}]},None,502),
+    (False,{'data':[{'id':'local-a'},{'id':'local-b'}]},['local-a','local-b'],200),
+    (False,{'data':[]},[],200),
+    (False,{'models':[]},None,502),
+])
+def test_discover_uses_the_catalog_contract_for_the_selected_authentication(client,monkeypatch,tmp_path,oauth,catalog,expected,status):
+    import app as application
+    from security import encrypt
+    monkeypatch.setenv('OPENAI_OAUTH_LOCAL_HOME',str(tmp_path/'vault'))
+    auth(client)
+    with SessionLocal() as session:
+        owner=session.query(db.User).filter_by(username='admin').one()
+        provider=db.Provider(name='Catalog fixture',kind='openai-oauth' if oauth else 'openai-compatible',
+                             owner_id=owner.id if oauth else None,enabled=True,
+                             base_url=openai_oauth.API if oauth else 'http://local-fixture/v1',
+                             encrypted_key='' if oauth else encrypt('fixture-api-key'))
+        session.add(provider);session.commit();provider_id=provider.id
+    if oauth:
+        openai_oauth.write_vault(provider_id,{'token':{'access_token':'fixture-plan-token','expires_at':time.time()+3600}})
+    def response(request):
+        assert request.url.path=='/v1/models'
+        assert request.url.host==('api.openai.com' if oauth else 'local-fixture')
+        assert request.headers['Authorization']=='Bearer '+('fixture-plan-token' if oauth else 'fixture-api-key')
+        return httpx.Response(200,json=catalog)
+    real_client=httpx.AsyncClient
+    monkeypatch.setattr(application.httpx,'AsyncClient',lambda **kwargs:real_client(transport=httpx.MockTransport(response)))
+    result=client.get(f'/api/providers/{provider_id}/discover')
+    assert result.status_code==status,result.text
+    if status==200:
+        assert result.json()['models']==expected
+        if oauth:
+            assert [item['id'] for item in result.json()['model_details']]==expected
+            if expected and 'display_name' in catalog['models'][0]:
+                assert result.json()['model_details'][0]['name']==catalog['models'][0]['display_name']
+    assert 'fixture-plan-token' not in result.text and 'fixture-api-key' not in result.text

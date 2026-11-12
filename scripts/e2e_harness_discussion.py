@@ -332,6 +332,23 @@ def run(scratch):
             expect(oauth_page.locator('#openaiOAuthFlow')).to_be_visible()
             oauth_page.get_by_role('button',name='Hủy',exact=True).click()
             expect(oauth_page.locator('#openaiOAuthFlow')).not_to_be_visible()
+            # Account catalogs expose display names while inference uses the slug.
+            oauth_page.route(f'**/api/providers/{provider_id}/discover',lambda route:route.fulfill(json={
+                'models':['catalog-fixture'],
+                'model_details':[{'id':'catalog-fixture','name':'QA catalog model'}],
+            }))
+            oauth_page.locator(f'.provider-fetch[data-id="{provider_id}"]').click()
+            expect(oauth_page.locator('#fetchedModels')).to_contain_text('QA catalog model · catalog-fixture')
+            expect(oauth_page.locator('#fetchedModels input')).to_have_value('catalog-fixture')
+            oauth_page.locator('#fetchedModels input').check()
+            oauth_page.set_viewport_size({'width':1440,'height':1000})
+            if screenshot_dir:
+                oauth_page.screenshot(path=str(Path(screenshot_dir)/'oauth-model-catalog.png'),full_page=False,animations='disabled')
+            oauth_page.locator('#saveModels').click()
+            expect(oauth_page.locator(f'[data-provider="{provider_id}"] .model-tag').filter(has_text='catalog-fixture')).to_be_visible()
+            with closing(sqlite3.connect(scratch/'data.sqlite')) as database:
+                assert database.execute('select model_id from models where provider_id=? and model_id=?',
+                                        (provider_id,'catalog-fixture')).fetchone()==('catalog-fixture',)
             assert not errors,errors
             browser.close()
         print('Passed SpecWeave discussion E2E against the native harness and a local provider fixture.')

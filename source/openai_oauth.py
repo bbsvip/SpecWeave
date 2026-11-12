@@ -25,6 +25,26 @@ API = 'https://api.openai.com/v1'
 SCOPES = 'openid profile email offline_access resource.invoke chatgpt.tokens.use.direct'
 
 
+def model_catalog(data):
+    """Normalize the account-specific catalog returned for ChatGPT plan tokens."""
+    if not isinstance(data,dict) or not isinstance(data.get('models'),list):
+        raise HTTPException(502,'OpenAI trả về danh mục model OAuth không hợp lệ')
+    details=[]
+    seen=set()
+    for item in data['models']:
+        if not isinstance(item,dict) or item.get('visibility')!='list':
+            continue
+        slug=item.get('slug')
+        if not isinstance(slug,str) or not slug.strip() or slug in seen:
+            continue
+        name=item.get('display_name')
+        details.append({'id':slug,'name':name if isinstance(name,str) and name.strip() else slug})
+        seen.add(slug)
+        if len(details)==300:
+            break
+    return {'models':[item['id'] for item in details],'model_details':details}
+
+
 def enabled():
     return os.getenv('OPENAI_OAUTH_LOCAL_MODE','true').lower() in ('1','true','yes')
 

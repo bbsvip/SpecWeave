@@ -9,16 +9,18 @@
   modal.addEventListener('click',e=>{if(e.target===modal)close()});
   function populate(items){
     const list=document.getElementById('fetchedModels');list.replaceChildren();
-    for(const name of items){const label=document.createElement('label'),check=document.createElement('input');
-      check.type='checkbox';check.value=name;check.className='form-check-input me-2';
-      label.append(check,document.createTextNode(name));list.appendChild(label);
+    for(const item of items){const label=document.createElement('label'),check=document.createElement('input');
+      const id=typeof item==='string'?item:item.id;
+      const name=typeof item==='string'?item:item.name||id;
+      check.type='checkbox';check.value=id;check.className='form-check-input me-2';
+      label.append(check,document.createTextNode(name===id?name:`${name} · ${id}`));list.appendChild(label);
     }
   }
   async function fetchModels(providerId){
     selectedProvider=providerId;modal.classList.remove('d-none');populate([]);
     document.getElementById('fetchedModels').textContent='Đang tải danh sách...';
     try{const data=await fetch(`/api/providers/${providerId}/discover`).then(async r=>{const d=await r.json();if(!r.ok)throw new Error(d.message||`HTTP ${r.status}`);return d});
-      populate(data.models);if(!data.models.length)sw.toast('Endpoint không có model nào, có thể thêm manual.');
+      populate(data.model_details||data.models);if(!data.models.length)sw.toast('Endpoint không có model nào, có thể thêm manual.');
     }catch(e){populate([]);sw.toast(e.message,'error')}
   }
   root.querySelectorAll('.provider-fetch').forEach(btn=>btn.addEventListener('click',()=>fetchModels(btn.dataset.id)));

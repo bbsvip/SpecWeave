@@ -55,6 +55,8 @@ Open **Settings → Providers → Continue with ChatGPT**. Complete the authoriz
 
 The native OAuth implementation follows OpenAI's public-client Authorization Code flow with PKCE and dynamic registration. It verifies state, nonce, ID-token signatures, issuer, audience and the ChatGPT-plan scope before activating the connection. Models stream through the Responses API. Provider-row locks serialize refresh-token rotation across web and worker. Credentials are encrypted with `ENCRYPTION_KEY` in the shared `openai_oauth_local` volume. `OPENAI_OAUTH_LOCAL_MODE` enables the feature and defaults to true in Compose. Each connection belongs to its owner.
 
+OAuth model discovery reads the account catalog's `models` array, shows entries with `visibility: "list"` in server order, displays `display_name` and submits `slug` as the model ID. API-key providers use the `data[].id` contract. Regression fixtures cover both shapes, hidden entries, empty catalogs and malformed responses.
+
 Automated HTTP fixtures verify authorization, invalid callbacks, signature rejection, token refresh and native inference. Interactive authorization with a real ChatGPT account and production deployment of this restoration are pending. [OpenAI sign-in documentation](https://developers.openai.com/siwc/token-sharing-open-source/sign-in), [models and inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference).
 
 ## Runtime architecture
