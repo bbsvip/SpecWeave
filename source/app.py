@@ -35,7 +35,7 @@ from storage import (DATA_ROOT, PROJECTS_ROOT, project_root, resolve, init_proje
 from ai import ROLES, MODES
 from harness import SYSTEM, facts_for, facts_text, harness_stream, validate_plan
 from model_runtime import require_model, endpoint as provider_endpoint
-from planning import save_question, question_payload, answer_question, QUESTION_JSON_INSTRUCTIONS
+from planning import save_question, question_payload, answer_question, reopen_question, QUESTION_JSON_INSTRUCTIONS
 from intelligence import (coverage_report, graph_payload, report_markdown, link_nodes,
                           project_node, add_phase_dependency, phase_review_blockers)
 from research import search_searxng, fetch_web
@@ -1102,9 +1102,20 @@ def get_planning_questions(pid:str, request:Request, discussion_id:str, db:Sessi
     u,s=api_guard(request,db);acl(db,pid,u)
     discussion=db.get(Discussion,discussion_id)
     if not discussion or discussion.project_id!=pid:raise HTTPException(404,"Discussion not found")
-    questions=db.query(PlanningQuestion).filter_by(project_id=pid,discussion_id=discussion_id).order_by(PlanningQuestion.created_at.desc()).limit(30).all()
+    questions=db.query(PlanningQuestion).filter_by(project_id=pid,discussion_id=discussion_id).order_by(PlanningQuestion.created_at.desc(),PlanningQuestion.id.desc()).all()
     return {"pending":next((question_payload(q) for q in questions if q.status=="pending"),None),
-            "history":[question_payload(q) for q in questions if q.status!="pending"][:15]}
+            "history":[question_payload(q) for q in questions if q.status!="pending" or q.answer_history]}
+
+@app.post('/api/projects/{pid}/planning/questions/{qid}/reopen')
+def reopen_planning_question(pid:str, qid:str, request:Request, db:Session=Depends(get_db)):
+    u,s=api_guard(request,db,True);pr=acl(db,pid,u,write=True)
+    lock_project_write(db,pid)
+    question=db.query(PlanningQuestion).filter_by(id=qid,project_id=pid).with_for_update().one_or_none()
+    if not question:raise HTTPException(404,'Question not found')
+    reopen_question(db,pr,question,u.id)
+    audit(db,u,'planning_reopen',pr,{'question_id':qid})
+    db.commit()
+    return {'ok':True,'question':question_payload(question)}
 
 @app.get("/api/projects/{pid}/planning/discovery-progress")
 def discovery_progress(pid:str,request:Request,discussion_id:str,db:Session=Depends(get_db)):
@@ -1116,6 +1127,7 @@ def discovery_progress(pid:str,request:Request,discussion_id:str,db:Session=Depe
     existing=named_draft_records(db,pid,paths)
     state=(pr.profile or {}).get('_discovery',{})
     return {'status':'draft_ready' if state.get('status')=='draft_ready' else 'interviewing',
+            'answers_revised':bool(state.get('reopened_question_id') and state.get('status')!='draft_ready'),
             'answered':sum(q.status=='answered' for q in questions),
             'pending':sum(q.status=='pending' for q in questions),
             'deferred':sum(q.status=='deferred' for q in questions),
@@ -1270,6 +1282,7 @@ async def answer_and_start(pid:str,qid:str,request:Request,db:Session=Depends(ge
         raise HTTPException(409,'Hãy chọn model trước khi trả lời')
     require_model(model)
     answer_question(db,q,payload,commit=False)
+    db.flush()
     audit(db,u,'planning_answer_background',pr,{'question_id':qid})
     return await _chat_stream_impl(pid,db,u,pr,{
         'discussion_id':q.discussion_id,'continue_question_id':qid,

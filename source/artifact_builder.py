@@ -84,7 +84,7 @@ def build_artifacts(db, pid):
     phases = db.query(PlanPhase).filter_by(project_id=pid).order_by(PlanPhase.sort_order).all()
     research = db.query(ResearchItem).filter_by(project_id=pid).order_by(ResearchItem.created_at).limit(100).all()
     trace = db.query(TraceLink).filter_by(project_id=pid).all()
-    questions = db.query(PlanningQuestion).filter_by(project_id=pid).order_by(PlanningQuestion.created_at).all()
+    questions = db.query(PlanningQuestion).filter_by(project_id=pid).filter(PlanningQuestion.status!='superseded').order_by(PlanningQuestion.created_at).all()
     req_by_id = {r.id:r for r in reqs}
     sources = defaultdict(list)
     for edge in trace:

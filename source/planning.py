@@ -4,7 +4,15 @@ No framework package install is required: app.py imports this file directly.
 """
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
-from db import PlanningQuestion, Message, ResearchItem
+from db import PlanningQuestion, Message, ResearchItem, AgentRun, ReviewJob, utcnow
+
+
+def tradeoff_text(value):
+    if isinstance(value,str):
+        return value.strip()[:600]
+    if isinstance(value,list):
+        return ' · '.join(item.strip() for item in value[:4] if isinstance(item,str) and item.strip())[:600]
+    return ''
 
 
 def normalize_question(data):
@@ -23,13 +31,14 @@ def normalize_question(data):
         if not isinstance(entry, dict):
             raise ValueError('Invalid option')
         label = str(entry.get('label', '')).strip()[:110]
-        if not label or not str(entry.get('pros', '')).strip() or not str(entry.get('cons', '')).strip():
+        pros, cons = tradeoff_text(entry.get('pros')), tradeoff_text(entry.get('cons'))
+        if not label or not pros or not cons:
             raise ValueError('Mỗi phương án cần tên, ưu điểm và nhược điểm')
         options.append({
             'id': f'o{i+1}', 'label': label,
             'description': str(entry.get('description', '')).strip()[:700],
-            'pros': str(entry.get('pros', '')).strip()[:600],
-            'cons': str(entry.get('cons', '')).strip()[:600],
+            'pros': pros,
+            'cons': cons,
         })
     try:
         recommended = int(data['recommended_index'])
@@ -75,6 +84,7 @@ def question_payload(item):
         'recommendation_reason': item.recommendation_reason, 'impact': item.impact,
         'assumptions': item.assumptions or [], 'sources': item.sources or [], 'allow_multiple': item.allow_multiple,
         'status': item.status, 'answer': item.answer or {},
+        'answer_history': item.answer_history or [], 'created_at': item.created_at.isoformat(),
     }
 
 
@@ -87,6 +97,7 @@ def answer_question(db: Session, question: PlanningQuestion, data: dict, *, comm
     if action == 'defer':
         question.status = 'deferred'
         question.answer = {'note': str(data.get('note', ''))[:1000]}
+        record_answer(question)
         if commit:db.commit()
         return question
     selected = data.get('selected_ids', [])
@@ -105,6 +116,7 @@ def answer_question(db: Session, question: PlanningQuestion, data: dict, *, comm
     labels = [o['label'] for o in question.options if o['id'] in selected]
     question.answer = {'selected_ids': selected, 'selected_labels': labels, 'custom_answer': custom, 'note': note}
     question.status = 'answered'
+    record_answer(question)
     # An explicit user choice is captured as conversation context, NOT a spec approval.
     answer_text = ', '.join(labels) if labels else custom
     details = f"\nĐiều chỉnh: {custom}" if selected and custom else ''
@@ -118,9 +130,50 @@ def answer_question(db: Session, question: PlanningQuestion, data: dict, *, comm
     return question
 
 
+def record_answer(question):
+    question.answer_history = [*(question.answer_history or []), {
+        'status': question.status, 'answer': dict(question.answer or {}),
+        'recorded_at': utcnow().isoformat(),
+    }]
+
+
+def reopen_question(db, project, question, actor_id):
+    """Caller holds the project write lock. Preserve the prior branch for review."""
+    if question.status not in ('answered', 'deferred'):
+        raise HTTPException(409, 'Chỉ có thể quay lại câu hỏi đã trả lời hoặc tạm hoãn')
+    if db.query(AgentRun.id).filter(AgentRun.project_id==project.id,
+            AgentRun.status.in_(('queued', 'running'))).first():
+        raise HTTPException(409, 'Hãy đợi lượt AI hiện tại hoàn thành hoặc bấm Dừng trước khi quay lại')
+    if db.query(ReviewJob.id).filter(ReviewJob.project_id==project.id,
+            ReviewJob.status.in_(('queued', 'running'))).first():
+        raise HTTPException(409, 'Hãy đợi review hiện tại hoàn thành trước khi quay lại')
+    branch = db.query(PlanningQuestion).filter_by(
+        project_id=project.id, discussion_id=question.discussion_id
+    ).order_by(PlanningQuestion.created_at, PlanningQuestion.id).all()
+    index = next(i for i, item in enumerate(branch) if item.id==question.id)
+    for item in branch[index:]:
+        if item.status=='superseded':
+            continue
+        # Legacy answers are captured lazily, without changing old messages.
+        if item.status in ('answered', 'deferred') and not item.answer_history:
+            record_answer(item)
+        item.answer_history = [*(item.answer_history or []), {
+            'status': 'reopened' if item.id==question.id else 'superseded',
+            'recorded_at': utcnow().isoformat(), 'actor_id': actor_id,
+        }]
+        item.status = 'pending' if item.id==question.id else 'superseded'
+        item.answer = {}
+    state = dict((project.profile or {}).get('_discovery') or {})
+    state.update(status='interviewing', reopened_question_id=question.id,
+                 branch_started_at=utcnow().isoformat(), review_required=True)
+    project.profile = {**(project.profile or {}), '_discovery': state}
+    db.flush()
+    return question
+
+
 QUESTION_JSON_INSTRUCTIONS = """Create ONE decision brief from the user's actual project.
 Your output must be ONLY a JSON object with fields:
-question, context, options (array of 2-4 objects with label,description,pros,cons),
+question, context, options (2-4 objects with string fields label, description, pros, cons),
 recommended_index (0-based), recommendation_reason, impact, assumptions (array), sources (array of cited URLs from project research), allow_multiple (boolean).
 You MUST examine confirmed context and recent questions; don't ask a duplicate.
 Prefer the single highest-impact *unanswered* design decision.

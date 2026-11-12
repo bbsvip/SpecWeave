@@ -4,7 +4,7 @@ SpecWeave is a self-hosted workspace for turning project ideas into implementati
 
 SpecWeave runs its own Python harness. The background worker uses the selected API-key provider for model inference and controls Discovery, document checkpoints and review. PostgreSQL stores the conversation and execution state.
 
-> **Verification:** Automated tests cover the native transport, three confirmed answers followed by a draft handoff, and worker recovery after a file was written. Local browser testing covers SSE replay, Stop, discussion isolation and history after restarting the worker. Live validation of the new Docker image is pending.
+> **Verification:** The native harness image `7591f78` was deployed and tested in Brave against Strata. A fresh room-booking QA project completed three confirmed questions and handed off all four requested draft documents at revision 1. Automated tests cover transport, draft handoff, answer branch changes and recovery after a versioned file write. Local browser tests cover SSE replay, Stop, discussion isolation, scroll intent, docked questions, persistent history and reopening answers on desktop and mobile. Production validation of the follow-up history and composer changes remains pending.
 
 ## Features
 
@@ -24,6 +24,16 @@ SpecWeave runs its own Python harness. The background worker uses the selected A
 2. The worker acquires the discussion lease and builds the next request from its saved answers, approved decisions, project profile and relevant notes. It validates the proposed question and allows only one open question in that discussion.
 3. Once there are at least three confirmed answers and the structured evaluation identifies no material unknowns, the worker prepares each requested draft independently. It retries a truncated or invalid draft once with tighter instructions. Existing and approved documents are preserved.
 4. A checkpoint records the exact draft before its atomic file write. If the worker dies before the database commit, the next claim can reconcile the matching file and register it once. The worker checks the Discovery inputs and verifies all requested files before marking the handoff ready for human review.
+
+### Question history and changing an answer
+
+Open **Lịch sử câu hỏi và trả lời** above the composer to review saved questions, options, recommendations and answer versions. **Quay lại trả lời** reopens an answered or deferred question. Later questions move to the previous branch, whose questions and answers remain available in history. Each replacement answer is recorded separately. Existing pre-upgrade answers are captured when first reopened.
+
+The project must be idle before changing its branch. After confirming a replacement answer, Discovery evaluates the updated branch and refreshes affected unapproved drafts using versioned writes and revision checks. Approved documents retain their approval and require human review against the changed answers. The progress panel marks the changed branch until the new handoff.
+
+The current question stays above the composer while messages scroll independently. Context and tradeoffs can be expanded in that panel. Chat follows incoming output until the user scrolls up. Sending a message, selecting an option or pressing the down arrow resumes following. Opening history and reading older messages retain the reading position.
+
+Deploy web and worker together with Alembic revision `0014_planning_history`. This adds answer history to the existing questions. Production validation of these follow-up UI changes remains pending.
 
 The browser follows persisted `chat_stream_events` over SSE using event IDs and `Last-Event-ID`. Closing the tab leaves the job running. Stop requests cancel the upstream stream. An expired Discovery lease can resume once. Ordinary chat and tool executions with an uncertain outcome are not automatically replayed. `SPECWEAVE_CHAT_CONCURRENCY` defaults to 4 and accepts 1 through 16.
 

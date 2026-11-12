@@ -2,6 +2,7 @@
 import hashlib
 import json
 import re
+from datetime import datetime
 from contextlib import aclosing
 
 from fastapi import HTTPException
@@ -55,7 +56,7 @@ def json_object(raw):
 def facts_for(db, project, discussion_id):
     questions = db.query(PlanningQuestion).filter_by(
         project_id=project.id, discussion_id=discussion_id
-    ).order_by(PlanningQuestion.created_at.desc(), PlanningQuestion.id.desc()).limit(32).all()[::-1]
+    ).filter(PlanningQuestion.status!='superseded').order_by(PlanningQuestion.created_at.desc(), PlanningQuestion.id.desc()).limit(32).all()[::-1]
     decisions = db.query(Decision).filter_by(project_id=project.id, status='approved').order_by(Decision.id).limit(20)
     requirements = db.query(Requirement).filter_by(project_id=project.id, status='approved').order_by(Requirement.code).limit(20)
     goals = db.query(ProjectGoal).filter_by(project_id=project.id).order_by(ProjectGoal.id).limit(12)
@@ -246,6 +247,16 @@ class Harness:
             if not resolve(self.pid,existing.path).is_file():
                 raise ModelError('Bản nháp có bản ghi nhưng mất file. Kiểm tra Document Studio.',409)
             path = existing.path
+            if 'revision' in draft:
+                if existing.status=='approved' or existing.revision!=draft['revision']:
+                    raise ModelError('Bản nháp đã thay đổi trong khi soạn. Hãy kiểm tra Document Studio.',409)
+                current = read_text(self.pid,path)
+                if current != content:
+                    if hashlib.sha256(current.encode()).hexdigest()!=draft['previous_sha256']:
+                        raise ModelError('Nội dung bản nháp đã thay đổi trong khi soạn.',409)
+                    write_text(self.pid,path,content)
+                existing.revision += 1
+                existing.status = 'draft'
         else:
             if target.exists():
                 if not target.is_file() or read_text(self.pid,path) != content:
@@ -256,6 +267,17 @@ class Harness:
         run.request_payload = {**run.request_payload,'_checkpoint':{key:value for key,value in state.items() if key!='draft'}}
         self.db.commit()
         return path
+
+    def draft_needs_refresh(self, project, record):
+        since = (project.profile or {}).get('_discovery',{}).get('branch_started_at')
+        return bool(since and record.status!='approved' and record.updated_at < datetime.fromisoformat(since))
+
+    def prepare_draft(self, state, path, text, record):
+        draft = {'path':path,'text':text}
+        if record:
+            draft.update(revision=record.revision,
+                         previous_sha256=hashlib.sha256(read_text(self.pid,record.path).encode()).hexdigest())
+        return {**state,'draft':draft}
 
     def handoff(self, state, requested):
         lock_project_write(self.db,self.pid)
@@ -350,17 +372,20 @@ class Harness:
         if not requested:
             requested = [ARTIFACTS[key][1] for key in CORE_DRAFTS]
         records = named_draft_records(self.db,self.pid,requested)
-        missing = [path for path in requested if path.lower() not in records]
+        missing = [path for path in requested if path.lower() not in records
+                   or self.draft_needs_refresh(project,records[path.lower()])]
         self.db.commit()
         for path in missing:
             filename = path.rsplit('/',1)[-1]
+            prepared = self.prepare_draft(state,path,'',records.get(path.lower()))
+            self.db.commit()
             yield 'status',{'phase':'drafting','message':f'Đang soạn {filename}…'}
             async for kind,item in self.draft_content(path,facts,state['plan']):
                 if kind == 'draft':
                     text = item
                 else:
                     yield kind,item
-            prepared = {**state,'draft':{'path':path,'text':text}}
+            prepared['draft']['text'] = text
             self.save_checkpoint(prepared)
             saved = self.apply_draft(prepared)
             yield 'status',{'phase':'draft_saved','message':f'Đã lưu {saved.rsplit("/",1)[-1]}.'}
@@ -370,9 +395,10 @@ class Harness:
         existing = named_draft_records(self.db,self.pid,[item['path'] for item in documents.values()])
         self.db.commit()
         for item in documents.values():
-            if item['path'].lower() in existing:
+            record = existing.get(item['path'].lower())
+            if record and not self.draft_needs_refresh(project,record):
                 continue
-            prepared = {**state,'draft':{'path':item['path'],'text':item['content']}}
+            prepared = self.prepare_draft(state,item['path'],item['content'],record)
             self.save_checkpoint(prepared)
             self.apply_draft(prepared)
         self.handoff(state,requested)
@@ -418,7 +444,10 @@ class Harness:
             (Message.run_id.is_(None)) | (Message.run_id!=self.run_id)
         ).order_by(Message.created_at.desc(),Message.id.desc()).limit(28).all()[::-1]
         history = [{'role':row.role,'content':row.content} for row in history
-                   if row.content.strip() not in ('',EMPTY_REPLY)]
+                   if row.content.strip() not in ('',EMPTY_REPLY)
+                   and not row.content.startswith('[TRẢ LỜI CÂU HỎI LẬP KẾ HOẠCH]')
+                   and (not (project.profile or {}).get('_discovery',{}).get('branch_started_at')
+                        or row.created_at >= datetime.fromisoformat(project.profile['_discovery']['branch_started_at']))]
         self.db.commit()
         output = self.cap(self.output_limit)
         system = SYSTEM+'\n'+ROLES[role]+'\n'+MODES[mode]+'\n'+facts_text(facts,self.context_budget(output))

@@ -15,7 +15,7 @@ from storage import read_text, write_text
 
 BRIEF = {
     'options':[
-        {'label':'Phạm vi hẹp','description':'Ưu tiên MVP','pros':'Dễ kiểm thử','cons':'Ít tính năng'},
+        {'label':'Phạm vi hẹp','description':'Ưu tiên MVP','pros':['Dễ kiểm thử','Phù hợp MVP'],'cons':'Ít tính năng'},
         {'label':'Phạm vi rộng','description':'Thêm tự động hóa','pros':'Đủ nghiệp vụ','cons':'Cần thêm thời gian'},
     ],
     'recommended_index':0,'recommendation_reason':'Phù hợp tiêu chí MVP và giảm rủi ro.',
@@ -104,7 +104,9 @@ def test_discovery_rejects_premature_handoff_and_finishes_three_rounds(client, m
                 break
             assert stream.count('"type": "planning_question"')==1
             assert session.query(db.Document).filter_by(project_id=pid).count()==0
-            qid=session.query(db.PlanningQuestion).filter_by(discussion_id=did,status='pending').one().id
+            question=session.query(db.PlanningQuestion).filter_by(discussion_id=did,status='pending').one()
+            assert question.options[0]['pros']=='Dễ kiểm thử · Phù hợp MVP'
+            qid=question.id
         job=client.post(f'/api/projects/{pid}/planning/questions/{qid}/answer-start',headers=csrf,
                         json={'selected_ids':['o1']}).json()
     assert len(requests)==10
@@ -203,6 +205,48 @@ def test_no_pi_runtime_in_any_docker_variant():
         assert compose['services']['review-worker']['depends_on']['web']['condition']=='service_healthy'
 
 
+def test_reanswer_refreshes_drafts_and_reconciles_revision_after_interrupted_write(client,monkeypatch):
+    from harness import Harness, fact_digest, facts_for
+    csrf=auth(client)
+    pid,did=_make_discussion_with_model(client,csrf,'reanswer-drafts')
+    seed_answers(pid,did)
+    with SessionLocal() as session:
+        project=session.get(db.Project,pid)
+        project.profile={'documents':['PRD','Architecture']}
+        for path,status in (('docs/drafts/PRD.md','draft'),('docs/drafts/Architecture.md','approved')):
+            write_text(pid,path,'# Original content\n')
+            session.add(db.Document(project_id=pid,path=path,title=path,status=status,revision=1))
+        session.commit()
+        qid=session.query(db.PlanningQuestion).filter_by(project_id=pid).order_by(db.PlanningQuestion.created_at.desc()).first().id
+    assert client.post(f'/api/projects/{pid}/planning/questions/{qid}/reopen',headers=csrf,json={}).status_code==200
+    job=client.post(f'/api/projects/{pid}/planning/questions/{qid}/answer-start',headers=csrf,json={'selected_ids':['o2']}).json()
+    assert claim_next()==job['run_id']
+    with SessionLocal() as session:
+        project=session.get(db.Project,pid)
+        run=session.get(db.AgentRun,job['run_id'])
+        harness=Harness(session,project,session.get(db.Discussion,did),session.get(db.Model,project.active_model_id),run,None)
+        record=session.query(db.Document).filter_by(project_id=pid,path='docs/drafts/PRD.md').one()
+        state=harness.prepare_draft({'digest':fact_digest(facts_for(session,project,did)),'plan':PLAN},record.path,DRAFT+'\n',record)
+        harness.save_checkpoint(state)
+        # The versioned file write finishes, then the worker loses its DB lease.
+        write_text(pid,record.path,DRAFT+'\n')
+        run.lease_expires_at=db.utcnow()-timedelta(seconds=1)
+        session.commit()
+    install_provider(monkeypatch,lambda request:pytest.fail('Recovered draft must not be generated again'))
+    assert claim_next()==job['run_id']
+    asyncio.run(process_queued_run(job['run_id']))
+    with SessionLocal() as session:
+        run=session.get(db.AgentRun,job['run_id'])
+        assert run.status=='completed',run.error
+        doc=session.query(db.Document).filter_by(project_id=pid,path='docs/drafts/PRD.md').one()
+        assert doc.revision==2 and doc.status=='draft'
+        approved=session.query(db.Document).filter_by(project_id=pid,path='docs/drafts/Architecture.md').one()
+        assert approved.revision==1 and approved.status=='approved'
+        assert session.get(db.Project,pid).profile['_discovery']['status']=='draft_ready'
+    assert read_text(pid,'docs/drafts/PRD.md')==DRAFT+'\n'
+    assert read_text(pid,'docs/drafts/Architecture.md')=='# Original content\n'
+
+
 def test_model_review_uses_the_native_transport_without_tools(client,monkeypatch):
     csrf=auth(client)
     pid,_did=_make_discussion_with_model(client,csrf,'native-model-review')
@@ -218,3 +262,44 @@ def test_model_review_uses_the_native_transport_without_tools(client,monkeypatch
     response=client.post(f'/api/projects/{pid}/quality/reviews/run',headers=csrf,json={'engine':'model'})
     assert response.status_code==200,response.text
     assert response.json()['findings']==0
+
+
+def test_harness_executes_complete_tool_call_but_never_executes_cutoff(client,monkeypatch):
+    csrf=auth(client)
+    pid,did=_make_discussion_with_model(client,csrf,'native-tool-round')
+    write_text(pid,'inputs/qa-note.md','A fact belonging to this project.')
+    calls=[]
+
+    def provider(request):
+        body=json.loads(request.content)
+        calls.append(body)
+        if len(calls)==1:
+            return frames(
+                {'choices':[{'delta':{'tool_calls':[{'index':0,'id':'read-1','function':{
+                    'name':'read_project_file','arguments':'{"path":'}}]},'finish_reason':None}]},
+                {'choices':[{'delta':{'tool_calls':[{'index':0,'function':{
+                    'arguments':'"inputs/qa-note.md"}'}}]},'finish_reason':'tool_calls'}]},
+            )
+        if len(calls)==2:
+            tool=body['messages'][-1]
+            assert tool['role']=='tool' and tool['tool_call_id']=='read-1'
+            assert 'A fact belonging to this project.' in tool['content']
+            return completion('Đã đọc ghi chú trong dự án.')
+        assert len(calls)==3
+        return frames({'choices':[{'delta':{'tool_calls':[{'index':0,'id':'cut-1','function':{
+            'name':'propose_decision','arguments':'{"title":"Truncated","description":"No write"}'
+        }}]},'finish_reason':'length'}]})
+
+    install_provider(monkeypatch,provider)
+    for mode in ('discuss','draft'):
+        job=client.post(f'/api/projects/{pid}/chat/start',headers=csrf,
+                        json={'discussion_id':did,'message':'Test tool round','mode':mode}).json()
+        assert asyncio.run(run_once())==job['run_id']
+        stream=client.get(job['events_url']).text
+        if mode=='discuss':
+            assert 'Đã đọc ghi chú trong dự án.' in stream
+            assert '"status": "complete"' in stream
+        else:
+            assert 'Đầu ra bị cắt' in stream and '"type": "tool"' not in stream
+    with SessionLocal() as session:
+        assert session.query(db.Decision).filter_by(project_id=pid).count()==0

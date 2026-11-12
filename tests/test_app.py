@@ -1024,7 +1024,7 @@ def test_0003_migration_creates_review_queue_without_deleting_old_data(tmp_path,
     assert set(inspect(eng).get_table_names())>=missing
     with eng.connect() as conn:
         assert conn.execute(text("SELECT username FROM users WHERE username='legacy'")).scalar()=='legacy'
-        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0013_native_harness'
+        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0014_planning_history'
         assert 'cancel_requested' in [x['name'] for x in inspect(eng).get_columns('agent_runs')]
     eng.dispose()
 
@@ -1092,7 +1092,7 @@ def test_0004_fresh_database_migration_is_idempotent(tmp_path, monkeypatch):
     command.upgrade(cfg,'head')
     eng=create_engine(url)
     with eng.connect() as conn:
-        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0013_native_harness'
+        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0014_planning_history'
         assert any(col['name']=='cancel_requested' for col in __import__('sqlalchemy').inspect(eng).get_columns('agent_runs'))
     eng.dispose()
 

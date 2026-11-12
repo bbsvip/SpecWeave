@@ -142,6 +142,7 @@ class PlanningQuestion(Base):
     allow_multiple = Column(Boolean, default=False, nullable=False)
     status = Column(String(20), default="pending", nullable=False)
     answer = Column(JSON, nullable=False, default=dict)
+    answer_history = Column(JSON, nullable=False, default=list)
     created_at = Column(DateTime, default=utcnow)
 
 class AgentRun(Base):

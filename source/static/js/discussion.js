@@ -13,10 +13,20 @@
   let controller=null,runId=null,openQuestion=null,selectedIds=new Set();
   let discoveryDone=root.dataset.discoveryReady==='true';
   let streamingTimer=null,mermaidLibrary=null,mermaidCounter=0;
+  let following=true,lastScrollTop=list.scrollTop;
+  list.addEventListener('scroll',()=>{
+    if(list.scrollTop<lastScrollTop-0.5)following=false;
+    else if(list.scrollHeight-list.scrollTop-list.clientHeight<12)following=true;
+    lastScrollTop=list.scrollTop;
+  },{passive:true});
+  list.addEventListener('wheel',event=>{if(event.deltaY<0)following=false;},{passive:true});
   const make=(tag,cls='',txt)=>{const node=document.createElement(tag);if(cls)node.className=cls;if(txt!==undefined)node.textContent=txt;return node;};
   function followIfNearBottom(force=false){
-    if(force||list.scrollHeight-list.scrollTop-list.clientHeight<170)list.scrollTop=list.scrollHeight;
+    if(force)following=true;
+    if(following){list.scrollTop=list.scrollHeight;lastScrollTop=list.scrollTop;}
   }
+  new ResizeObserver(()=>followIfNearBottom()).observe(list);
+  new MutationObserver(()=>followIfNearBottom()).observe(list,{childList:true,subtree:true,characterData:true});
   function formatNumber(n){return typeof n==='number'?new Intl.NumberFormat('vi-VN').format(n):'—';}
   function hideUnfinishedDecisionJSON(raw,mode){
     // Do not show raw JSON choices in the chat while the model is writing them.
@@ -95,7 +105,6 @@
   }
   list.querySelectorAll('.markdown-content').forEach(node=>renderMarkdown(node,node.textContent));
   function addMessage(who,text=''){
-    const shouldFollow=list.scrollHeight-list.scrollTop-list.clientHeight<170;
     list.querySelector('.conversation-intro')?.remove();
     const article=make('article','message '+(who==='user'?'message-user':'message-agent'));
     const avatar=make('div','message-avatar',who==='user'?'A':'✦');
@@ -103,10 +112,8 @@
     const meta=make('div','message-meta',who==='user'?'Anh':'SpecWeave AI');
     const content=make('div','message-content'+(who==='assistant'?' markdown-content':''),text);
     body.append(meta,content);article.append(avatar,body);
-    // Keep pending decision brief at the bottom of the conversation timeline.
-    if(questionSlot&&questionSlot.parentElement===list)list.insertBefore(article,questionSlot);
-    else list.append(article);
-    if(shouldFollow)followIfNearBottom(true);
+    list.append(article);
+    followIfNearBottom();
     return {article,body,content};
   }
   function buildTurnActivity(turn){
@@ -134,6 +141,7 @@
     state.textContent=label||(active?'Đang trả lời…':'Sẵn sàng');
     root.classList.toggle('chat-busy',active);
     suggestButton&&(suggestButton.disabled=active);
+    root.querySelectorAll('[data-planning-control]').forEach(button=>{button.disabled=active;});
   }
   function describeUsage(usage,first,elapsed,outputChars=0,outputTps=null){
     const parts=[];
@@ -165,8 +173,9 @@
     const message=(continueQuestionId||answerQuestion||advancePlanning||resumeRunId)?'':input.value.trim();
     if(!continueQuestionId&&!answerQuestion&&!advancePlanning&&!resumeRunId&&!message)return false;
     let optimistic=null;
-    if(message){input.value='';input.style.height='auto';optimistic=addMessage('user',message);}
+    if(message){followIfNearBottom(true);input.value='';input.style.height='auto';optimistic=addMessage('user',message);}
     if(answerQuestion){
+      followIfNearBottom(true);
       const q=answerQuestion.question;
       const chosen=q.options.filter(o=>answerQuestion.data.selected_ids.includes(o.id)).map(o=>o.label);
       const text='Tôi chọn: '+(chosen.join(', ')||answerQuestion.data.custom_answer)+
@@ -176,6 +185,7 @@
     }
     document.getElementById('piRunPlaceholder')?.remove();
     const turn=addMessage('assistant','');const panel=buildTurnActivity(turn);
+    followIfNearBottom();
     const role=sw.val('agentRole'),mode=sw.val('agentMode');
     let full='',usage={},firstTokenMs=null,elapsedMs=0,completed=false,outputTps=null;
     let thinkingFull='',lastPhase='request',answerAccepted=false,nextQuestionMissing=false;
@@ -192,7 +202,6 @@
       renderMarkdown(turn.content,full);
     };
     runId=resumeRunId;controller=new AbortController();setBusy(true,'Đang kết nối…');
-    if(observing)followIfNearBottom(true);
     headerUsage&&(headerUsage.textContent='Đang kết nối…');
     addTimeline(panel.timeline,'status','Kết nối tới agent');
     streamingTimer=setInterval(()=>{
@@ -255,7 +264,7 @@
       runId=queued.run_id;
       setBusy(true,'Đang kết nối với SpecWeave…');
       answerAccepted=Boolean(answerQuestion&&!observing);
-      if(answerAccepted){renderPlanningQuestion(null);refreshDiscoveryProgress();}
+      if(answerAccepted){renderPlanningQuestion(null);refreshDiscoveryProgress();refreshPlanningQuestion();}
       const historyStatus=document.querySelector(`[data-run-status="${CSS.escape(runId)}"]`);
       const showStatus=(status,label)=>{
         terminalStatus=['completed','cancelled','error'].includes(status)?status:terminalStatus;
@@ -424,6 +433,7 @@
       if(headerUsage)headerUsage.textContent=panel.metrics.textContent;
       await refreshPlanningQuestion();
       await refreshDiscoveryProgress();
+      followIfNearBottom();
       if((nextQuestionMissing||advancePlanning)&&!openQuestion&&!discoveryDone){
         if(panel.heading.textContent==='Hoàn thành')panel.heading.textContent='Discovery chưa hoàn tất';
         const note=make('p','turn-error',
@@ -472,29 +482,36 @@
   }
   function renderPlanningQuestion(q){
     if(q&&openQuestion?.id===q.id)return;
-    const follow=list.scrollHeight-list.scrollTop-list.clientHeight<170;
     questionSlot.replaceChildren();questionSlot.hidden=!q;openQuestion=q;selectedIds=new Set();
     if(!q)return;
     const panel=make('div','planning-brief');questionSlot.append(panel);
     panel.setAttribute('aria-label','Câu hỏi đang chờ xác nhận');
+    panel.append(make('div','planning-dock-label','Câu hỏi đang chờ'));
     panel.append(make('h3','',q.question));
-    if(q.context)panel.append(make('p','planning-description',q.context));
+    const explanation=make('details','planning-explanation');
+    explanation.append(make('summary','','Bối cảnh và so sánh phương án'));
+    panel.append(explanation);
+    if(q.context)explanation.append(make('p','planning-description',q.context));
     const optHolder=make('div','planning-options');panel.append(optHolder);
     const optionNodes=[];
     for(const opt of q.options){
       const row=make('button','planning-option');row.type='button';row.setAttribute('aria-pressed','false');
+      row.dataset.planningControl='true';row.disabled=Boolean(controller);
       row.append(make('span','planning-check',q.allow_multiple?'□':'○'));
       const body=make('div');const title=make('div','planning-option-title');
       title.append(make('span','',opt.label));
       if(opt.id===q.recommended_id)title.append(make('span','planning-recommended','AI đề xuất'));
       body.append(title);
-      if(opt.description)body.append(make('div','planning-option-copy',opt.description));
+      const comparison=make('section','planning-comparison');
+      comparison.append(make('strong','',opt.label));
+      if(opt.description)comparison.append(make('div','planning-option-copy',opt.description));
       const trade=make('div','planning-tradeoffs');
       if(opt.pros)trade.append(make('div','up','+ '+opt.pros));
       if(opt.cons)trade.append(make('div','down','− '+opt.cons));
-      body.append(trade);row.append(body);optHolder.append(row);
+      comparison.append(trade);explanation.append(comparison);row.append(body);optHolder.append(row);
       row.addEventListener('click',()=>{
         if(controller)return;
+        followIfNearBottom(true);
         if(!q.allow_multiple)selectedIds.clear();
         if(row.classList.contains('selected')&&q.allow_multiple)selectedIds.delete(opt.id);
         else selectedIds.add(opt.id);
@@ -506,16 +523,16 @@
       });
       optionNodes.push({node:row,opt});
     }
-    if(q.recommendation_reason){const why=make('div','planning-reason');why.append(make('strong','','Vì sao AI đề xuất: '),document.createTextNode(q.recommendation_reason));panel.append(why);}
-    if(q.impact)panel.append(make('div','planning-extras','Tác động: '+q.impact));
-    if(q.assumptions?.length)panel.append(make('div','planning-extras','Giả định: '+q.assumptions.join('; ')));
+    if(q.recommendation_reason){const why=make('div','planning-reason');why.append(make('strong','','Vì sao AI đề xuất: '),document.createTextNode(q.recommendation_reason));explanation.append(why);}
+    if(q.impact)explanation.append(make('div','planning-extras','Tác động: '+q.impact));
+    if(q.assumptions?.length)explanation.append(make('div','planning-extras','Giả định: '+q.assumptions.join('; ')));
     if(q.sources?.length){
       const sources=make('div','planning-extras');sources.append(make('strong','','Nguồn tham khảo: '));
       for(const src of q.sources){
         if(!/^https?:\/\//i.test(src.url))continue;
         const link=make('a','planning-source',src.title||src.url);link.href=src.url;link.target='_blank';link.rel='noopener noreferrer';sources.append(link);
       }
-      panel.append(sources);
+      explanation.append(sources);
     }
     const custom=make('textarea','planning-custom');custom.placeholder='Điều chỉnh hoặc nhập câu trả lời riêng…';panel.append(custom);
     const notes=make('input','planning-custom');notes.style.minHeight='38px';notes.placeholder='Ghi chú bổ sung (tùy chọn)';panel.append(notes);
@@ -556,10 +573,63 @@
       input.focus();
     }));
     actions.append(actionButton('Tạm hoãn','btn-outline-secondary',()=>submit('defer')));
-    if(follow)scrollToQuestion();
+    followIfNearBottom();
   }
   function scrollToQuestion(){
-    list.scrollTop+=questionSlot.getBoundingClientRect().top-list.getBoundingClientRect().top-16;
+    questionSlot.querySelector('button')?.focus({preventScroll:true});
+  }
+  function renderQuestionHistory(history){
+    const holder=document.getElementById('planningHistoryList');
+    const historyPanel=document.getElementById('planningHistory');
+    const previousTop=historyPanel.scrollTop;
+    const expanded=new Set([...holder.querySelectorAll('details[open]')].map(item=>item.dataset.questionId));
+    holder.replaceChildren();
+    document.getElementById('planningHistoryCount').textContent=history.length?`(${history.length})`:'';
+    if(!history.length){holder.append(make('p','','Chưa có câu trả lời đã lưu.'));return;}
+    const labels={answered:'Đã trả lời',deferred:'Tạm hoãn',superseded:'Nhánh trước',pending:'Đang trả lời lại'};
+    for(const q of history){
+      const item=make('details','planning-history-item');item.dataset.questionId=q.id;
+      item.open=expanded.has(q.id);
+      item.append(make('summary','',`${labels[q.status]||q.status} · ${q.question}`));
+      if(q.context)item.append(make('p','planning-description',q.context));
+      for(const option of q.options){
+        const row=make('div','planning-history-option');
+        row.append(make('strong','',option.label),make('p','',option.description||''),
+          make('p','',`Ưu điểm: ${option.pros} · Hạn chế: ${option.cons}`));item.append(row);
+      }
+      if(q.recommendation_reason)item.append(make('p','',`Đề xuất của AI: ${q.recommendation_reason}`));
+      const versions=q.answer_history?.length?q.answer_history:[{status:q.status,answer:q.answer}];
+      for(const version of versions){
+        const record=make('div','planning-answer-record');
+        const date=version.recorded_at?new Date(version.recorded_at+'Z').toLocaleString('vi-VN'):'';
+        record.append(make('strong','',`${labels[version.status]||({reopened:'Đã quay lại',superseded:'Chuyển sang nhánh trước'})[version.status]||version.status} ${date}`));
+        const answer=version.answer||{};
+        record.append(make('p','',[(answer.selected_labels||[]).join(', '),answer.custom_answer,answer.note].filter(Boolean).join('\n')));
+        item.append(record);
+      }
+      if(['answered','deferred'].includes(q.status)){
+        const reopen=actionButton('Quay lại trả lời','btn-outline-primary',()=>{
+          if(controller)return;
+          const confirmation=make('div','planning-reopen-confirm');
+          confirmation.append(make('p','','Các câu hỏi phía sau sẽ chuyển vào lịch sử nhánh trước. Bản nháp sẽ cần cập nhật theo câu trả lời mới.'));
+          const confirm=actionButton('Quay lại câu hỏi này','btn-primary',async()=>{
+            confirm.disabled=true;
+            try{
+              const response=await sw.api(`/api/projects/${pid}/planning/questions/${q.id}/reopen`);
+              discoveryDone=false;renderPlanningQuestion(response.question);
+              document.getElementById('planningHistory').open=false;
+              await refreshPlanningQuestion();await refreshDiscoveryProgress();scrollToQuestion();
+              sw.toast('Đã quay lại câu hỏi. Chọn câu trả lời mới để tiếp tục.','info');
+            }catch(error){sw.toast(error.message,'error');confirm.disabled=false;}
+          });
+          confirmation.append(confirm,actionButton('Giữ câu trả lời hiện tại','btn-outline-secondary',()=>{confirmation.remove();reopen.hidden=false;}));
+          reopen.hidden=true;item.append(confirmation);
+        });
+        reopen.dataset.planningControl='true';reopen.disabled=Boolean(controller);item.append(reopen);
+      }
+      holder.append(item);
+    }
+    historyPanel.scrollTop=previousTop;
   }
   async function refreshDiscoveryProgress(){
     if(!progressElement||!did)return;
@@ -571,9 +641,12 @@
       progressElement.append(make('strong','',finished?'Đủ dữ liệu · đã tạo draft':'Đang làm rõ với SpecWeave'));
       progressElement.append(make('span','',`${progress.answered} đã xác nhận · ${progress.pending} chờ trả lời · ${progress.deferred} hoãn`));
       progressElement.append(make('span','',`${progress.drafts}/${progress.total_artifacts} bản nháp hiện có`));
+      if(progress.answers_revised)progressElement.append(make('span','','Đã đổi nhánh trả lời · bản nháp cần cập nhật và rà soát lại.'));
       if(finished){
         const a=make('a','', 'Xem tài liệu để review');a.href=`/projects/${pid}/artifacts`;progressElement.append(a);
         if(suggestButton){suggestButton.textContent='Xem bản nháp';suggestButton.title='Mở danh sách bản nháp';}
+      }else if(suggestButton){
+        suggestButton.textContent='AI đề xuất';suggestButton.title='AI đề xuất phương án để chọn';
       }
     }catch(e){progressElement.textContent='Chưa tải được tiến độ: '+e.message;}
   }
@@ -582,6 +655,7 @@
     try{
       const data=await sw.api(`/api/projects/${pid}/planning/questions?discussion_id=${encodeURIComponent(did)}`,{},'GET');
       renderPlanningQuestion(data.pending);
+      renderQuestionHistory(data.history||[]);
       const recent=data.history?.[0];
       if(!data.pending&&!discoveryDone&&recent?.status==='answered'&&!recent.answer?.continuation_run_id){
         questionSlot.hidden=false;

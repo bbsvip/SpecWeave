@@ -68,11 +68,12 @@ def test_fresh_database_migrates_to_head():
         url = f'sqlite:///{db_path}'
         env = {**os.environ, 'DATABASE_URL': url}
         _alembic(env)
+
         engine = sa.create_engine(url)
         with engine.connect() as conn:
             names = set(sa.inspect(conn).get_table_names())
             assert set(Base.metadata.tables) <= names
-            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0013_native_harness'
+            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0014_planning_history'
             # Confirm that a real FK references the previously missing table.
             fks = sa.inspect(conn).get_foreign_keys('review_jobs')
             assert any(fk['referred_table'] == 'spec_reviews' for fk in fks)
@@ -80,6 +81,27 @@ def test_fresh_database_migrates_to_head():
         # Re-running migration must not corrupt schema or fail.
         _alembic(env)
 
+
+def test_planning_history_upgrade_keeps_existing_answer(tmp_path):
+    url=f'sqlite:///{tmp_path / "planning-history.db"}'
+    env={**os.environ,'DATABASE_URL':url}
+    _alembic(env)
+    engine=sa.create_engine(url)
+    questions=Base.metadata.tables['planning_questions']
+    with engine.begin() as conn:
+        conn.execute(questions.insert(),{
+            'id':'saved-question','project_id':'qa','discussion_id':'qa-discussion',
+            'question':'Which option?','recommended_id':'o1','options':[{'id':'o1','label':'Original'}],
+            'status':'answered','answer':{'selected_ids':['o1'],'note':'Keep this answer'},
+        })
+        conn.execute(sa.text('ALTER TABLE planning_questions DROP COLUMN answer_history'))
+        conn.execute(sa.text("UPDATE alembic_version SET version_num='0013_native_harness'"))
+    _alembic(env)
+    with engine.connect() as conn:
+        row=conn.execute(sa.select(questions.c.answer,questions.c.answer_history)).one()
+        assert row.answer=={'selected_ids':['o1'],'note':'Keep this answer'}
+        assert row.answer_history==[]
+    engine.dispose()
 
 def test_legacy_schema_without_alembic_version_is_adopted():
     with tempfile.TemporaryDirectory(prefix='specweave-legacy-migration-') as tmp:
@@ -95,7 +117,7 @@ def test_legacy_schema_without_alembic_version_is_adopted():
         _alembic({**os.environ, 'DATABASE_URL': url})
         with engine.connect() as conn:
             assert conn.execute(sa.text('SELECT count(*) FROM system_settings')).scalar_one() == 1
-            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0013_native_harness'
+            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0014_planning_history'
         engine.dispose()
 
 

@@ -25,7 +25,7 @@ from e2e_local import free_port
 ROOT = Path(__file__).resolve().parents[1]
 calls = []
 provider_requests = []
-releases = {name: threading.Event() for name in ('alpha', 'bravo', 'stop-test')}
+releases = {name: threading.Event() for name in ('alpha', 'bravo', 'stop-test', 'scroll-test')}
 posts = []
 
 class Provider(BaseHTTPRequestHandler):
@@ -45,10 +45,23 @@ class Provider(BaseHTTPRequestHandler):
                        'model':'local-test','choices':[{'index':0,'delta':delta,'finish_reason':reason}]}
             self.wfile.write(('data: '+json.dumps(payload,ensure_ascii=False)+'\n\n').encode())
             self.wfile.flush()
+        if name.startswith(('Create ONE decision brief', 'Trả duy nhất một JSON')):
+            brief={'question':f'Cần lưu lịch sử quyết định theo cách nào trong lượt {len(calls)}?',
+                   'context':'Kiểm thử câu hỏi neo và lịch sử với provider cục bộ.',
+                   'options':[{'label':label,'description':'Phương án kiểm thử.','pros':'Có lịch sử để kiểm tra.','cons':'Cần dung lượng lưu trữ.'}
+                              for label in ('Lưu đầy đủ','Lưu tối giản')],
+                   'recommended_index':0,'recommendation_reason':'Cần lưu đầy đủ để có thể quay lại và kiểm tra.',
+                   'impact':'Ảnh hưởng lịch sử thảo luận.','assumptions':[],'sources':[]}
+            text=json.dumps({'action':'ask','question':brief},ensure_ascii=False) if name.startswith('Trả duy nhất') else json.dumps(brief,ensure_ascii=False)
+            chunk({'content':text},'stop')
+            self.wfile.write(b'data: [DONE]\n\n');self.wfile.flush()
+            return
         chunk({'role':'assistant','content':f'SpecWeave {name} đang chạy'})
         if name in releases and not releases[name].wait(40):
             return
         try:
+            if name=='scroll-test':
+                chunk({'content':'\n\n'+('\n\nNội dung mới trong khi người dùng đang đọc lịch sử.'*20)})
             chunk({'content':' · hoàn tất'})
             chunk({},'stop')
             self.wfile.write(b'data: [DONE]\n\n')
@@ -239,6 +252,62 @@ def run(scratch):
             assert [name for name,_ in calls]==['alpha','bravo','charlie','delta','stop-test']
             assert sum(url.endswith('/chat/start') for url in posts)==5
             assert sum(url.endswith('/cancel') for url in posts)==1
+            wait_until_idle(bid)
+            with closing(sqlite3.connect(scratch/'data.sqlite')) as database:
+                for number in range(24):
+                    database.execute('insert into messages (id,discussion_id,role,content,created_at) values (?,?,?,?,?)',
+                                     (f'scroll-message-{number}',did,'user',f'Nội dung lịch sử {number}. '+('Đoạn văn kiểm thử cuộn. '*15),'2026-01-01 00:00:00'))
+                database.commit()
+            a.reload()
+            expect(a.locator('#chatInput')).to_be_enabled()
+            a.locator('#agentMode').select_option('discuss')
+            send(a,'scroll-test')
+            live(a,'SpecWeave scroll-test đang chạy')
+            bottom=lambda:a.locator('#messageList').evaluate('(el)=>el.scrollHeight-el.scrollTop-el.clientHeight')
+            assert bottom()<5, 'Sending a user message must scroll to the bottom'
+            a.locator('#messageList').evaluate('(el)=>{el.scrollTop=120}')
+            a.wait_for_timeout(100)
+            before=a.locator('#messageList').evaluate('(el)=>el.scrollTop')
+            releases['scroll-test'].set()
+            expect(a.locator('.turn-live-label').last).to_have_text('Hoàn thành',timeout=15000)
+            assert abs(a.locator('#messageList').evaluate('(el)=>el.scrollTop')-before)<3, 'Streaming must preserve the reading position'
+            send(a,'scroll-finished')
+            expect(a.locator('.turn-live-label').last).to_have_text('Hoàn thành',timeout=15000)
+            assert bottom()<5, 'A new user message must resume following'
+            wait_until_idle(did)
+            post(f'/api/projects/{pid}/planning/questions/suggest',{'discussion_id':did})
+            a.reload()
+            expect(a.locator('#planningQuestion')).to_be_visible()
+            a.locator('#messageList').evaluate('(el)=>{el.scrollTop=100}')
+            a.locator('#planningQuestion .planning-option').first.click()
+            assert bottom()<5, 'Selecting an answer must resume following'
+            a.locator('#planningQuestion').get_by_role('button',name='Xác nhận & tiếp tục với AI').click()
+            expect(a.locator('.turn-live-label').last).to_have_text('Chờ xác nhận',timeout=15000)
+            expect(a.locator('#planningHistoryCount')).to_have_text('(1)')
+            a.locator('#planningHistory > summary').click()
+            a.locator('.planning-history-item > summary').click()
+            expect(a.locator('.planning-answer-record')).to_contain_text('Lưu đầy đủ')
+            a.get_by_role('button',name='Quay lại trả lời',exact=True).click()
+            a.get_by_role('button',name='Quay lại câu hỏi này',exact=True).click()
+            expect(a.locator('#planningHistory')).not_to_have_attribute('open','')
+            expect(a.locator('#planningQuestion')).to_be_visible()
+            a.reload()
+            expect(a.locator('#planningQuestion')).to_be_visible()
+            a.locator('#planningHistory > summary').click()
+            expect(a.locator('#planningHistoryList')).to_contain_text('Đang trả lời lại')
+            a.locator('#planningHistory > summary').click()
+            for width,height,label in ((1440,1000,'desktop'),(390,844,'mobile')):
+                a.set_viewport_size({'width':width,'height':height})
+                a.locator('#messageList').evaluate('(el)=>{el.scrollTop=80}')
+                a.wait_for_timeout(100)
+                bounds=a.locator('#planningQuestion').bounding_box()
+                composer=a.locator('#chatInput').bounding_box()
+                assert bounds['y']+bounds['height']<=composer['y']+2
+                assert composer['y']+composer['height']<height
+                assert a.evaluate('document.documentElement.scrollWidth <= innerWidth')
+                screenshot_dir=os.getenv('E2E_SCREENSHOT_DIR')
+                if screenshot_dir:
+                    a.screenshot(path=str(Path(screenshot_dir)/f'planning-history-{label}.png'),full_page=False,animations='disabled')
             assert not errors,errors
             browser.close()
         print('Passed SpecWeave discussion E2E against the native harness and a local provider fixture.')
