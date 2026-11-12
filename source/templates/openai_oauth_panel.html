@@ -1,6 +1,6 @@
 <section class="content-card mb-3" id="openaiOAuthApp" data-enabled="{{'true' if oauth_local else 'false'}}">
   <div class="card-heading"><h3><i class="ti ti-lock-check"></i> OpenAI · Đăng nhập bằng ChatGPT</h3></div>
-  <p class="text-secondary small">Chỉ OpenAI hỗ trợ OAuth trong SpecWeave. Kết nối sử dụng cơ chế đăng nhập của Pi và lưu credential trong kho cục bộ của người sở hữu. Không chuyển access token, refresh token hoặc mã đăng nhập vào PostgreSQL.</p>
+  <p class="text-secondary small">Chỉ OpenAI hỗ trợ OAuth trong SpecWeave. SpecWeave sử dụng cơ chế đăng nhập của Pi, giữ installation ID ổn định và lưu credential trong kho cục bộ của người sở hữu. Không chuyển access token, refresh token hoặc mã đăng nhập vào PostgreSQL.</p>
   {% if oauth_local %}
   <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
     <span id="openaiOAuthStatus" class="status-chip">Đang kiểm tra…</span>

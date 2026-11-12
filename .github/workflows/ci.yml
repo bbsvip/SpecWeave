@@ -26,6 +26,8 @@ jobs:
           find source/static/js -type f -name '*.js' -print0 | xargs -0 -r -n 1 node --check
       - name: SSE parser regression
         run: node tests/test_sse_protocol.js
+      - name: Pi OAuth contract regression (no external credentials)
+        run: node --test tests/test_openai_oauth_contract.mjs
       - name: Dependency vulnerability report
         continue-on-error: true
         run: |

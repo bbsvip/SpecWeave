@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 python3
     && /opt/venv/bin/pip install --no-cache-dir fastapi uvicorn pydantic \
     && mkdir -p /runner \
     && npm install --prefix /runner --no-save --ignore-scripts @earendil-works/pi-coding-agent@1.5.2 @earendil-works/pi-ai@1.5.2 typebox \
-    && (cd /runner && node --input-type=module -e "import {createModels} from '@earendil-works/pi-ai/models'; import {openaiProvider} from '@earendil-works/pi-ai/providers/openai'; const m=createModels(); m.setProvider(openaiProvider()); if(!m.getModel) throw Error('Missing Models API')") \
+    && (cd /runner && node --input-type=module -e "import {createModels} from '@earendil-works/pi-ai/models'; import {openaiProvider} from '@earendil-works/pi-ai/providers/openai'; const m=createModels(); const p=openaiProvider(); m.setProvider(p); if(typeof m.login!=='function' || typeof p.auth?.oauth?.login!=='function') throw Error('Missing OAuth API')") \
     && useradd -r -u 10001 -m -d /home/specweave specweave \
     && mkdir -p /runner /data/projects /auth-local \
     && chown -R specweave:specweave /runner /data /auth-local \
@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 python3
 COPY --chown=specweave:specweave source/pi_runner.py source/chat_events.py /runner/
 COPY --chown=specweave:specweave source/pi_tools.ts /runner/pi_tools.ts
 COPY --chown=specweave:specweave source/openai_oauth_runtime.py /runner/openai_oauth_runtime.py
-COPY --chown=specweave:specweave source/openai_oauth.mjs /runner/openai_oauth.mjs
+COPY --chown=specweave:specweave source/openai_oauth.mjs source/pi_device_id.mjs /runner/
 WORKDIR /runner
 ENV PATH=/runner/node_modules/.bin:/opt/venv/bin:$PATH PROJECTS_ROOT=/data/projects PYTHONDONTWRITEBYTECODE=1
 USER specweave

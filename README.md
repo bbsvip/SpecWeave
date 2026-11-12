@@ -248,3 +248,8 @@ If running images from GHCR, push this source to GitHub to publish a new image, 
 Sau khi trả lời một Decision Brief, AI tiếp tục trong cùng session mà không phải gửi lại câu trả lời. Chat có streaming Markdown, SSE trạng thái/tool, usage thực do provider báo, TTFT, thời lượng, lịch sử run riêng theo discussion, code copy và Mermaid preview theo yêu cầu. Cấu trúc chọn phương án nằm ngay trong khung chat, lấy cảm hứng từ ThinkRail.
 
 **Migration:** `0008_conversation_stream` (bổ sung usage/timings cho `agent_runs`). Khi triển khai qua GHCR cần build lại cả image `web` và `pi-runner` do `chat_events.py` được dùng chung. Xem [RELEASE_v0.9.6.vi.md](docs/RELEASE_v0.9.6.vi.md).
+
+
+## v0.9.7 — OpenAI OAuth stability
+
+Đã sửa thiếu Pi installation device ID trong Sign in with ChatGPT, lưu UUID ổn định theo Pi settings và bổ sung safe diagnostics. Xem `docs/RELEASE_v0.9.7_OPENAI_OAUTH_PI_IDENTITY.vi.md`. Không thay đổi schema/volume.

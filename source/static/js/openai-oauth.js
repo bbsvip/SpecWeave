@@ -34,7 +34,7 @@
         }else if(event.type==='device_code'){
           $('openaiOAuthCodeInfo').textContent=`Truy cập ${event.url}, nhập mã ${event.user_code}`;
         }else if(event.type==='prompt')progress(event.message||'Dán callback URL / authorization code');
-        else if(event.type==='progress')progress(event.message||'Đang chờ đăng nhập');
+        else if(event.type==='progress')progress(event.message==='Pi installation identity ready'?'Đã chuẩn bị định danh thiết bị Pi, đang khởi tạo xác thực…':event.message||'Đang chờ đăng nhập');
         else if(event.type==='error'){failLogin(`${event.message} (${event.code||'OAUTH_RUNTIME_FAILURE'}; ${event.phase||'unknown'} / ${event.hint||'UNCLASSIFIED'})`);sw.toast(event.message,'error');}
         else if(event.type==='done'){
           finished=true;progress('Đã xác thực OpenAI thành công.');
@@ -44,6 +44,10 @@
         }
       }
       if(result.status==='error' && !finished)failLogin('Phiên đăng nhập đã thất bại');
+      if(result.status==='running' && !finished && !(result.events||[]).length) {
+        const phaseText={initializing:'Đang khởi tạo OAuth…',browser_authorization:'Đang chờ xác thực qua trình duyệt…',device_authorization:'Đang chờ xác nhận mã thiết bị…',awaiting_manual_callback:'Đang chờ mã hoặc URL chuyển hướng cuối…'};
+        if(phaseText[result.phase])progress(phaseText[result.phase]);
+      }
     }catch(e){failLogin(e.message);sw.toast(e.message,'error');}
     if(!finished)pollHandle=setTimeout(poll,1200);
   }
@@ -54,7 +58,8 @@
     out.textContent=['Node imports: '+(data.node_import?'OK':'FAILED'),
       'Pi models.login: '+(data.model_login?'OK':'FAILED'),
       'OpenAI OAuth adapter: '+(data.provider_oauth?'OK':'FAILED'),
-      'Credential volume writable: '+(data.vault_writable?'OK':'FAILED')].join('\n');
+      'Credential volume writable: '+(data.vault_writable?'OK':'FAILED'),
+      'Stable Pi installation identity: '+(data.device_id_ready?'OK':'NOT CREATED (created at next Connect)')].join('\n');
   },''));
   $('openaiOAuthConnect')?.addEventListener('click',async()=>{
     if(busy)return;

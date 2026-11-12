@@ -43,6 +43,8 @@ def public_status():
 # provider/Node exception strings which might include auth codes or tokens.
 ERROR_DESCRIPTIONS = {
     'OAUTH_MODULE_ERROR':'Thư viện Pi OAuth không nạp được. Kiểm tra bản Pi trong image runner.',
+    'OAUTH_DEVICE_ID':'Pi cần installation UUID ổn định để đăng nhập ChatGPT; kiểm tra settings.json của Pi.',
+    'OAUTH_SETTINGS_INVALID':'Pi settings.json không đọc được hoặc sai cấu trúc; kiểm tra dữ liệu Pi trong volume.',
     'OAUTH_VAULT_PERMISSION':'Pi không đọc/ghi được credential volume /auth-local.',
     'OAUTH_NETWORK':'Pi runner không kết nối được dịch vụ xác thực OpenAI.',
     'OAUTH_REJECTED':'OpenAI từ chối hoặc mã đăng nhập đã hết hạn. Hãy tạo phiên mới.',
@@ -81,14 +83,15 @@ def safe_event(event):
         result=_oauth_error(str(event.get('code','OAUTH_RUNTIME_FAILURE')))
         phase=str(event.get('phase',''))
         hint=str(event.get('hint',''))
-        allowed_phases={'bootstrap','register_provider','provider_login','awaiting_manual_callback','persisting_credential'}
+        allowed_phases={'bootstrap','device_identity','register_provider','provider_login','awaiting_manual_callback','persisting_credential'}
         allowed_hints={'INCOMPATIBLE_API','INCOMPATIBLE_PACKAGE_VERSION','MISSING_DEPENDENCY','VAULT_PERMISSION',
                        'NETWORK_OR_PROXY','INVALID_REDIRECT','AUTH_REJECTED','INPUT_TIMEOUT',
-                       'CREDENTIAL_NOT_PERSISTED','UNCLASSIFIED'}
+                       'CREDENTIAL_NOT_PERSISTED','DEVICE_ID_MISSING','PI_SETTINGS_INVALID','UNCLASSIFIED'}
         if phase in allowed_phases:result['phase']=phase
         if hint in allowed_hints:result['hint']=hint
         return result
-    if kind=='progress': return {'type':'progress','message':'OpenAI sign-in in progress'}
+    if kind=='progress':
+        return {'type':'progress','message':'Pi installation identity ready' if event.get('message')=='Pi installation identity ready' else 'OpenAI sign-in in progress'}
     return None
 
 
@@ -100,12 +103,20 @@ async def _login_worker(job):
         while True:
             raw=await proc.stderr.readline()
             if not raw:break
-            matched=re.search(rb'\bOAUTH_[A-Z_]+\b',raw[:1000])
-            if matched:
-                code=matched.group(0).decode('ascii')
+            # The Node runner prints only audited enum labels. Never log arbitrary stderr:
+            # upstream OAuth errors may contain authorization codes or access tokens.
+            fields = re.fullmatch(
+                rb'\[openai-oauth\] (OAUTH_[A-Z_]+) phase=([a-z_]+) hint=([A-Z_]+) error_type=([A-Za-z]+)\s*',
+                raw[:1000],
+            )
+            if fields:
+                code, phase, hint, error_type = (part.decode('ascii') for part in fields.groups())
                 if code in ERROR_DESCRIPTIONS:
-                    job['diagnostic_code']=code
-                    LOG.warning('OpenAI OAuth runner failure: %s',code)
+                    job['diagnostic_code'] = code
+                    job['diagnostic_phase'] = phase
+                    job['diagnostic_hint'] = hint
+                    LOG.warning('OpenAI OAuth failure: code=%s phase=%s hint=%s error_type=%s',
+                                code, phase, hint, error_type)
     stderr_task=asyncio.create_task(drain_stderr())
     try:
         while True:
@@ -115,13 +126,21 @@ async def _login_worker(job):
             except (UnicodeError,ValueError,TypeError):continue
             if event:
                 job['events'].append(event)
+                if event['type']=='auth_url': job['phase']='browser_authorization'
+                elif event['type']=='device_code': job['phase']='device_authorization'
+                elif event['type']=='prompt': job['phase']='awaiting_manual_callback'
+                elif event['type']=='done': job['phase']='completed'
+                elif event['type']=='error': job['phase']=event.get('phase','failed')
                 if event['type'] in ('done','error'):
                     job['state']='done' if event['type']=='done' else 'error'
         await asyncio.wait_for(proc.wait(),timeout=6)
         if job['state']=='running':
             job['state']='error'
             code=job.get('diagnostic_code','OAUTH_PROCESS_EXIT')
-            job['events'].append(_oauth_error(code))
+            event=_oauth_error(code)
+            if job.get('diagnostic_phase'): event['phase']=job['diagnostic_phase']
+            if job.get('diagnostic_hint'): event['hint']=job['diagnostic_hint']
+            job['events'].append(event)
     except (asyncio.TimeoutError,asyncio.CancelledError):
         job['state']='error'
         job['events'].append(_oauth_error('OAUTH_PROCESS_TIMEOUT'))
@@ -151,7 +170,7 @@ async def start_login():
         except BaseException:
             AUTH_USE_LOCK.release()
             raise
-        job={'id':secrets.token_urlsafe(24),'proc':proc,'events':[], 'state':'running'}
+        job={'id':secrets.token_urlsafe(24),'proc':proc,'events':[], 'state':'running', 'phase':'initializing'}
         job['task']=asyncio.create_task(_login_worker(job))
         LOGIN=job
         return {'id':job['id'],'status':'running'}
@@ -162,7 +181,7 @@ def poll_login(login_id,offset=0):
     if LOGIN is None or not secrets.compare_digest(login_id,LOGIN['id']):
         raise HTTPException(404,'Login session not found')
     offset=max(0,min(int(offset),10000))
-    return {'status':LOGIN['state'],'events':LOGIN['events'][offset:],
+    return {'status':LOGIN['state'],'phase':LOGIN.get('phase','initializing'),'events':LOGIN['events'][offset:],
             'next_offset':len(LOGIN['events']),'connected':public_status()['connected']}
 
 
@@ -230,7 +249,7 @@ async def diagnostics():
             "console.log(JSON.stringify({model_login:typeof m.login==='function',"
             "provider_oauth:typeof p.auth?.oauth?.login==='function'}))")
     status={'local_mode':True,'node_import':False,'model_login':False,
-            'provider_oauth':False,'vault_writable':False}
+            'provider_oauth':False,'vault_writable':False,'device_id_ready':False}
     try:
         proc=await asyncio.create_subprocess_exec('node','--input-type=module','-e',script,
             cwd='/runner',stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL,
@@ -241,6 +260,13 @@ async def diagnostics():
             status.update(node_import=True,model_login=result.get('model_login') is True,
                           provider_oauth=result.get('provider_oauth') is True)
     except (ValueError,OSError,asyncio.TimeoutError):pass
+    try:
+        from uuid import UUID
+        settings_file=AUTH_PATH.parent/'settings.json'
+        settings=json.loads(settings_file.read_text(encoding='utf8'))
+        device_id=settings.get('deviceId')
+        status['device_id_ready']=isinstance(device_id,str) and str(UUID(device_id))==device_id.lower()
+    except (OSError,ValueError,TypeError,AttributeError):pass
     try:
         # Only inspect/write a random temp probe; never read or modify auth.json.
         folder=AUTH_PATH.parent

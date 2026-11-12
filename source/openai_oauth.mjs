@@ -12,6 +12,7 @@ import {join, dirname} from 'node:path';
 import {homedir} from 'node:os';
 import {createInterface} from 'node:readline';
 import {randomUUID} from 'node:crypto';
+import {getOrCreateDeviceId} from './pi_device_id.mjs';
 
 const path = join(process.env.HOME || homedir(), '.pi', 'agent', 'auth.json');
 let oauthPhase='bootstrap';
@@ -26,6 +27,8 @@ function safeHint(err) {
   if (/Invalid URL|bad URL/i.test(value)) return 'INVALID_REDIRECT';
   if (/invalid_grant|access_denied|unauthorized/i.test(value)) return 'AUTH_REJECTED';
   if (/Login input expired/i.test(value)) return 'INPUT_TIMEOUT';
+  if (/Pi global settings\.json|JSON object/i.test(value)) return 'PI_SETTINGS_INVALID';
+  if (/requires a device ID|deviceId is invalid/i.test(value)) return 'DEVICE_ID_MISSING';
   if (/did not persist/i.test(value)) return 'CREDENTIAL_NOT_PERSISTED';
   return 'UNCLASSIFIED';
 }
@@ -34,6 +37,10 @@ function safeHint(err) {
 // exceptions can include callback URLs, tokens or authorization codes.
 function classifyFailure(err) {
   const raw = String(err?.code || '')+' '+String(err?.message || err || '');
+  if (/Pi global settings\.json|settings\.json must contain/i.test(raw))
+    return ['OAUTH_SETTINGS_INVALID','Pi settings.json is unreadable or invalid; repair the local Pi settings before login'];
+  if (/requires a device ID|deviceId is invalid/i.test(raw))
+    return ['OAUTH_DEVICE_ID','Pi OpenAI sign-in requires a stable installation ID'];
   if (/ERR_MODULE_NOT_FOUND|Cannot find (module|package)|does not provide an export|Unknown file extension/i.test(raw))
     return ['OAUTH_MODULE_ERROR','Pi OAuth module could not be loaded; check the pinned Pi installation'];
   if (/EACCES|EPERM|permission denied|read-only file system/i.test(raw))
@@ -100,6 +107,12 @@ const store={
   async delete(providerId){const obj=await load();delete obj[providerId];await save(obj)},
 };
 async function main(){
+  // Share Pi's global installation UUID, as SettingsManager.getOrCreateDeviceId() does.
+  // Pi OpenAI OAuth refuses a login with no device ID. Persist before login.
+  oauthPhase='device_identity';
+  const deviceId=await getOrCreateDeviceId(process.env.HOME || homedir());
+  if (!deviceId) throw new Error('Pi deviceId is invalid');
+  send('progress',{message:'Pi installation identity ready'});
   // Only OpenAI provider is registered: never expose any other provider login.
   oauthPhase='register_provider';
   const models=createModels({credentials:store});
@@ -112,7 +125,7 @@ async function main(){
       else if(event?.type==='device_code')send('device_code',{user_code:String(event.userCode||'').slice(0,120),verification_uri:String(event.verificationUri||'').slice(0,2000)});
       else if(event?.type==='info'||event?.type==='progress')send('progress',{message:String(event.message||'').slice(0,800)});
     },
-  });
+  }, {getDeviceId:()=>deviceId, agentName:'SpecWeave'});
   // Check that an OAuth record (not API key) was stored, without exposing it.
   oauthPhase='persisting_credential';
   const record=(await load()).openai;
