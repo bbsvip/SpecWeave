@@ -14,6 +14,25 @@ import {createInterface} from 'node:readline';
 import {randomUUID} from 'node:crypto';
 
 const path = join(process.env.HOME || homedir(), '.pi', 'agent', 'auth.json');
+// Errors are classified before crossing the runner boundary; raw provider
+// exceptions can include callback URLs, tokens or authorization codes.
+function classifyFailure(err) {
+  const raw = String(err?.code || '')+' '+String(err?.message || err || '');
+  if (/ERR_MODULE_NOT_FOUND|Cannot find (module|package)|does not provide an export|Unknown file extension/i.test(raw))
+    return ['OAUTH_MODULE_ERROR','Pi OAuth module could not be loaded; check the pinned Pi installation'];
+  if (/EACCES|EPERM|permission denied|read-only file system/i.test(raw))
+    return ['OAUTH_VAULT_PERMISSION','Pi cannot read or write its local credential volume'];
+  if (/ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|fetch failed|network|TLS|certificate|ETIMEDOUT/i.test(raw))
+    return ['OAUTH_NETWORK','Pi could not reach the OpenAI authorization service'];
+  if (/invalid_grant|invalid_request|access_denied|unauthorized|expired|code verifier|callback/i.test(raw))
+    return ['OAUTH_REJECTED','OpenAI declined or expired the authorization; start a new login'];
+  if (/timeout|timed out|expired input|aborted/i.test(raw))
+    return ['OAUTH_TIMEOUT','OpenAI login timed out or was cancelled'];
+  if (/Unsupported.*oauth|not.*support.*oauth|Unknown provider|not.*registered/i.test(raw))
+    return ['OAUTH_UNSUPPORTED','Installed Pi provider does not support this OpenAI OAuth flow'];
+  return ['OAUTH_RUNTIME_FAILURE','OpenAI sign-in failed inside the Pi OAuth runtime'];
+}
+
 const send=(type,props={})=>process.stdout.write(JSON.stringify({type,...props})+'\n');
 const answers=[];
 let answerResolve;
@@ -77,4 +96,10 @@ async function main(){
   send('done',{connected:true});
   input.close();process.stdin.pause();
 }
-main().catch(e=>{send('error',{message:String(e?.message||'OAuth login failed').replace(/(code|token|secret)=[^\s&]+/gi,'$1=[redacted]').slice(0,400)});process.exitCode=1});
+main().catch(e=>{
+  const [code,message]=classifyFailure(e);
+  // Never print raw error messages to stdout/stderr: they can contain secrets.
+  console.error(`[openai-oauth] ${code}`);
+  send('error',{code,message});
+  input.close();process.stdin.pause();process.exitCode=1;
+});

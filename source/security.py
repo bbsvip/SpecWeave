@@ -66,11 +66,22 @@ def check_csrf(request, session, supplied):
             raise HTTPException(403, "Nguồn request không hợp lệ")
 
 
+def validate_encryption_key():
+    """Fail at startup rather than fail a provider write with HTTP 500.
+
+    Never log the key itself. Existing encrypted secrets require the SAME key.
+    """
+    value = os.environ.get("ENCRYPTION_KEY", "").strip()
+    if not value:
+        raise RuntimeError("ENCRYPTION_KEY chưa cấu hình. Tạo Fernet key bằng: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\"")
+    try:
+        return Fernet(value.encode("ascii"))
+    except (ValueError, TypeError, UnicodeError) as exc:
+        raise RuntimeError("ENCRYPTION_KEY không hợp lệ: phải là 32 byte ngẫu nhiên mã hóa URL-safe Base64 (Fernet key). Không đặt password/hex thông thường. Không đổi khóa nếu đã có provider secrets.") from exc
+
+
 def cipher():
-    key = os.environ.get("ENCRYPTION_KEY", "").encode()
-    if not key:
-        raise RuntimeError("ENCRYPTION_KEY chưa cấu hình")
-    return Fernet(key)
+    return validate_encryption_key()
 
 
 def encrypt(value):

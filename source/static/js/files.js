@@ -71,11 +71,20 @@
     try{
       const r=await fetch(`/api/projects/${pid}/files/content?path=${encodeURIComponent(currentPath)}`);
       const data=await r.json();if(!r.ok)throw new Error(data.message||'Không thể mở văn bản');
-      editor.value=data.content;document.getElementById('fileEditorTitle').textContent=currentPath;
+      const isJson=/\.json$/i.test(currentPath);
+      const formatBtn=document.getElementById('formatFileJson');
+      formatBtn.classList.toggle('d-none',!isJson);
+      if(isJson){try{editor.value=JSON.stringify(JSON.parse(data.content),null,2)}catch{editor.value=data.content}}
+      else editor.value=data.content;
+      document.getElementById('fileEditorTitle').textContent=currentPath;
       document.getElementById('fileVersionInfo').textContent=`${data.content.length} ký tự`;
       currentMtime=data.mtime;modal.classList.remove('d-none');
     }catch(e){sw.toast(e.message,'error')}
   }));
+  document.getElementById('formatFileJson').addEventListener('click',()=>{
+    try{editor.value=JSON.stringify(JSON.parse(editor.value),null,2);sw.toast('Đã định dạng JSON','success')}
+    catch(e){sw.toast('JSON không hợp lệ: '+e.message,'error')}
+  });
   document.getElementById('saveFile').addEventListener('click',()=>sw.act(async()=>{
     await sw.api(`/api/projects/${pid}/files/content`,{path:currentPath,content:editor.value,expected_mtime:currentMtime});close();
   }));

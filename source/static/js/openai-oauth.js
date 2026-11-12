@@ -8,6 +8,14 @@
   function status(text,kind=''){const el=$('openaiOAuthStatus');el.textContent=text;el.className='status-chip '+kind;}
   function progress(text){$('openaiOAuthProgress').textContent=text;}
   function stopPolling(){if(pollHandle){clearTimeout(pollHandle);pollHandle=null;}}
+  function setFlowInput(enabled){
+    $('openaiOAuthSend').disabled=!enabled;
+    $('openaiOAuthAnswer').disabled=!enabled;
+  }
+  function failLogin(message){
+    finished=true;stopPolling();setFlowInput(false);
+    progress(message+' — Bấm Connect / Reconnect để thử phiên mới.');
+  }
   async function loadStatus(){
     try{const data=await auth('status');
       status(data.connected?(data.provider_enabled?'Đã kết nối':'Đã xác thực · cần kích hoạt'):'Chưa kết nối',data.connected?'good':'');
@@ -27,7 +35,7 @@
           $('openaiOAuthCodeInfo').textContent=`Truy cập ${event.url}, nhập mã ${event.user_code}`;
         }else if(event.type==='prompt')progress(event.message||'Dán callback URL / authorization code');
         else if(event.type==='progress')progress(event.message||'Đang chờ đăng nhập');
-        else if(event.type==='error'){finished=true;progress(event.message);sw.toast(event.message,'error');}
+        else if(event.type==='error'){failLogin(`${event.message} (${event.code||'OAUTH_RUNTIME_FAILURE'})`);sw.toast(event.message,'error');}
         else if(event.type==='done'){
           finished=true;progress('Đã xác thực OpenAI thành công.');
           await sw.api('/api/openai/oauth/activate',{});
@@ -35,8 +43,8 @@
           $('openaiOAuthFlow').classList.add('d-none');
         }
       }
-      if(result.status==='error')finished=true;
-    }catch(e){finished=true;sw.toast(e.message,'error');}
+      if(result.status==='error' && !finished)failLogin('Phiên đăng nhập đã thất bại');
+    }catch(e){failLogin(e.message);sw.toast(e.message,'error');}
     if(!finished)pollHandle=setTimeout(poll,1200);
   }
   $('openaiOAuthConnect')?.addEventListener('click',async()=>{
@@ -44,7 +52,7 @@
     if(!confirm('Chỉ kết nối tài khoản ChatGPT của chính anh trên runtime cục bộ do anh kiểm soát. Không chia sẻ cho người khác. Tiếp tục?'))return;
     busy=true;
     try{
-      stopPolling();finished=false;offset=0;
+      stopPolling();finished=false;offset=0;setFlowInput(true);
       const result=await sw.api('/api/openai/oauth/start',{});
       loginId=result.id;
       $('openaiOAuthFlow').classList.remove('d-none');
@@ -56,6 +64,7 @@
     finally{busy=false;}
   });
   $('openaiOAuthSend')?.addEventListener('click',()=>sw.act(async()=>{
+    if(finished)throw Error('Phiên OAuth đã kết thúc. Hãy bấm Connect / Reconnect để tạo phiên mới.');
     if(!loginId)throw Error('Chưa có phiên đăng nhập');
     const field=$('openaiOAuthAnswer'),value=field.value.trim();
     if(!value)throw Error('Cần dán redirect URL hoặc authorization code');

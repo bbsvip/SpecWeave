@@ -5,6 +5,7 @@ There is deliberately NO token or authorization-code persistence in PostgreSQL.
 """
 import asyncio
 import json
+import logging
 import os
 import re
 import secrets
@@ -14,6 +15,7 @@ from urllib.parse import urlsplit
 from fastapi import HTTPException
 
 LOCAL_HOME = Path(os.getenv('OPENAI_OAUTH_LOCAL_HOME', '/auth-local'))
+LOG = logging.getLogger("specweave.openai_oauth")
 AUTH_PATH = LOCAL_HOME / '.pi' / 'agent' / 'auth.json'
 LOGIN = None
 LOCK = asyncio.Lock()
@@ -37,6 +39,26 @@ def public_status():
         return {'connected':False,'provider':'openai','storage':'local-pi-vault','shared':False}
 
 
+# Only allow static, reviewed messages to reach the browser, not arbitrary
+# provider/Node exception strings which might include auth codes or tokens.
+ERROR_DESCRIPTIONS = {
+    'OAUTH_MODULE_ERROR':'Thư viện Pi OAuth không nạp được. Kiểm tra bản Pi trong image runner.',
+    'OAUTH_VAULT_PERMISSION':'Pi không đọc/ghi được credential volume /auth-local.',
+    'OAUTH_NETWORK':'Pi runner không kết nối được dịch vụ xác thực OpenAI.',
+    'OAUTH_REJECTED':'OpenAI từ chối hoặc mã đăng nhập đã hết hạn. Hãy tạo phiên mới.',
+    'OAUTH_TIMEOUT':'Phiên đăng nhập hết thời gian chờ hoặc đã bị hủy.',
+    'OAUTH_UNSUPPORTED':'Phiên bản Pi đang cài không hỗ trợ OpenAI OAuth theo giao thức này.',
+    'OAUTH_RUNTIME_FAILURE':'Đăng nhập OpenAI thất bại trong Pi runner; xem mã lỗi trong log Pi.',
+    'OAUTH_PROCESS_EXIT':'Tiến trình OAuth kết thúc trước khi xác thực hoàn tất.',
+    'OAUTH_PROCESS_TIMEOUT':'Tiến trình OAuth bị ngắt hoặc quá thời gian chờ.',
+}
+
+def _oauth_error(code):
+    if code not in ERROR_DESCRIPTIONS:
+        code='OAUTH_RUNTIME_FAILURE'
+    return {'type':'error','code':code,'message':ERROR_DESCRIPTIONS[code]}
+
+
 def safe_event(event):
     """Never echo arbitrary fields from Pi/OAuth provider to the browser."""
     kind=event.get('type')
@@ -55,13 +77,26 @@ def safe_event(event):
     if kind=='prompt':
         return {'type':'prompt','message':str(event.get('message',''))[:600]}
     if kind=='done': return {'type':'done','connected':True}
-    if kind=='error': return {'type':'error','message':'OpenAI login failed; check local Pi logs'}
+    if kind=='error': return _oauth_error(str(event.get('code','OAUTH_RUNTIME_FAILURE')))
     if kind=='progress': return {'type':'progress','message':'OpenAI sign-in in progress'}
     return None
 
 
 async def _login_worker(job):
     proc=job['proc']
+    # Drain stderr to avoid subprocess stalls. Do not log raw OAuth output.
+    async def drain_stderr():
+        if not proc.stderr:return
+        while True:
+            raw=await proc.stderr.readline()
+            if not raw:break
+            matched=re.search(rb'\bOAUTH_[A-Z_]+\b',raw[:1000])
+            if matched:
+                code=matched.group(0).decode('ascii')
+                if code in ERROR_DESCRIPTIONS:
+                    job['diagnostic_code']=code
+                    LOG.warning('OpenAI OAuth runner failure: %s',code)
+    stderr_task=asyncio.create_task(drain_stderr())
     try:
         while True:
             line=await asyncio.wait_for(proc.stdout.readline(),timeout=300)
@@ -74,13 +109,19 @@ async def _login_worker(job):
                     job['state']='done' if event['type']=='done' else 'error'
         await asyncio.wait_for(proc.wait(),timeout=6)
         if job['state']=='running':
-            job['state']='error';job['events'].append({'type':'error','message':'OpenAI sign-in exited before completion'})
+            job['state']='error'
+            code=job.get('diagnostic_code','OAUTH_PROCESS_EXIT')
+            job['events'].append(_oauth_error(code))
     except (asyncio.TimeoutError,asyncio.CancelledError):
         job['state']='error'
-        job['events'].append({'type':'error','message':'OpenAI sign-in was interrupted or timed out'})
+        job['events'].append(_oauth_error('OAUTH_PROCESS_TIMEOUT'))
     finally:
         if proc.returncode is None:
             proc.kill();await proc.wait()
+        if not stderr_task.done():
+            stderr_task.cancel()
+        try: await stderr_task
+        except asyncio.CancelledError: pass
         if AUTH_USE_LOCK.locked():
             AUTH_USE_LOCK.release()
 
@@ -96,7 +137,7 @@ async def start_login():
             LOCAL_HOME.mkdir(parents=True,exist_ok=True,mode=0o700)
             proc=await asyncio.create_subprocess_exec('node','/runner/openai_oauth.mjs',
                 env={**os.environ,'HOME':str(LOCAL_HOME)},stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL)
+                stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
         except BaseException:
             AUTH_USE_LOCK.release()
             raise
@@ -117,8 +158,11 @@ def poll_login(login_id,offset=0):
 
 async def answer_login(login_id,value):
     require_local()
-    if LOGIN is None or not secrets.compare_digest(login_id,LOGIN['id']) or LOGIN['state']!='running':
-        raise HTTPException(404,'Active login session not found')
+    if LOGIN is None or not secrets.compare_digest(login_id,LOGIN['id']):
+        raise HTTPException(404,'Login session not found. Start a new login.')
+    if LOGIN['state']!='running':
+        code=next((e.get('code') for e in reversed(LOGIN['events']) if e.get('type')=='error'),None)
+        raise HTTPException(409,f'Login session already {LOGIN["state"]} ({code or "OAUTH_PROCESS_EXIT"}). Start a new login.')
     if not isinstance(value,str) or not 1<=len(value)<=8192:
         raise HTTPException(422,'Invalid OAuth callback URL or code')
     proc=LOGIN['proc']

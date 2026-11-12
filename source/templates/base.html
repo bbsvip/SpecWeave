@@ -22,9 +22,9 @@
     <div class="side-section-label">WORKSPACE</div>
     <nav class="side-nav" aria-label="Điều hướng chính">
       <a href="/" class="side-link {% if active|default('') == 'dashboard' %}active{% endif %}"><i class="ti ti-layout-dashboard"></i><span>Tổng quan</span></a>
-      <a href="/projects" class="side-link {% if active|default('') == 'projects' %}active{% endif %}"><i class="ti ti-stack-2"></i><span>Tất cả dự án</span></a>
+      <a href="/projects" class="side-link {% if active|default('') == 'projects' %}active{% endif %}" {% if active|default('') == 'projects' %}aria-current="page"{% endif %}><i class="ti ti-stack-2"></i><span>Tất cả dự án</span></a>
     </nav>
-    <nav class="side-nav" aria-label="Thư viện cá nhân"><a href="/presets" class="side-link {% if active|default('') == 'presets' %}active{% endif %}"><i class="ti ti-bookmarks"></i><span>Project Presets</span></a><a href="/projects/trash" class="side-link"><i class="ti ti-trash"></i><span>Thùng rác dự án</span></a></nav>
+    <nav class="side-nav" aria-label="Thư viện cá nhân"><a href="/presets" class="side-link {% if active|default('') == 'presets' %}active{% endif %}"><i class="ti ti-bookmarks"></i><span>Project Presets</span></a><a href="/projects/trash" class="side-link {% if active|default('') == 'project_trash' %}active{% endif %}" {% if active|default('') == 'project_trash' %}aria-current="page"{% endif %}><i class="ti ti-trash"></i><span>Thùng rác dự án</span></a></nav>
     {% if pr is defined and pr %}
     <div class="side-project"><div class="side-section-label">DỰ ÁN ĐANG MỞ</div><strong title="{{pr.name}}">{{pr.name}}</strong><small>{{pr.stage|replace('_',' ')|title}}</small></div>
     <nav class="side-nav" aria-label="Điều hướng dự án">
@@ -57,7 +57,7 @@
     {% endif %}
     <div class="side-section-label">ACCOUNT</div>
     <nav class="side-nav"><a href="/settings/appearance" class="side-link {% if active|default('') == 'appearance' %}active{% endif %}"><i class="ti ti-palette"></i><span>Appearance</span></a><a href="/profile" class="side-link"><i class="ti ti-user"></i><span>Account & Sessions</span></a></nav>
-    <div class="sidebar-bottom"><span class="dot-online"></span> Self-hosted · Project isolated <small>v0.8.0</small></div>
+    <div class="sidebar-bottom"><span class="dot-online"></span> Self-hosted · Project isolated <small>v0.9.4</small></div>
   </aside>
   <div class="main-column">
     <header class="app-topbar">

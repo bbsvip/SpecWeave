@@ -123,3 +123,15 @@
 @media(max-width:850px){.timeline-grid,.artifact-grid{grid-template-columns:1fr}.trace-node-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:500px){.trace-node-grid{grid-template-columns:1fr}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition-duration:0.01ms!important;animation-duration:0.01ms!important}}
+
+/* v0.9.4: structured JSON display / readable project profile. */
+.profile-lines .profile-field{display:grid;grid-template-columns:minmax(120px,34%) minmax(0,1fr);gap:14px;align-items:start;padding:13px 0;border-bottom:1px solid var(--sw-line)}
+.profile-field .profile-label{color:var(--sw-muted);font-size:12px;text-transform:capitalize}
+.profile-field .profile-value{min-width:0;word-break:break-word;font-size:12px}
+.profile-chips{display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-start}
+.profile-chip{background:var(--sw-canvas);border:1px solid var(--sw-line);color:var(--sw-ink);padding:4px 9px;border-radius:7px;display:inline-block}
+.profile-text{white-space:pre-wrap;overflow-wrap:anywhere}
+.json-details{max-width:100%;min-width:0}
+.json-details summary{cursor:pointer;color:var(--sw-accent);font-weight:650;font-size:12px;white-space:normal}
+.pretty-json{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px;line-height:1.5;white-space:pre;overflow:auto;max-width:100%;max-height:360px;padding:12px;border-radius:9px;background:var(--sw-canvas);border:1px solid var(--sw-line);color:var(--sw-ink);margin-top:8px;text-align:left}
+@media(max-width:600px){.profile-lines .profile-field{grid-template-columns:1fr;gap:8px}.pretty-json{max-height:300px}}

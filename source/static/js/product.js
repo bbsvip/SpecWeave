@@ -26,6 +26,10 @@
   }
   if($('presetCreate')){
     const name=$('presetName'), data=$('presetProfile');
+    $('formatPresetJson')?.addEventListener('click',()=>{
+      try{data.value=JSON.stringify(JSON.parse(data.value),null,2);sw.toast('Đã định dạng JSON','success')}
+      catch(e){sw.toast('JSON không hợp lệ: '+e.message,'error')}
+    });
     let selected=null;
     $('presetCreate').addEventListener('click',()=>act(async()=>{
       let profile;try{profile=JSON.parse(data.value)}catch{throw Error('JSON không hợp lệ')}

@@ -3,7 +3,29 @@
 <div class="page-heading"><div><div class="eyebrow">PROJECT OVERVIEW <span class="status-chip ms-2">{{pr.stage|replace('_',' ')}}</span></div><h1>{{pr.name}}</h1><p>{{pr.description or 'Cùng AI làm rõ bài toán, mục tiêu và phương án triển khai.'}}</p></div><a class="btn btn-primary" href="/projects/{{pr.id}}/discussion"><i class="ti ti-messages"></i> Thảo luận với AI</a></div>
 <div class="project-progress-card"><div><div class="eyebrow">PLANNING JOURNEY</div><h3>Mỗi quyết định đều có căn cứ</h3><p>Chọn giai đoạn để xem phần việc cần hoàn thiện.</p></div><div class="stage-track">{% for item in stages %}<span class="stage-node {% if item == pr.stage %}current{% endif %} {% if stages.index(item) < stages.index(pr.stage) %}passed{% endif %}">{{loop.index}}<small>{{item|replace('_',' ')}}</small></span>{% endfor %}</div></div>
 <div class="overview-grid">
-<div class="content-card"><div class="card-heading"><h3><i class="ti ti-target-arrow"></i> Hồ sơ dự án</h3><a href="/projects/{{pr.id}}/settings">Chỉnh sửa</a></div><div class="profile-lines">{% for key,value in (pr.profile or {}).items() %}{% if value %}<div><span>{{key|replace('_',' ')|title}}</span><strong>{% if value is string %}{{value[:200]}}{% else %}{{value|join(', ') if value is sequence and value is not mapping else value|string|truncate(130)}}{% endif %}</strong></div>{% endif %}{% endfor %}{% if not pr.profile %}<p class="text-secondary">Chưa có thông tin.</p>{% endif %}</div></div>
+<div class="content-card"><div class="card-heading"><h3><i class="ti ti-target-arrow"></i> Hồ sơ dự án</h3><a href="/projects/{{pr.id}}/settings">Chỉnh sửa</a></div><div class="profile-lines">
+{% for key,value in (pr.profile or {}).items() %}
+  {% if value is not none and value != '' and value != [] and value != {} %}
+  <div class="profile-field">
+    <span class="profile-label">{{key|replace('_',' ')|title}}</span>
+    <div class="profile-value">
+    {% if value is mapping %}
+      <details class="json-details"><summary>Xem cấu hình JSON</summary><pre class="pretty-json">{{value|pretty_json}}</pre></details>
+    {% elif value is sequence and value is not string %}
+      <div class="profile-chips">{% for item in value %}
+        {% if item is mapping or (item is sequence and item is not string) %}
+          <details class="json-details"><summary>Mục {{loop.index}}</summary><pre class="pretty-json">{{item|pretty_json}}</pre></details>
+        {% else %}<span class="profile-chip">{{item}}</span>{% endif %}
+      {% endfor %}</div>
+    {% elif value is sameas true %}<span class="profile-chip">Có</span>
+    {% elif value is sameas false %}<span class="profile-chip">Không</span>
+    {% else %}<span class="profile-text">{{value}}</span>{% endif %}
+    </div>
+  </div>
+  {% endif %}
+{% endfor %}
+{% if not pr.profile %}<p class="text-secondary">Chưa có thông tin.</p>{% endif %}
+</div></div>
 <div class="content-card"><div class="card-heading"><h3><i class="ti ti-compass"></i> Điểm bắt đầu</h3></div><div class="quick-actions"><a href="/projects/{{pr.id}}/discussion"><i class="ti ti-messages"></i><div><strong>Khám phá cùng AI</strong><small>Phỏng vấn, so sánh phương án và lập kế hoạch.</small></div><i class="ti ti-chevron-right"></i></a><a href="/projects/{{pr.id}}/files"><i class="ti ti-cloud-upload"></i><div><strong>Thêm dữ liệu đầu vào</strong><small>Đưa tài liệu, yêu cầu và tài nguyên vào dự án.</small></div><i class="ti ti-chevron-right"></i></a><a href="/projects/{{pr.id}}/intelligence"><i class="ti ti-chart-dots-3"></i><div><strong>Planning Intelligence</strong><small>{{readiness.blockers}} blockers · {{readiness.warnings}} warnings cần review trước khi handoff.</small></div><i class="ti ti-chevron-right"></i></a><a href="/projects/{{pr.id}}/artifacts"><i class="ti ti-file-description"></i><div><strong>BMAD Draft Generator</strong><small>Sinh bộ tài liệu có nguồn và đánh dấu giả định, sau đó review trong Studio.</small></div><i class="ti ti-chevron-right"></i></a></div></div>
 <div class="content-card"><div class="card-heading"><h3><i class="ti ti-git-branch"></i> Quyết định gần đây</h3><a href="/projects/{{pr.id}}/decisions">Xem tất cả</a></div>{% if decisions %}<div class="item-list">{% for d in decisions %}<div class="item-line"><div><strong>{{d.title}}</strong><small>{{d.created_at|date_short}}</small></div><span class="status-chip {{'good' if d.status == 'approved' else ''}}">{{d.status}}</span></div>{% endfor %}</div>{% else %}<p class="text-secondary">Chưa có quyết định. AI có thể đề xuất phương án trong buổi thảo luận.</p>{% endif %}</div>
 <div class="content-card"><div class="card-heading"><h3><i class="ti ti-file-text"></i> Tài liệu</h3><a href="/projects/{{pr.id}}/documents">Mở Studio</a></div>{% if docs %}<div class="item-list">{% for doc in docs %}<a class="item-line" href="/projects/{{pr.id}}/documents?doc={{doc.id}}"><div><strong>{{doc.title}}</strong><small>Revision {{doc.revision}}</small></div><i class="ti ti-chevron-right"></i></a>{% endfor %}</div>{% else %}<p class="text-secondary">Chưa có tài liệu. Có thể tạo thủ công hoặc yêu cầu agent viết draft.</p>{% endif %}</div>

@@ -219,3 +219,19 @@ For `compose.external-db.yaml`, use `docker compose -f compose.external-db.yaml 
 ## v0.9.2 — Fresh PostgreSQL migration fix
 
 Fix an Alembic initialization error on empty PostgreSQL databases (`relation "spec_reviews" does not exist` while creating `review_jobs`). Migration `0001_baseline` now creates only baseline tables; `0002_quality` creates `spec_reviews`, and `0003_review_jobs` creates `review_jobs` after its referenced table exists. No changes to application data or provider/OAuth configuration. See `docs/MIGRATION_FIX.v0.9.2.vi.md`.
+
+
+## v0.9.4 — OAuth diagnostics, Fernet startup validation, UI fixes
+
+- `ENCRYPTION_KEY` must be a **32-byte random Fernet key encoded with URL-safe Base64**. Generate locally (do not share or commit it):
+
+  ```bash
+  python3 -c 'import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())'
+  ```
+
+- The app now validates `ENCRYPTION_KEY` during startup (and the container entrypoint validates before Alembic migration) instead of allowing a later HTTP 500 on provider creation. **Never rotate an existing encryption key without a secret-re-encryption procedure.**
+- OpenAI OAuth UI now exposes safe diagnostic codes (`OAUTH_MODULE_ERROR`, `OAUTH_NETWORK`, `OAUTH_VAULT_PERMISSION`, `OAUTH_REJECTED` etc.). On a terminal login, `/answer` returns HTTP 409 with a code instead of a misleading 404. Credential values/authorization callback URLs are not logged. OAuth success is still subject to supported Pi version and a real account on the deployment host.
+- On the **Thùng rác dự án** page, sidebar active state now highlights Thùng rác instead of Tất cả dự án. Project profile nested data and admin audit metadata show readable pretty JSON. The File Manager automatically formats `.json` in its editor (in-memory only, until Save), plus a Format JSON button; presets also have a formatter.
+- **Cloudflare Tunnel + `COOKIE_SECURE=true`** remains supported when using HTTPS. This setting is unrelated to Fernet/OAuth subprocess errors.
+
+If running images from GHCR, push this source to GitHub to publish a new image, then set `SPECWEAVE_IMAGE_TAG` to the published tag and execute `docker compose -f compose.external-db.images.yaml --profile pi pull && docker compose -f compose.external-db.images.yaml --profile pi up -d --no-build`. If using local build, run `docker compose -f compose.external-db.yaml --profile pi up -d --build`. Preserve `.env` and existing volumes.

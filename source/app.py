@@ -28,7 +28,7 @@ from db import (get_db, init_db, SessionLocal, utcnow, User, AuthSession, Projec
                 ProjectGoal, TraceLink, PlanPhase, PhaseDependency, PhaseReview,
                 SpecReview, ReviewFinding, EvidenceAssessment, TraceSuggestion, WorkflowCheckpoint, ReviewJob, LoginAttempt)
 from security import (hash_password, verify_password, new_session, current_auth, require_auth,
-                      check_csrf, encrypt, decrypt, SESSION_COOKIE)
+                      check_csrf, encrypt, decrypt, validate_encryption_key, SESSION_COOKIE)
 from storage import (DATA_ROOT, PROJECTS_ROOT, project_root, resolve, init_project, list_entries,
                      read_text, write_text, remove, move, atomic_text, project_usage, enforce_project_quota, storage_limits)
 from ai import compatible_stream, pi_stream, tool_call, pi_tool_token, TOOLS, ROLES, MODES, plan_prompt, api_endpoint
@@ -47,15 +47,17 @@ from chat_coordination import discussion_lease, ChatBusy, cancellation_requested
 BASE = Path(__file__).parent
 @asynccontextmanager
 async def lifespan(_app):
+    validate_encryption_key()
     DATA_ROOT.mkdir(parents=True,exist_ok=True)
     PROJECTS_ROOT.mkdir(parents=True,exist_ok=True)
     init_db()
     yield
 
-app = FastAPI(title="SpecWeave", version="0.9.0", docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(title="SpecWeave", version="0.9.4", docs_url=None, redoc_url=None, lifespan=lifespan)
 app.mount("/static",StaticFiles(directory=BASE / "static"),name="static")
 templates = Jinja2Templates(directory=BASE / "templates")
 templates.env.filters["date_short"] = lambda d: d.strftime("%d/%m/%Y %H:%M") if d else "—"
+templates.env.filters["pretty_json"] = lambda v: json.dumps(v, indent=2, ensure_ascii=False, default=str)
 STAGES = ["discovery","requirements","solution_design","ux_design","spec_review","approved"]
 ROLE_LABELS = {"analyst":"Analyst","pm":"Product Manager","architect":"Architect","ux":"UX Designer","reviewer":"Critical Reviewer","planner":"Planning"}
 
@@ -280,7 +282,7 @@ def projects_trash_page(request:Request,db:Session=Depends(get_db)):
     u,s,redirect=auth_page(request,db)
     if redirect:return redirect
     trashed=db.query(Project).filter_by(owner_id=u.id,status='deleted').order_by(Project.updated_at.desc()).all()
-    return page(request,'projects_trash.html',db=db,user=u,session=s,trashed=trashed,active='projects')
+    return page(request,'projects_trash.html',db=db,user=u,session=s,trashed=trashed,active='project_trash')
 
 
 @app.get("/projects/{pid}",response_class=HTMLResponse)

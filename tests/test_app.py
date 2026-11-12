@@ -1503,7 +1503,8 @@ def test_openai_oauth_event_whitelist_and_redaction():
     valid=runtime.safe_event({'type':'auth_url','url':'https://auth.openai.com/oauth/authorize?state=abc','access_token':'HIDDEN'})
     assert valid['type']=='auth_url' and 'access_token' not in valid
     assert runtime.safe_event({'type':'error','message':'secret token abc'})=={
-        'type':'error','message':'OpenAI login failed; check local Pi logs'}
+        'type':'error','code':'OAUTH_RUNTIME_FAILURE',
+        'message':runtime.ERROR_DESCRIPTIONS['OAUTH_RUNTIME_FAILURE']}
 
 
 @pytest.mark.asyncio
