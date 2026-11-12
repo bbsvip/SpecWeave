@@ -1,38 +1,237 @@
+/* SpecWeave Conversation Workspace — stream-first, project-scoped interactive planning. */
 (() => {
-  const root=document.getElementById('discussionApp');if(!root)return;
-  const pid=root.dataset.project,did=root.dataset.discussion,list=document.getElementById('messageList');
-  const input=document.getElementById('chatInput'),send=document.getElementById('sendChat'),stop=document.getElementById('stopChat');
+  'use strict';
+  const root=document.getElementById('discussionApp'); if(!root)return;
+  const pid=root.dataset.project, did=root.dataset.discussion;
+  const list=document.getElementById('messageList'),input=document.getElementById('chatInput');
+  const send=document.getElementById('sendChat'),stop=document.getElementById('stopChat');
   const state=document.getElementById('agentState'),activity=document.getElementById('toolActivity');
-  let controller=null,runId=null;
+  const suggestButton=document.getElementById('suggestPlanningQuestion');
+  const questionSlot=document.getElementById('planningQuestion');
+  const headerUsage=document.getElementById('sessionUsage');
+  const autoNext=document.getElementById('autoNextPlanning');
+  let controller=null,runId=null,openQuestion=null,selectedIds=new Set();
+  let streamingTimer=null,mermaidLibrary=null,mermaidCounter=0;
+  const make=(tag,cls='',txt)=>{const node=document.createElement(tag);if(cls)node.className=cls;if(txt!==undefined)node.textContent=txt;return node;};
+  function followIfNearBottom(force=false){
+    if(force||list.scrollHeight-list.scrollTop-list.clientHeight<170)list.scrollTop=list.scrollHeight;
+  }
+  function formatNumber(n){return typeof n==='number'?new Intl.NumberFormat('vi-VN').format(n):'—';}
   function renderMarkdown(node,content){
-    if(window.marked && window.DOMPurify){node.innerHTML=DOMPurify.sanitize(marked.parse(content,{breaks:true}));
-      node.querySelectorAll('a').forEach(a=>{a.target='_blank';a.rel='noopener noreferrer'});
+    if(window.marked&&window.DOMPurify){
+      node.innerHTML=DOMPurify.sanitize(marked.parse(content,{breaks:true}),{USE_PROFILES:{html:true}});
+      node.querySelectorAll('a').forEach(a=>{a.target='_blank';a.rel='noopener noreferrer';});
+      // ThinkRail-like inline visual artifacts: render Mermaid only when opened.
+      // Source text remains visible without CDN access. Strict mode forbids diagram HTML.
+      node.querySelectorAll('pre code.language-mermaid').forEach(code=>{
+        const pre=code.closest('pre');if(!pre||pre.parentElement?.classList.contains('mermaid-preview'))return;
+        const source=code.textContent||'';
+        const frame=make('details','mermaid-preview');
+        const summary=make('summary','','Sơ đồ · xem trực quan / nguồn Mermaid');
+        const diagram=make('div','mermaid-render');
+        pre.replaceWith(frame);frame.append(summary,diagram,pre);
+        frame.addEventListener('toggle',async()=>{
+          if(!frame.open||frame.dataset.rendered)return;
+          frame.dataset.rendered='loading';diagram.textContent='Đang render Mermaid…';
+          try{
+            if(!mermaidLibrary){
+              mermaidLibrary=import('https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs').then(m=>m.default);
+            }
+            const mermaid=await mermaidLibrary;
+            mermaid.initialize({startOnLoad:false,securityLevel:'strict',theme:'neutral'});
+            const id='sw-mermaid-'+(++mermaidCounter);
+            const {svg}=await mermaid.render(id,source);
+            diagram.innerHTML=DOMPurify.sanitize(svg,{USE_PROFILES:{svg:true,svgFilters:true}});
+            frame.dataset.rendered='done';
+          }catch(e){diagram.textContent='Không render được sơ đồ; mã Mermaid vẫn có sẵn bên dưới.';frame.dataset.rendered='error';}
+        });
+      });
+      node.querySelectorAll('pre').forEach(pre=>{
+        const b=make('button','code-copy','Sao chép');b.type='button';
+        b.addEventListener('click',()=>navigator.clipboard?.writeText(pre.querySelector('code')?.textContent||pre.textContent||'').then(()=>{b.textContent='Đã sao chép';}));
+        pre.append(b);
+      });
     }else node.textContent=content;
   }
   list.querySelectorAll('.markdown-content').forEach(node=>renderMarkdown(node,node.textContent));
   function addMessage(who,text=''){
+    const shouldFollow=list.scrollHeight-list.scrollTop-list.clientHeight<170;
     list.querySelector('.conversation-intro')?.remove();
-    const article=document.createElement('article');article.className='message '+(who==='user'?'message-user':'message-agent');
-    const avatar=document.createElement('div');avatar.className='message-avatar';
-    avatar.textContent=who==='user'?'U':'✦';
-    const body=document.createElement('div');body.className='message-body';
-    const meta=document.createElement('div');meta.className='message-meta';meta.textContent=who==='user'?'Anh':'SpecWeave AI';
-    const content=document.createElement('div');content.className='message-content'+(who==='assistant'?' markdown-content':'');content.textContent=text;
-    body.append(meta,content);article.append(avatar,body);list.appendChild(article);list.scrollTop=list.scrollHeight;
-    return content;
+    const article=make('article','message '+(who==='user'?'message-user':'message-agent'));
+    const avatar=make('div','message-avatar',who==='user'?'U':'✦');
+    const body=make('div','message-body');
+    const meta=make('div','message-meta',who==='user'?'Anh':'SpecWeave AI');
+    const content=make('div','message-content'+(who==='assistant'?' markdown-content':''),text);
+    body.append(meta,content);article.append(avatar,body);
+    // Keep pending decision brief at the bottom of the conversation timeline.
+    if(questionSlot&&questionSlot.parentElement===list)list.insertBefore(article,questionSlot);
+    else list.append(article);
+    if(shouldFollow)followIfNearBottom(true);
+    return {article,body,content};
   }
-  const questionSlot=document.getElementById('planningQuestion');
-  const suggestButton=document.getElementById('suggestPlanningQuestion');
-  let openQuestion=null, selectedIds=new Set();
-  const make=(tag, cls, txt)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(txt!==undefined)e.textContent=txt;return e;};
-  const actionButton=(caption, style, callback)=>{
-    const b=make('button','btn btn-sm '+style,caption);b.type='button';b.addEventListener('click',callback);return b;
-  };
+  function buildTurnActivity(turn){
+    const details=make('details','turn-activity');
+    const summary=make('summary','','Đang kết nối…');
+    const inner=make('div','turn-activity-body');
+    const timeline=make('div','turn-timeline');
+    const metrics=make('div','turn-metrics','Usage: chưa được cung cấp');
+    inner.append(timeline,metrics);details.append(summary,inner);turn.body.append(details);
+    return {details,summary,timeline,metrics};
+  }
+  const actionButton=(label,cls,cb)=>{const b=make('button','btn btn-sm '+cls,label);b.type='button';b.addEventListener('click',cb);return b;};
+  function setBusy(active,label){
+    send.disabled=active;input.disabled=active;
+    stop.classList.toggle('d-none',!active);
+    state.textContent=label||(active?'Đang trả lời…':'Ready');
+    root.classList.toggle('chat-busy',active);
+    suggestButton&&(suggestButton.disabled=active);
+  }
+  function describeUsage(usage,first,elapsed,contextWindow){
+    const parts=[];
+    if(typeof usage.input_tokens==='number')parts.push('Input '+formatNumber(usage.input_tokens));
+    if(typeof usage.output_tokens==='number')parts.push('Output '+formatNumber(usage.output_tokens));
+    if(typeof usage.cache_read_tokens==='number')parts.push('Cache read '+formatNumber(usage.cache_read_tokens));
+    if(typeof usage.cache_write_tokens==='number')parts.push('Cache write '+formatNumber(usage.cache_write_tokens));
+    if(typeof usage.cost_usd==='number')parts.push('$'+usage.cost_usd.toFixed(5));
+    if(typeof usage.input_tokens==='number'&&contextWindow>0){
+      parts.push('Context '+(100*usage.input_tokens/contextWindow).toFixed(1)+'%');
+    }
+    if(typeof first==='number')parts.push('TTFT '+(first/1000).toFixed(2)+'s');
+    if(typeof elapsed==='number')parts.push('Thời gian '+(elapsed/1000).toFixed(1)+'s');
+    return parts.length?parts.join(' · '):'Usage: provider chưa cung cấp';
+  }
+  function addTimeline(timeline,type,text){
+    const row=make('div','activity-line');
+    row.append(make('span','activity-dot '+type),make('span','',text));
+    timeline.append(row);if(timeline.children.length>32)timeline.firstChild.remove();
+  }
+  async function readSSE(response,onFrame){
+    if(!response.body)throw new Error('Server không trả về SSE stream');
+    const reader=response.body.getReader(),decoder=new TextDecoder();
+    const parser=window.SpecWeaveSSE.createParser(onFrame);
+    try{
+      for(;;){
+        const {done,value}=await reader.read();if(done)break;
+        parser.push(decoder.decode(value,{stream:true}));
+      }
+      parser.push(decoder.decode());parser.finish();
+    }finally{reader.releaseLock();}
+  }
+  async function talk({continueQuestionId=null}={}){
+    if(controller||!did)return false;
+    const message=continueQuestionId?'':input.value.trim();
+    if(!continueQuestionId&&!message)return false;
+    if(message){input.value='';input.style.height='auto';addMessage('user',message);}
+    const turn=addMessage('assistant','');const panel=buildTurnActivity(turn);
+    const role=sw.val('agentRole'),mode=sw.val('agentMode');
+    let full='',usage={},contextWindow=0,firstTokenMs=null,elapsedMs=0,completed=false,hadError=false;
+    const started=performance.now();let renderScheduled=false,renderHandle=null;
+    const scheduleRender=()=>{
+      if(renderScheduled)return;renderScheduled=true;
+      renderHandle=setTimeout(()=>{renderScheduled=false;renderHandle=null;renderMarkdown(turn.content,full);followIfNearBottom();},95);
+    };
+    const flushRender=()=>{
+      if(renderHandle!==null)clearTimeout(renderHandle);
+      renderScheduled=false;renderHandle=null;
+      renderMarkdown(turn.content,full||'(Không có nội dung)');
+    };
+    runId=null;controller=new AbortController();setBusy(true,'Đang kết nối…');
+    headerUsage&&(headerUsage.textContent='Đang kết nối…');
+    addTimeline(panel.timeline,'status','Kết nối tới agent');
+    streamingTimer=setInterval(()=>{
+      if(!controller)return;
+      elapsedMs=performance.now()-started;
+      panel.metrics.textContent=describeUsage(usage,firstTokenMs,elapsedMs,contextWindow);
+      if(headerUsage)headerUsage.textContent=panel.metrics.textContent;
+    },350);
+    try{
+      const response=await fetch(`/api/projects/${pid}/chat`,{
+        method:'POST',credentials:'same-origin',
+        headers:{'Content-Type':'application/json','X-CSRF-Token':sw.csrf},
+        body:JSON.stringify({discussion_id:did,message,role,mode,...(continueQuestionId?{continue_question_id:continueQuestionId}:{})}),
+        signal:controller.signal,
+      });
+      if(!response.ok){const payload=await response.json().catch(()=>({}));throw new Error(payload.detail||payload.message||`HTTP ${response.status}`);}
+      const handleFrame=(ev)=>{
+        if(ev.run_id)runId=ev.run_id;
+        const p=ev.payload||{};
+        if(ev.type==='start'){
+          contextWindow=Number(p.context_window)||0;
+          const message=`${p.model||'Agent'} · ${p.backend||'model'}`;
+          panel.summary.textContent=message+' · Đang chạy';
+          addTimeline(panel.timeline,'status','Bắt đầu: '+message);
+          setBusy(true,'Đang phân tích…');
+        }else if(ev.type==='status'){
+          const message=String(p.message||'Đang xử lý…');
+          setBusy(true,message);
+          addTimeline(panel.timeline,'status',message);
+        }else if(ev.type==='delta'){
+          if(!firstTokenMs)firstTokenMs=Math.round(performance.now()-started);
+          full+=String(p.text||'');scheduleRender();
+          setBusy(true,'Đang trả lời…');
+        }else if(ev.type==='timing'){
+          if(typeof p.first_token_ms==='number')firstTokenMs=p.first_token_ms;
+        }else if(ev.type==='tool'){
+          const name=String(p.name||'tool').slice(0,90);
+          const toolStatus=p.status==='complete'?'✓ Hoàn tất':'Đang chạy';
+          addTimeline(panel.timeline,'tool',name+' · '+toolStatus);
+          if(activity.textContent==='Chưa có tool call')activity.replaceChildren();
+          const row=make('div','tool-item',name+' · '+toolStatus);activity.prepend(row);
+          if(activity.children.length>15)activity.lastElementChild?.remove();
+        }else if(ev.type==='usage'){
+          usage={...usage,...p};
+          panel.metrics.textContent=describeUsage(usage,firstTokenMs,elapsedMs,contextWindow);
+          if(headerUsage)headerUsage.textContent=panel.metrics.textContent;
+        }else if(ev.type==='final'&&typeof p.text==='string'){
+          full=p.text;scheduleRender();
+        }else if(ev.type==='done'){
+          completed=true;elapsedMs=typeof p.duration_ms==='number'?p.duration_ms:performance.now()-started;
+          if(typeof p.first_token_ms==='number')firstTokenMs=p.first_token_ms;
+          usage={...usage,...(p.usage||{})};
+          panel.summary.textContent='Hoàn thành · '+(elapsedMs/1000).toFixed(1)+'s';
+          addTimeline(panel.timeline,'status','Hoàn thành');
+        }else if(ev.type==='error'){
+          hadError=true;
+          throw new Error(ev.message||p.message||'Agent error');
+        }
+      };
+      await readSSE(response,handleFrame);
+      if(!completed)throw new Error('Kết nối bị ngắt trước khi có sự kiện hoàn thành');
+      flushRender();
+      panel.metrics.textContent=describeUsage(usage,firstTokenMs,elapsedMs,contextWindow);
+      if(headerUsage)headerUsage.textContent=panel.metrics.textContent;
+      await refreshPlanningQuestion();
+      // Discovery is an ongoing interview. Once the answer has been discussed,
+      // propose the next decision if a tool has not already created one.
+      if(continueQuestionId&&autoNext?.checked&&!openQuestion){
+        try{await requestNextQuestion();}catch(e){sw.toast('AI đã phản hồi, nhưng chưa tạo được câu hỏi kế tiếp: '+e.message,'info');}
+      }
+      return true;
+    }catch(error){
+      if(error.name==='AbortError'){
+        if(full)flushRender();
+        panel.summary.textContent='Đã dừng';
+        addTimeline(panel.timeline,'status','Người dùng dừng phản hồi');
+      }else{
+        if(full)flushRender();
+        panel.summary.textContent='Không hoàn thành';
+        const msg=String(error.message||error).slice(0,400);
+        addTimeline(panel.timeline,'error',msg);
+        turn.content.append(make('p','turn-error','Lỗi: '+msg));
+        sw.toast(msg,'error');
+      }
+      return false;
+    }finally{
+      if(streamingTimer){clearInterval(streamingTimer);streamingTimer=null;}
+      if(renderHandle!==null)clearTimeout(renderHandle);
+      controller=null;runId=null;setBusy(false);followIfNearBottom();input.focus();
+    }
+  }
   function renderPlanningQuestion(q){
     questionSlot.replaceChildren();questionSlot.hidden=!q;openQuestion=q;selectedIds=new Set();
     if(!q)return;
     const panel=make('div','planning-brief');questionSlot.append(panel);
-    panel.append(make('div','planning-header','✦  GỢI Ý QUYẾT ĐỊNH · CHƯA PHÊ DUYỆT'));
+    panel.append(make('div','planning-header','✦  CẦN ANH XÁC NHẬN · CHƯA PHÊ DUYỆT'));
     panel.append(make('h3','',q.question));
     if(q.context)panel.append(make('p','planning-description',q.context));
     const optHolder=make('div','planning-options');panel.append(optHolder);
@@ -40,9 +239,9 @@
     for(const opt of q.options){
       const row=make('button','planning-option');row.type='button';row.setAttribute('aria-pressed','false');
       row.append(make('span','planning-check',q.allow_multiple?'□':'○'));
-      const body=make('div');
-      const title=make('div','planning-option-title');title.append(make('span','',opt.label));
-      if(opt.id===q.recommended_id)title.append(make('span','planning-recommended','Đề xuất'));
+      const body=make('div');const title=make('div','planning-option-title');
+      title.append(make('span','',opt.label));
+      if(opt.id===q.recommended_id)title.append(make('span','planning-recommended','AI đề xuất'));
       body.append(title);
       if(opt.description)body.append(make('div','planning-option-copy',opt.description));
       const trade=make('div','planning-tradeoffs');
@@ -50,31 +249,34 @@
       if(opt.cons)trade.append(make('div','down','− '+opt.cons));
       body.append(trade);row.append(body);optHolder.append(row);
       row.addEventListener('click',()=>{
+        if(controller)return;
         if(!q.allow_multiple)selectedIds.clear();
         if(row.classList.contains('selected')&&q.allow_multiple)selectedIds.delete(opt.id);
         else selectedIds.add(opt.id);
-        for(const v of optionNodes){const on=selectedIds.has(v.opt.id);v.node.classList.toggle('selected',on);v.node.setAttribute('aria-pressed',String(on));v.node.querySelector('.planning-check').textContent=on?'✓':q.allow_multiple?'□':'○'}
+        for(const item of optionNodes){
+          const on=selectedIds.has(item.opt.id);item.node.classList.toggle('selected',on);
+          item.node.setAttribute('aria-pressed',String(on));
+          item.node.querySelector('.planning-check').textContent=on?'✓':q.allow_multiple?'□':'○';
+        }
       });
       optionNodes.push({node:row,opt});
     }
-    if(q.recommendation_reason){
-      const why=make('div','planning-reason');why.append(make('strong','','Vì sao AI đề xuất: '),document.createTextNode(q.recommendation_reason));panel.append(why);
-    }
-    if(q.impact)panel.append(make('div','planning-extras','Tác động cần cân nhắc: '+q.impact));
-    if(q.assumptions?.length)panel.append(make('div','planning-extras','Giả định chưa xác minh: '+q.assumptions.join('; ')));
+    if(q.recommendation_reason){const why=make('div','planning-reason');why.append(make('strong','','Vì sao AI đề xuất: '),document.createTextNode(q.recommendation_reason));panel.append(why);}
+    if(q.impact)panel.append(make('div','planning-extras','Tác động: '+q.impact));
+    if(q.assumptions?.length)panel.append(make('div','planning-extras','Giả định: '+q.assumptions.join('; ')));
     if(q.sources?.length){
-      const sources=make('div','planning-extras');sources.append(make('strong','','Nguồn nghiên cứu của dự án: '));
+      const sources=make('div','planning-extras');sources.append(make('strong','','Nguồn tham khảo: '));
       for(const src of q.sources){
         if(!/^https?:\/\//i.test(src.url))continue;
-        const a=make('a','planning-source',src.title||src.url);a.href=src.url;a.target='_blank';a.rel='noopener noreferrer';
-        sources.append(a);
+        const link=make('a','planning-source',src.title||src.url);link.href=src.url;link.target='_blank';link.rel='noopener noreferrer';sources.append(link);
       }
       panel.append(sources);
     }
-    const custom=make('textarea','planning-custom');custom.placeholder='Câu trả lời riêng, hoặc điều chỉnh phương án đã chọn (không bắt buộc)...';custom.setAttribute('aria-label','Điều chỉnh câu trả lời');panel.append(custom);
-    const notes=make('input','planning-custom');notes.style.minHeight='38px';notes.placeholder='Ghi chú bổ sung về quyết định (tùy chọn)';notes.setAttribute('aria-label','Ghi chú');panel.append(notes);
+    const custom=make('textarea','planning-custom');custom.placeholder='Điều chỉnh hoặc nhập câu trả lời riêng…';panel.append(custom);
+    const notes=make('input','planning-custom');notes.style.minHeight='38px';notes.placeholder='Ghi chú bổ sung (tùy chọn)';panel.append(notes);
     const actions=make('div','planning-actions');panel.append(actions);
     async function submit(action){
+      if(controller)return;
       panel.classList.add('planning-loading');
       try{
         const res=await sw.api(`/api/projects/${pid}/planning/questions/${q.id}/answer`,{
@@ -82,89 +284,63 @@
         });
         if(action==='answer'){
           const labels=q.options.filter(o=>selectedIds.has(o.id)).map(o=>o.label);
-          addMessage('user','Tôi chọn: '+(labels.join(', ')||custom.value)+(labels.length&&custom.value?'\nĐiều chỉnh: '+custom.value:'')+(notes.value?'\nGhi chú: '+notes.value:''));
-          sw.toast('Đã lưu câu trả lời. Có thể yêu cầu AI tiếp tục phân tích.','success');
-        }else sw.toast('Đã hoãn câu hỏi này.','info');
-        renderPlanningQuestion(null);
+          const reply='[TRẢ LỜI CÂU HỎI LẬP KẾ HOẠCH]\nCâu hỏi: '+q.question+'\nTôi chọn: '+(labels.join(', ')||custom.value)+(labels.length&&custom.value?'\nĐiều chỉnh: '+custom.value:'')+(notes.value?'\nGhi chú: '+notes.value:'');
+          renderPlanningQuestion(null);
+          addMessage('user',reply);
+          sw.toast('Đã lưu câu trả lời, AI đang tiếp tục thảo luận…','success');
+          const ok=await talk({continueQuestionId:q.id});
+          if(!ok){input.value='Hãy tiếp tục phân tích dựa trên câu trả lời lập kế hoạch tôi vừa xác nhận.';}
+        }else{
+          renderPlanningQuestion(null);sw.toast('Đã hoãn câu hỏi này.','info');
+        }
       }catch(e){sw.toast(e.message,'error');panel.classList.remove('planning-loading');}
     }
-    actions.append(actionButton('Xác nhận câu trả lời','btn-primary',()=>submit('answer')));
+    actions.append(actionButton('Xác nhận & tiếp tục với AI','btn-primary',()=>submit('answer')));
     actions.append(actionButton('Thảo luận thêm','btn-outline-primary',()=>{
-      input.value=`Hãy phân tích sâu quyết định: ${q.question}\nLý do và rủi ro của phương án ${q.options.find(o=>o.id===q.recommended_id)?.label||'đề xuất'} là gì? Tôi chưa chốt phương án.`;
+      input.value=`Hãy phân tích sâu câu hỏi: ${q.question}\nPhản biện phương án ${q.options.find(o=>o.id===q.recommended_id)?.label||'đề xuất'} và các rủi ro. Tôi chưa chốt phương án.`;
       input.focus();
     }));
     actions.append(actionButton('Tạm hoãn','btn-outline-secondary',()=>submit('defer')));
+    followIfNearBottom(true);
   }
   async function refreshPlanningQuestion(){
     if(!did)return;
     try{
       const data=await sw.api(`/api/projects/${pid}/planning/questions?discussion_id=${encodeURIComponent(did)}`,{},'GET');
       renderPlanningQuestion(data.pending);
-    }catch(e){console.warn('Planning question unavailable:',e.message)}
+    }catch(e){console.warn('Planning question unavailable:',e.message);}
   }
-  suggestButton?.addEventListener('click',async()=>{
-    if(!did||controller)return;
-    suggestButton.disabled=true;suggestButton.textContent='AI đang đề xuất...';
+  async function requestNextQuestion(){
+    if(!did||controller&&controller.signal.aborted)return;
+    if(suggestButton){suggestButton.disabled=true;suggestButton.textContent='Đang tạo phương án…';}
     try{
       const data=await sw.api(`/api/projects/${pid}/planning/questions/suggest`,{discussion_id:did});
       renderPlanningQuestion(data.question);
-      if(data.created)sw.toast('Đã tạo câu hỏi với các phương án đề xuất.','success');
-    }catch(e){sw.toast(e.message,'error')}
-    finally{suggestButton.disabled=false;suggestButton.textContent='AI đề xuất'}
-  });
-  const busy=(isBusy)=>{send.disabled=isBusy;input.disabled=isBusy;stop.classList.toggle('d-none',!isBusy);state.textContent=isBusy?'Thinking':'Ready'};
-  async function talk(){
-    const message=input.value.trim();if(!message||controller||!did)return;
-    input.value='';input.style.height='auto';addMessage('user',message);const responseNode=addMessage('assistant','');
-    const role=sw.val('agentRole'),mode=sw.val('agentMode');let full='';runId=null;
-    controller=new AbortController();busy(true);
-    try{
-      const response=await fetch(`/api/projects/${pid}/chat`,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':sw.csrf},
-        body:JSON.stringify({discussion_id:did,message,role,mode}),signal:controller.signal});
-      if(!response.ok){const payload=await response.json().catch(()=>({}));throw new Error(payload.message||`HTTP ${response.status}`)}
-      const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='',finished=false;
-      while(!finished){
-        const {done,value}=await reader.read();if(done)break;
-        buffer+=decoder.decode(value,{stream:true}).replaceAll('\r\n','\n');
-        let boundary;while((boundary=buffer.indexOf('\n\n'))>=0){
-          const packet=buffer.slice(0,boundary);buffer=buffer.slice(boundary+2);
-          for(const line of packet.split('\n'))if(line.startsWith('data: ')){
-            let ev;try{ev=JSON.parse(line.slice(6))}catch{continue}
-            if(ev.run_id)runId=ev.run_id;
-            if(ev.type==='delta'){full+=ev.payload?.text||'';responseNode.textContent=full;list.scrollTop=list.scrollHeight}
-            if(ev.type==='status')state.textContent=ev.payload?.message||'Running';
-            if(ev.type==='tool'){
-              if(activity.textContent==='Chưa có tool call')activity.replaceChildren();
-              const line=document.createElement('div');line.className='tool-item';line.textContent=`${ev.payload?.name||'tool'}: ${ev.payload?.status||'running'}`;
-              activity.prepend(line);
-            }
-            if(ev.type==='final' && typeof ev.payload?.text==='string'){full=ev.payload.text;responseNode.textContent=full;}
-            if(ev.type==='error')throw new Error(ev.message||'Agent error');
-            if(ev.type==='done'){finished=true;break}
-          }
-          if(finished)break;
-        }
-      }
-      renderMarkdown(responseNode,full||'(Không có nội dung)');
-      await refreshPlanningQuestion();
-    }catch(e){
-      if(e.name==='AbortError'){responseNode.textContent=full+'\n\n[Đã dừng]' }
-      else{responseNode.textContent=full+'\n\n[Lỗi: '+e.message+']';sw.toast(e.message,'error')}
-    }finally{controller=null;busy(false);list.scrollTop=list.scrollHeight;input.focus();}
+      return data.question;
+    }finally{
+      if(suggestButton){suggestButton.disabled=!!controller;suggestButton.textContent='AI đề xuất';}
+    }
   }
+  suggestButton?.addEventListener('click',async()=>{
+    if(!did||controller)return;
+    try{await requestNextQuestion();}catch(e){sw.toast(e.message,'error');}
+  });
   document.querySelector('[data-plan-suggest]')?.addEventListener('click',()=>suggestButton?.click());
-  send.addEventListener('click',talk);
-  input.addEventListener('keydown',e=>{if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();talk()}});
-  document.querySelectorAll('[data-suggest]').forEach(button=>button.addEventListener('click',()=>{input.value=button.dataset.suggest;input.focus()}));
-  stop.addEventListener('click',async()=>{
-    if(runId)try{await sw.api(`/api/projects/${pid}/runs/${runId}/cancel`)}catch{}
+  send?.addEventListener('click',()=>talk());
+  input?.addEventListener('keydown',e=>{
+    if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();talk();}
+  });
+  input?.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,210)+'px';});
+  document.querySelectorAll('[data-suggest]').forEach(b=>b.addEventListener('click',()=>{input.value=b.dataset.suggest;input.focus();}));
+  stop?.addEventListener('click',async()=>{
+    // Server-side cancellation survives browser disconnects.
+    if(runId)try{await sw.api(`/api/projects/${pid}/runs/${runId}/cancel`);}catch{}
     controller?.abort();
   });
-  document.getElementById('clearContextView').addEventListener('click',()=>list.scrollTop=list.scrollHeight);
+  document.getElementById('clearContextView')?.addEventListener('click',()=>followIfNearBottom(true));
   document.getElementById('newDiscussion')?.addEventListener('click',async()=>{
     const name=prompt('Tên phiên thảo luận:','Phiên thảo luận mới');if(!name)return;
-    await sw.act(async()=>{const data=await sw.api(`/api/projects/${pid}/discussions`,{title:name,mode:'discovery'});location.href=data.redirect},'');
+    await sw.act(async()=>{const data=await sw.api(`/api/projects/${pid}/discussions`,{title:name,mode:'discovery'});location.href=data.redirect;},'');
   });
-  list.scrollTop=list.scrollHeight;
-  refreshPlanningQuestion();
+  list.scrollTop=list.scrollHeight;refreshPlanningQuestion();
 })();

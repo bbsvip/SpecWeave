@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
+from chat_events import normalize_usage, accumulate_usage
 from pydantic import BaseModel, Field
 from openai_oauth_runtime import (require_local, public_status, start_login, poll_login, answer_login, end_login, disconnect, available_models, complete, diagnostics, LOCAL_HOME, AUTH_USE_LOCK)
 
@@ -141,6 +142,7 @@ async def run(data: RunnerRequest, x_runner_key: str = Header(default="")):
                    "SPECWEAVE_TOOL_RUN":data.run_id,"SPECWEAVE_TOOL_TOKEN":data.tool_token}
             proc = None
             collected = []
+            reported_usage={}
             try:
                 proc = await asyncio.create_subprocess_exec(*cmd,cwd=str(root),env=env,
                                   stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,
@@ -155,21 +157,49 @@ async def run(data: RunnerRequest, x_runner_key: str = Header(default="")):
                     try: event = json.loads(raw)
                     except ValueError: continue
                     tp = event.get("type")
+                    if tp in ('agent_start','turn_start'):
+                        status='Agent bắt đầu phân tích…' if tp=='agent_start' else 'Model đang xử lý lượt trả lời…'
+                        yield 'data: '+json.dumps({'type':'status','payload':{'phase':tp,'message':status}},ensure_ascii=False)+'\n\n'
+                    if tp in ('compaction_start','auto_retry_start'):
+                        status='Đang rút gọn ngữ cảnh…' if tp=='compaction_start' else 'Đang thử lại model…'
+                        yield 'data: '+json.dumps({'type':'status','payload':{'phase':tp,'message':status}},ensure_ascii=False)+'\n\n'
                     if tp == "response" and event.get("command") == "prompt" and not event.get("success"):
                         raise RuntimeError("Pi did not accept request")
                     if tp == "message_update":
+                        interim=normalize_usage(event.get('usage'),source='pi')
+                        if interim:
+                            # A message_update usage is a snapshot of this turn, not
+                            # a new charge. Combine with finished earlier turns only.
+                            live=accumulate_usage(reported_usage,interim)
+                            yield 'data: '+json.dumps({'type':'usage','payload':live},ensure_ascii=False)+'\n\n'
                         upd = event.get("assistantMessageEvent") or {}
                         if upd.get("type") == "text_delta":
                             delta=upd.get("delta","")
                             collected.append(delta)
                             yield "data: "+json.dumps({"type":"delta","payload":{"text":delta}},ensure_ascii=False)+"\n\n"
+                    if tp in ('message_end','agent_end'):
+                        # Pi reports the final usage on assistant messages. Do not
+                        # count agent_end again (it may repeat the same total).
+                        message=event.get('message') or {}
+                        if tp=='message_end' and isinstance(message,dict) and message.get('role')=='assistant':
+                            item=normalize_usage(message.get('usage'),source='pi')
+                            if item:
+                                reported_usage=accumulate_usage(reported_usage,item)
+                                yield 'data: '+json.dumps({'type':'usage','payload':reported_usage},ensure_ascii=False)+'\n\n'
+                    if tp == 'message_update':
+                        upd=event.get('assistantMessageEvent') or {}
+                        if upd.get('type') in ('thinking_delta','reasoning_delta'):
+                            yield 'data: '+json.dumps({'type':'status','payload':{'phase':'reasoning','message':'Đang phân tích…'}},ensure_ascii=False)+'\n\n'
                     if tp == "tool_execution_start":
                         name=event.get("toolName") or event.get("tool_name") or "Pi tool"
                         yield "data: "+json.dumps({"type":"tool","payload":{"name":str(name)[:80],"status":"running"}},ensure_ascii=False)+"\n\n"
                     if tp == "tool_execution_end":
                         name=event.get("toolName") or event.get("tool_name") or "Pi tool"
                         yield "data: "+json.dumps({"type":"tool","payload":{"name":str(name)[:80],"status":"complete"}},ensure_ascii=False)+"\n\n"
-                    if tp == "agent_settled": break
+                    if tp == "agent_settled":
+                        if event.get('aborted'):
+                            raise RuntimeError('Phiên Pi đã bị dừng')
+                        break
                 yield "data: "+json.dumps({"type":"final","payload":{"text":"".join(collected)}},ensure_ascii=False)+"\n\n"
             except Exception as exc:
                 yield "data: "+json.dumps({"type":"error","payload":{"message":type(exc).__name__+": "+str(exc)[:300]}},ensure_ascii=False)+"\n\n"

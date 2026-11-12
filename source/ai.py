@@ -16,6 +16,7 @@ from research import search_searxng, fetch_web
 from security import decrypt
 from openai_oauth_gateway import require_access
 from planning import save_question, QUESTION_JSON_INSTRUCTIONS
+from chat_events import normalize_usage, accumulate_usage
 from intelligence import coverage_report
 
 ROLES = {
@@ -89,6 +90,7 @@ Rules:
 - Help plan and SPECIFY a product, do not implement its application code.
 - Never just ask an open-ended question and expect the user to invent options. Proactively draft 2-4 credible approaches with clear pros/cons and mark ONE recommended default with rationale.
 - In discovery/design, call propose_planning_question for interactive option cards whenever the model supports tools. Ask only ONE significant open question per turn.
+- When the user's latest turn is a confirmed answer to a planning question, FIRST acknowledge and evaluate its implications, update relevant draft context where permitted, THEN identify the next genuinely unanswered high-impact question. Continue in the SAME discussion. Never demand that the user click a separate button to continue.
 - Offer the user the ability to select, discuss, customize or defer. Do not regard an AI recommendation as human approval.
 - Prioritize unanswered high-impact decisions over trivial choices. Explicitly label hypotheses and unverified assumptions.
 - Keep responses in Vietnamese unless user requests otherwise. Use clear structured Markdown.
@@ -170,85 +172,99 @@ def api_endpoint(base):
     return base + "/v1/chat/completions"
 
 async def compatible_stream(project, discussion, db, model, *, role, mode):
-    """Yield (type, payload) tuples. Tool execution is sequential and scoped."""
+    """SSE-backed OpenAI-compatible tool loop; usage counted only when provider reports it."""
     history = db.query(Message).filter_by(discussion_id=discussion.id).order_by(Message.created_at.desc()).limit(16).all()[::-1]
-    messages = [{"role":"system","content":plan_prompt(project,db,role,mode)}]
-    messages += [{"role":x.role,"content":x.content[:14000]} for x in history]
+    messages = [{'role':'system','content':plan_prompt(project,db,role,mode)}]
+    messages += [{'role':x.role,'content':x.content[:14000]} for x in history]
     provider = model.provider
     key = decrypt(provider.encrypted_key)
-    headers = {"Content-Type":"application/json"}
-    if key: headers["Authorization"] = "Bearer " + key
-    url = api_endpoint(provider.base_url)
-    async with httpx.AsyncClient(timeout=httpx.Timeout(180, connect=20), trust_env=False) as client:
+    headers = {'Content-Type':'application/json'}
+    if key: headers['Authorization']='Bearer '+key
+    url=api_endpoint(provider.base_url)
+    total_usage={}
+    all_visible=[]
+    async with httpx.AsyncClient(timeout=httpx.Timeout(180,connect=20),trust_env=False) as client:
         for turn in range(6):
-            payload = {"model":model.model_id,"messages":messages,"stream":True,"temperature":0.6,
-                       "max_tokens":min(8192,int(os.environ.get("MAX_OUTPUT_TOKENS", "4096")))}
-            if turn < 5: payload["tools"] = TOOLS; payload["tool_choice"] = "auto"
-            if provider.kind == "openai" and model.reasoning and project.thinking_level != "off":
-                payload.pop("temperature", None)
-                payload["reasoning_effort"] = project.thinking_level if project.thinking_level in ("low","medium","high") else "medium"
-            accumulated = []
-            calls = {}
+            payload = {'model':model.model_id,'messages':messages,'stream':True,
+                       'stream_options':{'include_usage':True},'temperature':0.6,
+                       'max_tokens':min(8192,int(os.environ.get('MAX_OUTPUT_TOKENS','4096')))}
+            if turn < 5: payload['tools']=TOOLS;payload['tool_choice']='auto'
+            if provider.kind=='openai' and model.reasoning and project.thinking_level!='off':
+                payload.pop('temperature',None)
+                payload['reasoning_effort']=project.thinking_level if project.thinking_level in ('low','medium','high') else 'medium'
+            accumulated=[]
+            calls={}
+            seen_reasoning=False
             try:
-                async with client.stream("POST", url, json=payload, headers=headers) as response:
-                    if response.status_code >= 400:
-                        err = (await response.aread()).decode(errors="replace")[:450]
-                        if response.status_code in (400,422) and "tools" in payload and turn == 0:
-                            # Endpoint has no tool calling: retry once without tools.
-                            yield "status", {"message":"Model không hỗ trợ tool calling; chuyển sang chế độ thảo luận thuần."}
-                            payload.pop("tools");payload.pop("tool_choice",None)
-                            async with client.stream("POST", url, json=payload, headers=headers) as fallback:
-                                fallback.raise_for_status()
-                                async for line in fallback.aiter_lines():
-                                    if line.startswith("data: ") and line[6:] != "[DONE]":
-                                        try: event=json.loads(line[6:]); delta=event.get("choices",[{}])[0].get("delta",{})
-                                        except (ValueError,IndexError): continue
-                                        content = delta.get("content")
-                                        if isinstance(content,str) and content:
-                                            accumulated.append(content)
-                                            yield "delta", {"text":content}
-                            break
-                        raise RuntimeError(f"Provider HTTP {response.status_code}: {err}")
-                    async for line in response.aiter_lines():
-                        if not line.startswith("data:"): continue
-                        raw = line[5:].strip()
-                        if not raw or raw == "[DONE]": continue
-                        try: chunk=json.loads(raw)
-                        except ValueError: continue
-                        choices = chunk.get("choices") or []
-                        if not choices: continue
-                        delta = choices[0].get("delta") or {}
-                        content = delta.get("content")
-                        if isinstance(content,str) and content:
-                            accumulated.append(content)
-                            yield "delta", {"text":content}
-                        for c in delta.get("tool_calls") or []:
-                            idx = c.get("index",0)
-                            old = calls.setdefault(idx,{"id":"","name":"","arguments":""})
-                            if c.get("id"): old["id"] = c["id"]
-                            func = c.get("function") or {}
-                            old["name"] += func.get("name","")
-                            old["arguments"] += func.get("arguments","")
+                # Some local endpoints reject stream_options or tool calling.
+                # Downgrade only those OPTIONAL capabilities and keep streaming.
+                for attempt in range(3):
+                    retry=False
+                    async with client.stream('POST',url,json=payload,headers=headers) as response:
+                        if response.status_code>=400:
+                            error=(await response.aread()).decode(errors='replace')[:400]
+                            if response.status_code in (400,422) and 'stream_options' in payload:
+                                payload.pop('stream_options',None)
+                                yield 'status',{'phase':'model','message':'Provider không hỗ trợ usage streaming; tiếp tục nhận phản hồi.'}
+                                retry=True
+                            elif response.status_code in (400,422) and 'tools' in payload:
+                                payload.pop('tools',None);payload.pop('tool_choice',None)
+                                yield 'status',{'phase':'model','message':'Provider không hỗ trợ tool calling; chuyển sang chat thuần.'}
+                                retry=True
+                            else:
+                                raise RuntimeError(f'Provider HTTP {response.status_code}: {error}')
+                        else:
+                            async for line in response.aiter_lines():
+                                if not line.startswith('data:'):continue
+                                raw=line[5:].strip()
+                                if not raw or raw=='[DONE]':continue
+                                try: event=json.loads(raw)
+                                except (ValueError,TypeError):continue
+                                if not isinstance(event,dict):continue
+                                usage=normalize_usage(event.get('usage'),source='provider')
+                                if usage:
+                                    total_usage=accumulate_usage(total_usage,usage)
+                                    yield 'usage',dict(total_usage)
+                                choices=event.get('choices') or []
+                                if not choices:continue
+                                delta=choices[0].get('delta') or {}
+                                if not seen_reasoning and (delta.get('reasoning_content') or delta.get('reasoning')):
+                                    seen_reasoning=True
+                                    yield 'status',{'phase':'reasoning','message':'Đang phân tích…'}
+                                text=delta.get('content')
+                                if isinstance(text,str) and text:
+                                    accumulated.append(text)
+                                    all_visible.append(text)
+                                    yield 'delta',{'text':text}
+                                for call in delta.get('tool_calls') or []:
+                                    idx=call.get('index',0)
+                                    old=calls.setdefault(idx,{'id':'','name':'','arguments':''})
+                                    if call.get('id'):old['id']=call['id']
+                                    fn=call.get('function') or {}
+                                    old['name']+=fn.get('name','')
+                                    old['arguments']+=fn.get('arguments','')
+                    if not retry:break
+                else:
+                    raise RuntimeError('Provider rejected stream_options/tool calling even after fallback')
             except httpx.HTTPError as exc:
-                raise RuntimeError(f"Không kết nối được model provider: {type(exc).__name__}") from exc
+                raise RuntimeError(f'Không kết nối được model provider: {type(exc).__name__}') from exc
             if not calls:
-                if accumulated: yield "final", {"text":"".join(accumulated)}
-                else: yield "final", {"text":"(Model trả về phản hồi trống)"}
+                yield 'final',{'text':''.join(all_visible) or '(Model trả về phản hồi trống)'}
                 return
-            tool_calls = [{"id":c["id"] or f"call_{idx}","type":"function","function":{"name":c["name"],"arguments":c["arguments"]}} for idx,c in sorted(calls.items())]
-            messages.append({"role":"assistant","content":"".join(accumulated) or None,"tool_calls":tool_calls})
-            for c in tool_calls:
-                name = c["function"]["name"]
-                yield "tool", {"name":name,"status":"running"}
+            tool_calls=[{'id':c['id'] or f'call_{idx}','type':'function','function':{'name':c['name'],'arguments':c['arguments']}}
+                        for idx,c in sorted(calls.items())]
+            messages.append({'role':'assistant','content':''.join(accumulated) or None,'tool_calls':tool_calls})
+            for call in tool_calls:
+                name=call['function']['name']
+                yield 'tool',{'name':name,'status':'running'}
                 try:
-                    args = json.loads(c["function"]["arguments"] or "{}")
-                    result = await tool_call(name,args,project=project,db=db,discussion_id=discussion.id)
+                    args=json.loads(call['function']['arguments'] or '{}')
+                    result=await tool_call(name,args,project=project,db=db,discussion_id=discussion.id)
                 except Exception as exc:
-                    result = {"error":str(exc)[:500]}
-                messages.append({"role":"tool","tool_call_id":c["id"],"content":json.dumps(result,ensure_ascii=False)[:19000]})
-                yield "tool", {"name":name,"status":"complete", "result":json.dumps(result,ensure_ascii=False)[:300]}
-        # Some providers have already emitted content but didn't terminate cleanly.
-    yield "final", {"text":"Agent đã đạt giới hạn số lượt gọi công cụ cho câu hỏi này."}
+                    result={'error':str(exc)[:500]}
+                messages.append({'role':'tool','tool_call_id':call['id'],'content':json.dumps(result,ensure_ascii=False)[:19000]})
+                yield 'tool',{'name':name,'status':'complete','result':json.dumps(result,ensure_ascii=False)[:300]}
+    yield 'final',{'text':''.join(all_visible) or 'Agent đã đạt giới hạn số lượt gọi công cụ.'}
 
 def pi_tool_token(run_id: str, project_id: str, discussion_id: str, created_at) -> str:
     """Per-run capability token; model cannot choose or expand project scope."""

@@ -118,6 +118,7 @@ class Message(Base):
     discussion_id = Column(String(36), ForeignKey("discussions.id"), nullable=False, index=True)
     role = Column(String(20), nullable=False)
     content = Column(Text, nullable=False)
+    run_id = Column(String(36), ForeignKey('agent_runs.id'), nullable=True, index=True)
     created_at = Column(DateTime, default=utcnow)
 
 class PlanningQuestion(Base):
@@ -148,6 +149,10 @@ class AgentRun(Base):
     thinking = Column(String(20), default="")
     cancel_requested = Column(Boolean, nullable=False, default=False)
     error = Column(Text, default="")
+    usage = Column(JSON, nullable=False, default=dict)
+    events = Column(JSON, nullable=False, default=list)
+    first_token_ms = Column(Integer, nullable=True)
+    duration_ms = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=utcnow)
     finished_at = Column(DateTime, nullable=True)
 

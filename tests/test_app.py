@@ -1036,7 +1036,7 @@ def test_0003_migration_creates_review_queue_without_deleting_old_data(tmp_path,
     assert set(inspect(eng).get_table_names())>=missing
     with eng.connect() as conn:
         assert conn.execute(text("SELECT username FROM users WHERE username='legacy'")).scalar()=='legacy'
-        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0007_provider_deletion'
+        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0008_conversation_stream'
         assert 'cancel_requested' in [x['name'] for x in inspect(eng).get_columns('agent_runs')]
     eng.dispose()
 
@@ -1154,7 +1154,7 @@ def test_0004_fresh_database_migration_is_idempotent(tmp_path, monkeypatch):
     command.upgrade(cfg,'head')
     eng=create_engine(url)
     with eng.connect() as conn:
-        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0007_provider_deletion'
+        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0008_conversation_stream'
         assert any(col['name']=='cancel_requested' for col in __import__('sqlalchemy').inspect(eng).get_columns('agent_runs'))
     eng.dispose()
 
@@ -1597,3 +1597,126 @@ async def test_openai_oauth_vault_lock_prevents_disconnect(tmp_path,monkeypatch)
         with pytest.raises(HTTPException) as exc:
             await runtime.disconnect()
         assert exc.value.status_code==409
+
+# v0.9.6 ThinkRail-inspired conversation continuity and observable SSE
+
+def test_chat_continues_answer_once_with_usage_and_no_duplicate_message(client, monkeypatch):
+    import importlib
+    from planning import save_question
+    from db import AgentRun, PlanningQuestion
+    application=importlib.import_module('app')
+    csrf=auth(client)
+    provider=client.post('/api/providers',headers=csrf,json={'name':'MockChat','base_url':'http://model.test/v1','api_key':'x'}).json()['id']
+    assert client.post(f'/api/providers/{provider}/models',headers=csrf,json={'model_ids':['mock-continuation']}).status_code==200
+    with SessionLocal() as s:
+        mid=s.query(Model).filter_by(model_id='mock-continuation').one().id
+    pid=create_project(client,csrf)
+    assert client.post(f'/api/projects/{pid}/settings',headers=csrf,json={'active_model_id':mid}).status_code==200
+    with SessionLocal() as s:
+        did=s.query(db.Discussion).filter_by(project_id=pid).one().id
+        item,_=save_question(s,pid,did,{
+            'question':'How should user accounts be isolated in this system?',
+            'options':[{'label':'Per-user accounts','pros':'Privacy','cons':'Permissions design'},
+                       {'label':'Shared access','pros':'Simpler','cons':'Leaks across users'}],
+            'recommended_index':0,'recommendation_reason':'User-owned trading accounts require isolation'})
+        qid=item.id
+    res=client.post(f'/api/projects/{pid}/planning/questions/{qid}/answer',headers=csrf,
+                    json={'selected_ids':['o1'],'custom_answer':'Each person supplies their own trading credentials'})
+    assert res.status_code==200
+    assert 'answered' in res.text
+
+    async def simulated(project, discussion, db, model, *, role, mode):
+        assert db.query(Message).filter_by(discussion_id=did,role='user').count()==1
+        yield 'status',{'phase':'reasoning','message':'Đang phân tích…'}
+        yield 'delta',{'text':'Đã hiểu. Mỗi người có tài khoản riêng.'}
+        yield 'usage',{'input_tokens':123,'output_tokens':27,'cache_read_tokens':10,'source':'provider'}
+        yield 'final',{'text':'Đã hiểu. Mỗi người có tài khoản riêng.'}
+    monkeypatch.setattr(application,'compatible_stream',simulated)
+    url=f'/api/projects/{pid}/chat'
+    answer=client.post(url,headers=csrf,json={'discussion_id':did,'continue_question_id':qid,'message':'','role':'analyst','mode':'discovery'})
+    assert answer.status_code==200,answer.text
+    assert '"type": "usage"' in answer.text
+    assert '"input_tokens": 123' in answer.text
+    assert '"type": "timing"' in answer.text
+    assert '"type": "done"' in answer.text
+    with SessionLocal() as s:
+        messages=s.query(Message).filter_by(discussion_id=did).order_by(Message.created_at).all()
+        assert [m.role for m in messages]==['user','assistant']
+        run=s.query(AgentRun).filter_by(discussion_id=did).one()
+        assert run.status=='completed' and run.usage['output_tokens']==27
+        assert isinstance(run.duration_ms,int)
+        assert s.get(PlanningQuestion,qid).answer['continuation_run_id']==run.id
+        assert run.events and any(e.get('phase','')=='reasoning' or 'Đang phân tích' in e.get('message','') for e in run.events)
+        assert messages[-1].run_id==run.id
+    restored=client.get(f'/projects/{pid}/discussion?did={did}')
+    assert restored.status_code==200
+    assert 'Run history · phiên này' in restored.text
+    assert 'Đang phân tích' in restored.text
+    assert '123' in restored.text
+    repeat=client.post(url,headers=csrf,json={'discussion_id':did,'continue_question_id':qid,'message':''})
+    assert repeat.status_code==409
+    assert client.post(url,headers=csrf,json={'discussion_id':did,'continue_question_id':qid,'message':'duplicate'}).status_code==422
+
+
+def test_usage_normalization_distinguishes_provider_from_estimates():
+    from chat_events import normalize_usage, accumulate_usage
+    assert normalize_usage({},source='provider')=={}
+    assert normalize_usage({'prompt_tokens':0,'completion_tokens':12,
+                            'prompt_tokens_details':{'cached_tokens':7}},source='provider')=={
+        'source':'provider','input_tokens':0,'output_tokens':12,'cache_read_tokens':7}
+    p=normalize_usage({'input':123,'output':21,'cacheRead':11,'cacheWrite':4,'cost':{'total':0.08}},source='pi')
+    assert p['input_tokens']==123 and p['output_tokens']==21 and p['cost_usd']==0.08
+    assert accumulate_usage({'input_tokens':5},p)['input_tokens']==128
+    assert normalize_usage({'input':'estimated','output':True},source='pi')=={}
+
+
+@pytest.mark.asyncio
+async def test_compatible_stream_usage_without_choices_and_optional_fallback(client,monkeypatch):
+    import ai
+    import httpx
+    csrf=auth(client)
+    provider=client.post('/api/providers',headers=csrf,json={'name':'NoStreamOptions','base_url':'http://model.internal/v1','api_key':'x'}).json()['id']
+    client.post(f'/api/providers/{provider}/models',headers=csrf,json={'model_ids':['old-server']})
+    pid=create_project(client,csrf)
+    attempts=[]
+    def handler(request):
+        body=json.loads(request.content)
+        attempts.append(body)
+        if 'stream_options' in body:
+            return httpx.Response(400,text='unknown parameter stream_options')
+        packets=[
+            {'choices':[{'delta':{'content':'Hello'}}]},
+            {'choices':[],'usage':{'prompt_tokens':99,'completion_tokens':7}},
+        ]
+        return httpx.Response(200,content=''.join('data: '+json.dumps(x)+'\n\n' for x in packets)+'data: [DONE]\n\n',headers={'Content-Type':'text/event-stream'})
+    real_client=httpx.AsyncClient
+    monkeypatch.setattr(ai.httpx,'AsyncClient',lambda **kwargs:real_client(transport=httpx.MockTransport(handler)))
+    with SessionLocal() as s:
+        project=s.get(Project,pid)
+        discussion=s.query(db.Discussion).filter_by(project_id=pid).one()
+        model=s.query(Model).filter_by(model_id='old-server').one()
+        s.add(Message(discussion_id=discussion.id,role='user',content='Hi'));s.commit()
+        events=[]
+        async for event in ai.compatible_stream(project,discussion,s,model,role='analyst',mode='discuss'):
+            events.append(event)
+    assert len(attempts)==2
+    assert 'stream_options' in attempts[0] and 'stream_options' not in attempts[1]
+    assert ('delta',{'text':'Hello'}) in events
+    assert any(k=='usage' and v.get('input_tokens')==99 and v.get('output_tokens')==7 for k,v in events)
+    assert events[-1]==('final',{'text':'Hello'})
+
+@pytest.mark.asyncio
+async def test_sse_heartbeat_does_not_cancel_waiting_model():
+    import asyncio
+    from chat_events import with_heartbeat
+    completed=[]
+    async def slow_model():
+        await asyncio.sleep(.025)
+        completed.append(True)
+        yield 'delta',{'text':'ok'}
+    events=[]
+    async for name,payload in with_heartbeat(slow_model(),interval_seconds=.005):
+        events.append((name,payload))
+    assert completed==[True]
+    assert any(name=='status' and payload['phase']=='waiting' for name,payload in events)
+    assert events[-1]==('delta',{'text':'ok'})

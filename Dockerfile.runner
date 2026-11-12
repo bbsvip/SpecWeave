@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 python3
     && mkdir -p /runner /data/projects /auth-local \
     && chown -R specweave:specweave /runner /data /auth-local \
     && chmod 0700 /auth-local
-COPY --chown=specweave:specweave source/pi_runner.py /runner/pi_runner.py
+COPY --chown=specweave:specweave source/pi_runner.py source/chat_events.py /runner/
 COPY --chown=specweave:specweave source/pi_tools.ts /runner/pi_tools.ts
 COPY --chown=specweave:specweave source/openai_oauth_runtime.py /runner/openai_oauth_runtime.py
 COPY --chown=specweave:specweave source/openai_oauth.mjs /runner/openai_oauth.mjs

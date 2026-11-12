@@ -1,5 +1,6 @@
 """SpecWeave web server. Run directly: python source/app.py (no editable install)."""
 import asyncio
+import time
 import io
 import json
 import os
@@ -44,6 +45,7 @@ from planning_engine import (STEPS, SOURCE_KINDS, VERIFY_STATES, stage_current, 
 from review_queue import create_review_job, job_payload, TERMINAL
 from provider_management import owned_provider, impact as provider_impact, delete_provider as perform_provider_deletion, delete_models as perform_model_deletion
 from chat_coordination import discussion_lease, ChatBusy, cancellation_requested
+from chat_events import with_heartbeat
 
 BASE = Path(__file__).parent
 @asynccontextmanager
@@ -54,7 +56,7 @@ async def lifespan(_app):
     init_db()
     yield
 
-app = FastAPI(title="SpecWeave", version="0.9.5", docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(title="SpecWeave", version="0.9.6", docs_url=None, redoc_url=None, lifespan=lifespan)
 app.mount("/static",StaticFiles(directory=BASE / "static"),name="static")
 templates = Jinja2Templates(directory=BASE / "templates")
 templates.env.filters["date_short"] = lambda d: d.strftime("%d/%m/%Y %H:%M") if d else "—"
@@ -1146,11 +1148,15 @@ def discussion_page(pid:str,request:Request,did:str="",db:Session=Depends(get_db
     discussions=db.query(Discussion).filter_by(project_id=pid).order_by(Discussion.created_at.asc()).all()
     selected=db.get(Discussion,did) if did else (discussions[0] if discussions else None)
     if selected and selected.project_id!=pid:raise HTTPException(404,"Discussion not found")
-    messages=db.query(Message).filter_by(discussion_id=selected.id).order_by(Message.created_at).limit(120).all() if selected else []
+    messages=(db.query(Message).filter_by(discussion_id=selected.id)
+              .order_by(Message.created_at.desc()).limit(120).all()[::-1]) if selected else []
+    trace_runs={r.id:r for r in (db.query(AgentRun).filter(AgentRun.id.in_([m.run_id for m in messages if m.run_id])).all()
+                                  if any(m.run_id for m in messages) else [])}
     models=db.query(Model).join(Provider).filter(Model.enabled==True,Provider.enabled==True).all()
-    runs=db.query(AgentRun).filter_by(project_id=pid).order_by(AgentRun.created_at.desc()).limit(7).all()
+    runs=(db.query(AgentRun).filter_by(project_id=pid,discussion_id=selected.id)
+          .order_by(AgentRun.created_at.desc()).limit(7).all()) if selected else []
     return page(request,"discussion.html",db=db,user=u,session=s,pr=pr,discussions=discussions,discussion=selected,messages=messages,
-                models=models,runs=runs,modes=MODES,roles=ROLES,active="discussion")
+                models=models,runs=runs,trace_runs=trace_runs,modes=MODES,roles=ROLES,active="discussion")
 
 @app.post("/api/projects/{pid}/discussions")
 async def new_discussion(pid:str,request:Request,db:Session=Depends(get_db)):
@@ -1176,14 +1182,29 @@ async def chat_stream(pid:str,request:Request,db:Session=Depends(get_db)):
         status=await openai_oauth_relay('GET','/oauth/openai/status')
         if not status.get('connected'):raise HTTPException(409,'OpenAI chưa được kết nối trên Pi runtime')
     content=str(data.get("message","")).strip()
-    if not 1<=len(content)<=30000:raise HTTPException(422,"Nội dung phải từ 1 đến 30.000 ký tự")
+    continue_qid=str(data.get('continue_question_id') or '').strip()
+    if continue_qid:
+        if content:
+            raise HTTPException(422, 'Continuation cannot include a second user message')
+        q=(db.query(PlanningQuestion).filter_by(id=continue_qid,project_id=pid,
+                                               discussion_id=did).with_for_update().one_or_none())
+        if not q or q.status!='answered':
+            raise HTTPException(409,'Câu trả lời không còn ở trạng thái có thể tiếp tục')
+        if (q.answer or {}).get('continuation_run_id'):
+            raise HTTPException(409,'Câu trả lời này đã được gửi cho AI trước đó')
+    elif not 1<=len(content)<=30000:
+        raise HTTPException(422,"Nội dung phải từ 1 đến 30.000 ký tự")
     role=str(data.get("role","analyst"))
     mode=str(data.get("mode",discussion.mode))
     if role not in ROLES:role="analyst"
     if mode not in MODES:mode="discovery"
-    message=Message(discussion_id=did,role="user",content=content)
     run=AgentRun(project_id=pid,discussion_id=did,model_name=model.model_id,thinking=pr.thinking_level)
-    db.add(run);db.commit()
+    db.add(run)
+    db.flush()
+    if continue_qid:
+        # Persist the correlation before streaming so reconnects cannot send the same choice twice.
+        q.answer={**(q.answer or {}),'continuation_run_id':run.id}
+    db.commit()
     run_id=run.id
     backend="pi" if model.provider.kind=="openai-oauth" else pr.agent_backend
     actor_id=u.id
@@ -1194,42 +1215,76 @@ async def chat_stream(pid:str,request:Request,db:Session=Depends(get_db)):
             p=sdb.get(Project,pid);d=sdb.get(Discussion,did);m=sdb.get(Model,p.active_model_id)
             try:
                 async with discussion_lease(did):
-                    sdb.add(Message(discussion_id=did,role="user",content=content))
-                    sdb.commit()
+                    if content:
+                        sdb.add(Message(discussion_id=did,role="user",content=content))
+                        sdb.commit()
                     async for event in produce_locked(sdb, p, d, m):
                         yield event
             except ChatBusy:
-                obj=sdb.get(AgentRun,run_id);obj.status="error";obj.error="Another chat is running";obj.finished_at=utcnow();sdb.commit()
-                yield "data: "+json.dumps({"type":"error","message":"Một lượt thảo luận đang chạy"},ensure_ascii=False)+"\n\n"
+                obj=sdb.get(AgentRun,run_id);obj.status='error';obj.error='Another chat is running';obj.finished_at=utcnow()
+                if continue_qid:
+                    answer=sdb.get(PlanningQuestion,continue_qid)
+                    if answer and (answer.answer or {}).get('continuation_run_id')==run_id:
+                        answer.answer={k:v for k,v in answer.answer.items() if k!='continuation_run_id'}
+                sdb.commit()
+                yield 'data: '+json.dumps({'type':'error','payload':{'message':'Một lượt thảo luận đang chạy'},
+                                           'message':'Một lượt thảo luận đang chạy'},ensure_ascii=False)+'\n\n' 
 
     async def produce_locked(sdb,p,d,m):
-                full=[]
-                try:
-                    yield "data: "+json.dumps({"type":"start","run_id":run_id},ensure_ascii=False)+"\n\n"
-                    stream=pi_stream(p,d,sdb,m,role=role,mode=mode,run_id=run_id,actor_id=actor_id) if backend=="pi" else compatible_stream(p,d,sdb,m,role=role,mode=mode)
-                    async for typ,payload in stream:
-                        if cancellation_requested(run_id):
-                            raise asyncio.CancelledError()
-                        if typ=="delta":full.append(payload.get("text",""))
-                        elif typ=="final":
-                            txt=payload.get("text","")
-                            if txt:full=[txt]
-                            completed=True
-                        elif typ=="error":
-                            raise RuntimeError(payload.get("message","Lỗi Pi Runner"))
-                        yield "data: "+json.dumps({"type":typ,"payload":payload,"run_id":run_id},ensure_ascii=False)+"\n\n"
-                    output="".join(full).strip() or "(Không có nội dung phản hồi)"
-                    sdb.add(Message(discussion_id=did,role="assistant",content=output))
-                    obj=sdb.get(AgentRun,run_id);obj.status="completed";obj.finished_at=utcnow()
-                    sdb.commit()
-                    yield "data: "+json.dumps({"type":"done","run_id":run_id},ensure_ascii=False)+"\n\n"
-                except (asyncio.CancelledError,GeneratorExit):
-                    obj=sdb.get(AgentRun,run_id);obj.status="cancelled";obj.finished_at=utcnow();sdb.commit()
-                    yield "data: "+json.dumps({"type":"error","message":"Đã dừng lượt chạy"},ensure_ascii=False)+"\n\n"
-                except Exception as exc:
-                    obj=sdb.get(AgentRun,run_id);obj.status="error";obj.error=str(exc)[:700];obj.finished_at=utcnow();sdb.commit()
-                    yield "data: "+json.dumps({"type":"error","message":str(exc)[:500]},ensure_ascii=False)+"\n\n"
-    return StreamingResponse(produce(),media_type="text/event-stream",headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+        full=[]
+        trace=[]
+        clock=time.monotonic()
+        first_token_ms=None
+        usage={}
+        def emit(event_type,payload=None,**extra):
+            return 'data: '+json.dumps({'type':event_type,'payload':payload or {},'run_id':run_id,**extra},ensure_ascii=False)+'\n\n'
+        try:
+            yield emit('start',{'model':m.model_id,'backend':backend,'context_window':m.context_window,'continued':bool(continue_qid)})
+            yield emit('status',{'phase':'request','message':'Đang kết nối model…'})
+            stream=pi_stream(p,d,sdb,m,role=role,mode=mode,run_id=run_id,actor_id=actor_id) if backend=='pi' else compatible_stream(p,d,sdb,m,role=role,mode=mode)
+            async for typ,payload in with_heartbeat(stream):
+                if cancellation_requested(run_id):
+                    raise asyncio.CancelledError()
+                if typ=='delta':
+                    part=payload.get('text','')
+                    full.append(part)
+                    if first_token_ms is None and part:
+                        first_token_ms=int((time.monotonic()-clock)*1000)
+                        yield emit('timing',{'first_token_ms':first_token_ms})
+                elif typ=='final':
+                    txt=payload.get('text','')
+                    if txt:full=[txt]
+                elif typ=='usage':
+                    for k,v in payload.items():
+                        if v is not None:
+                            usage[k]=v
+                elif typ=='error':
+                    raise RuntimeError(payload.get('message','Lỗi Pi Runner'))
+                if typ in ('status','tool') and len(trace)<64:
+                    item={'type':typ,'at_ms':int((time.monotonic()-clock)*1000)}
+                    if typ=='status':item['message']=str(payload.get('message',''))[:220]
+                    else:item.update({'name':str(payload.get('name',''))[:80],
+                                      'status':str(payload.get('status',''))[:30]})
+                    trace.append(item)
+                yield emit(typ,payload)
+            output=''.join(full).strip() or '(Không có nội dung phản hồi)'
+            sdb.add(Message(discussion_id=did,role='assistant',content=output,run_id=run_id))
+            run=sdb.get(AgentRun,run_id)
+            run.status='completed';run.finished_at=utcnow()
+            run.usage=usage;run.events=trace;run.first_token_ms=first_token_ms;run.duration_ms=int((time.monotonic()-clock)*1000)
+            sdb.commit()
+            yield emit('done',{'duration_ms':run.duration_ms,'first_token_ms':first_token_ms,'usage':usage})
+        except (asyncio.CancelledError,GeneratorExit):
+            run=sdb.get(AgentRun,run_id)
+            run.status='cancelled';run.events=trace;run.finished_at=utcnow();run.duration_ms=int((time.monotonic()-clock)*1000)
+            sdb.commit()
+            yield emit('error',{'message':'Đã dừng lượt chạy'},message='Đã dừng lượt chạy')
+        except Exception as exc:
+            run=sdb.get(AgentRun,run_id)
+            run.status='error';run.events=trace;run.error=str(exc)[:700];run.finished_at=utcnow();run.duration_ms=int((time.monotonic()-clock)*1000)
+            sdb.commit()
+            yield emit('error',{'message':str(exc)[:500]},message=str(exc)[:500])
+    return StreamingResponse(produce(),media_type="text/event-stream",headers={"Cache-Control":"no-cache, no-transform","X-Accel-Buffering":"no"})
 
 
 # Internal Pi bridge: explicit allowlist and per-run HMAC capability, never arbitrary FS/shell.

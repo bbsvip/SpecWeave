@@ -242,3 +242,9 @@ If running images from GHCR, push this source to GitHub to publish a new image, 
 - Xóa provider xóa toàn bộ models và bỏ model khỏi các dự án liên quan; review hoàn tất vẫn giữ nguồn gốc model. Review/chat đang chạy sẽ chặn xóa (HTTP 409).
 - **OpenAI OAuth:** thêm nút **Chẩn đoán** để kiểm tra Pi modules/adapter/credential volume; sự cố đăng nhập xuất hiện thêm `phase` và `hint` an toàn. Chưa xác nhận luồng live trên máy chủ.
 - Migration mới: `0007_provider_deletion`; chi tiết tại `docs/RELEASE_v0.9.5.vi.md`.
+
+## v0.9.6 — Continuous Planning & Live Chat
+
+Sau khi trả lời một Decision Brief, AI tiếp tục trong cùng session mà không phải gửi lại câu trả lời. Chat có streaming Markdown, SSE trạng thái/tool, usage thực do provider báo, TTFT, thời lượng, lịch sử run riêng theo discussion, code copy và Mermaid preview theo yêu cầu. Cấu trúc chọn phương án nằm ngay trong khung chat, lấy cảm hứng từ ThinkRail.
+
+**Migration:** `0008_conversation_stream` (bổ sung usage/timings cho `agent_runs`). Khi triển khai qua GHCR cần build lại cả image `web` và `pi-runner` do `chat_events.py` được dùng chung. Xem [RELEASE_v0.9.6.vi.md](docs/RELEASE_v0.9.6.vi.md).
