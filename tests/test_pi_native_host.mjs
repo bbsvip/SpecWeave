@@ -40,15 +40,16 @@ export async function createAgentSession(options){
      if(user==='hold')await new Promise(resolve=>{release=resolve});
      if(aborted)return;
      emit({type:'message_update',assistantMessageEvent:{type:'thinking_delta',delta:'Considering the request.'}});
-     if(options.customTools.length){emit({type:'tool_execution_start',toolName:'search_web',toolCallId:'call1',args:{query:'a'}});
+     if(options.customTools.length&&user!=='truncated thinking'){emit({type:'tool_execution_start',toolName:'search_web',toolCallId:'call1',args:{query:'a'}});
        emit({type:'tool_execution_end',toolName:'search_web',toolCallId:'call1',result:{ok:true}});}
-     const text=user==='model-report'?JSON.stringify(options.model):user==='report'?'Turn '+(session.messages.length+1)+': '+beforeStart().systemPrompt:'Native Pi output';
+     const text=user==='truncated thinking'?'':user==='model-report'?JSON.stringify(options.model):user==='report'?'Turn '+(session.messages.length+1)+': '+beforeStart().systemPrompt:'Native Pi output';
      emit({type:'message_update',assistantMessageEvent:{type:'text_delta',delta:text}});
      const message={role:'assistant',content:[{type:'text',text}],usage:{input:12,output:4}};
      if(user==='truncated draft'){
        message.stopReason='length';
        message.content.push({type:'toolCall',name:'write_document'});
      }
+     if(user==='truncated thinking')message.stopReason='length';
      session.messages.push(message);emit({type:'message_end',message});emit({type:'agent_settled'});
    },getLastAssistantText:()=> 'Native Pi output'};
  return {session};
@@ -108,6 +109,10 @@ test('Pi Host handles chat and planning through same SDK and exposes native SSE'
    assert.match(stream,/"type":"final"/);assert.match(stream,/Native Pi output/);
    const truncated=await post(x.base,'/run',{...requestData,message:'truncated draft'});
    assert.match(await truncated.text(),/"phase":"document_output_limit"/);
+   const thinkingCutoff=await post(x.base,'/run',{...requestData,message:'truncated thinking'});
+   const cutoffStream=await thinkingCutoff.text();
+   assert.match(cutoffStream,/"phase":"output_limit"/);
+   assert.match(cutoffStream,/"text":"","stop_reason":"length"/);
    assert.equal((await post(x.base,'/run',{...requestData,project_id:'../x'})).status,422);
    assert.equal((await post(x.base,'/oauth/openai/start',{})).status,503);
  }finally{await stopSandbox(x);}

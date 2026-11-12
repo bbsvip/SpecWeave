@@ -46,7 +46,8 @@ export function createScopedTools(active) {
         if (!response.ok) return {content:[{type:'text',text:`SpecWeave rejected tool (${response.status})`}],details:{error:true}};
         const result=await response.json();
         const text=JSON.stringify(result);
-        return {content:[{type:'text',text:text.length>19000?text.slice(0,19000)+' [truncated]':text}],details:{ok:true}};
+        return {content:[{type:'text',text:text.length>19000?text.slice(0,19000)+' [truncated]':text}],
+          details:result?.error?{error:true}:{ok:true}};
       } catch (err) {
         return {content:[{type:'text',text:`Tool request failed (${err?.name||'unknown'})`}],details:{error:true}};
       }

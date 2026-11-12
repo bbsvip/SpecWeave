@@ -69,6 +69,55 @@ def test_cancel_queued_run_prevents_any_pi_execution(client,monkeypatch):
     assert 'Đã hủy trước khi Pi bắt đầu' in replay.text
 
 
+def test_turn_without_reply_reports_the_outcome_live_and_on_reload(client, monkeypatch):
+    import app as application
+    from chat_content import EMPTY_REPLY
+
+    csrf = auth(client)
+    pid, did = _make_discussion_with_model(client, csrf, 'turn-outcomes')
+    cases = iter([
+        [('tool', {'name':'write_document', 'status':'complete'}), ('final', {'text':''})],
+        [('thinking', {'text':'Thinking only'}), ('final', {'text':'', 'stop_reason':'length'})],
+        [('final', {'text':'<tool_call>\n<function'})],
+        [('thinking', {'text':'Thinking only'}), ('final', {'text':'', 'stop_reason':'stop'})],
+    ])
+
+    async def pi_stub(*args, **kwargs):
+        for event in next(cases):
+            yield event
+
+    monkeypatch.setattr(application, 'pi_stream', pi_stub)
+    labels = ('Có hoạt động công cụ', 'Đầu ra bị cắt', 'Lệnh công cụ chưa hoàn chỉnh', 'Chưa có câu trả lời')
+    for index, label in enumerate(labels, start=1):
+        result = client.post(f'/api/projects/{pid}/chat/start', headers=csrf, json={
+            'discussion_id':did, 'message':f'Test {index}', 'mode':'discuss',
+        })
+        assert result.status_code == 200, result.text
+        job = result.json()
+        assert asyncio.run(run_once()) == job['run_id']
+        events = [json.loads(line[6:]) for line in client.get(job['events_url']).text.splitlines()
+                  if line.startswith('data: ')]
+        assert events[-1]['type'] == 'done'
+        assert events[-1]['payload']['notice']['label'] == label
+        assert next(event for event in events if event['type']=='final')['payload']['text'] == ''
+        with SessionLocal() as sess:
+            reply = sess.query(db.Message).filter_by(run_id=job['run_id'], role='assistant').one()
+            assert reply.content == ''
+            if index == 1:
+                # Old runs could reach the trace cap before tool execution.
+                reply.content = EMPTY_REPLY
+                sess.get(db.AgentRun,job['run_id']).events = []
+                sess.commit()
+            if index == 3:
+                reply.content = '<tool_call>\n<function'
+                sess.get(db.AgentRun,job['run_id']).events = []
+                sess.commit()
+        html = client.get(f'/projects/{pid}/discussion?did={did}').text
+        assert label in html
+        assert EMPTY_REPLY not in html and '&lt;tool_call&gt;' not in html
+        assert html.count('class="turn-history-metrics"') == index
+
+
 def test_second_message_cannot_queue_in_busy_discussion(client):
     csrf=auth(client)
     pid,did=_make_discussion_with_model(client,csrf,'busy-discussion')

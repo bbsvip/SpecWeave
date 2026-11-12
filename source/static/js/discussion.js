@@ -189,7 +189,8 @@
     const flushRender=()=>{
       if(renderHandle!==null)clearTimeout(renderHandle);
       renderScheduled=false;renderHandle=null;
-      renderMarkdown(turn.content,full||'(Không có nội dung)');
+      turn.content.hidden=!full.trim();
+      renderMarkdown(turn.content,full);
     };
     runId=resumeRunId;controller=new AbortController();setBusy(true,'Đang kết nối…');
     if(observing)followIfNearBottom(true);
@@ -258,11 +259,11 @@
       answerAccepted=Boolean(answerQuestion&&!observing);
       if(answerAccepted){renderPlanningQuestion(null);refreshDiscoveryProgress();}
       const historyStatus=document.querySelector(`[data-run-status="${CSS.escape(runId)}"]`);
-      const showStatus=(status)=>{
+      const showStatus=(status,label)=>{
         terminalStatus=['completed','cancelled','error'].includes(status)?status:terminalStatus;
         if(historyStatus){
-          historyStatus.textContent=status;
-          historyStatus.classList.toggle('good',status==='completed');
+          historyStatus.textContent=label||status;
+          historyStatus.classList.toggle('good',status==='completed'&&!label);
         }
       };
       const handleFrame=(ev)=>{
@@ -300,7 +301,8 @@
           if(typeof p.first_token_ms==='number')firstTokenMs=p.first_token_ms;
         }else if(ev.type==='tool'){
           const name=String(p.name||'tool').slice(0,90);
-          const toolStatus=['complete','toolcall_end'].includes(p.status)?'✓ Hoàn tất':
+          const toolStatus=p.status==='complete'?'✓ Hoàn tất':
+            p.status==='toolcall_end'?'Đã chuẩn bị tham số':
             ['update','toolcall_delta'].includes(p.status)?'Đang cập nhật tham số':
             ['preparing','toolcall_start'].includes(p.status)?'Đang chuẩn bị công cụ':
             p.status==='error'?'Thất bại':p.status==='queued'?'Sắp thực thi':'Đang chạy';
@@ -315,7 +317,7 @@
             item={details,title,text,args:null,result:null,progress:null};panel.toolRows.set(key,item);
           }
           item.title.textContent=(p.status==='complete'?'✓ ':p.status==='running'?'◌ ':'↻ ')+name+' · '+toolStatus;
-          if(['complete','toolcall_end'].includes(p.status))item.details.classList.add('tool-complete');
+          if(p.status==='complete')item.details.classList.add('tool-complete');
           if(p.arguments!==undefined){
             const args=formatToolValue(p.arguments);
             item.args=p.status==='toolcall_delta'?(item.args||'')+args:args;
@@ -358,15 +360,18 @@
           turn.body.append(notice);
           addTimeline(panel.timeline,'status','Discovery kết thúc; tài liệu draft sẵn sàng review');
         }else if(ev.type==='done'){
-          showStatus('completed');
+          const notice=p.notice;
+          showStatus('completed',notice?.label);
           completed=true;elapsedMs=typeof p.duration_ms==='number'?p.duration_ms:performance.now()-started;
           if(typeof p.first_token_ms==='number')firstTokenMs=p.first_token_ms;
           usage={...usage,...(p.usage||{})};
           outputTps=typeof p.output_tps==='number'?p.output_tps:null;
-          panel.summary.textContent='Hoạt động · hoàn thành '+(elapsedMs/1000).toFixed(1)+'s';
-          panel.heading.textContent='Hoàn thành';panel.spinner.classList.add('completed');
+          const label=notice?.label||'Hoàn thành';
+          panel.summary.textContent='Hoạt động · '+(elapsedMs/1000).toFixed(1)+'s';
+          panel.heading.textContent=label;panel.spinner.classList.add('completed');
+          if(notice?.message)panel.live.after(make('p','turn-live-helper',notice.message));
           panel.details.open=false;
-          addTimeline(panel.timeline,'status','Hoàn thành');
+          addTimeline(panel.timeline,'status',label);
         }else if(ev.type==='error'){
           showStatus(p.status==='cancelled'?'cancelled':'error');
         }
@@ -422,7 +427,7 @@
       await refreshPlanningQuestion();
       await refreshDiscoveryProgress();
       if((nextQuestionMissing||advancePlanning)&&!openQuestion&&!discoveryDone){
-        panel.heading.textContent='Discovery chưa hoàn tất';
+        if(panel.heading.textContent==='Hoàn thành')panel.heading.textContent='Discovery chưa hoàn tất';
         const note=make('p','turn-error',
           'Anh có thể bổ sung thông tin trong chat hoặc yêu cầu Pi tiếp tục từ dữ liệu đã lưu.');
         const retry=actionButton('Tiếp tục với Pi','btn-outline-primary',()=>{

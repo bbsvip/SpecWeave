@@ -9,6 +9,54 @@ from planning import normalize_question
 _DECODER = json.JSONDecoder()
 _WHOLE_JSON_FENCE = re.compile(r'\s*```(?:json)?[ \t]*\r?\n\s*(\{[\s\S]+?\})\s*```\s*', re.IGNORECASE)
 
+EMPTY_REPLY = '(Không có nội dung phản hồi)'
+OUTPUT_LIMIT_PHASES = {'output_limit', 'document_output_limit'}
+_TOOL_MARKUP = re.compile(r'(?m)^[ \t]*<tool_call>[ \t]*\r?\n[ \t]*<function(?=[=\s>]|$)')
+
+
+def split_incomplete_tool_call(text):
+    """Remove a trailing tool-call fragment emitted as plain model text."""
+    for match in _TOOL_MARKUP.finditer(text):
+        prefix = text[:match.start()]
+        if prefix.count('```') % 2 == 0 and prefix.count('~~~') % 2 == 0 and '</tool_call>' not in text[match.start():]:
+            return prefix.rstrip(), True
+    return text, False
+
+
+def turn_notice(text, events, *, limited=None, pending=False, handoff=False,
+                incomplete_tool=False, tool_finished=False):
+    """Describe a turn's result without manufacturing an assistant reply."""
+    for event in reversed(events):
+        if event.get('type') == 'outcome':
+            return event['notice']
+    if limited is None:
+        limited = any(event.get('phase') in OUTPUT_LIMIT_PHASES or
+                      event.get('message') == 'Lệnh ghi tài liệu bị cắt do giới hạn đầu ra.'
+                      for event in events)
+    text, incomplete_tail = split_incomplete_tool_call(text)
+    incomplete_tool = incomplete_tool or incomplete_tail
+    if text.strip() not in ('', EMPTY_REPLY) and not (limited or incomplete_tool):
+        return None
+    tool_finished = tool_finished or any(
+        event.get('type') == 'tool' and event.get('status') in ('complete', 'error')
+        for event in events
+    )
+    if handoff:
+        return {'label':'Bản nháp sẵn sàng', 'message':'Pi đã bàn giao bản nháp để bạn duyệt.'}
+    if limited:
+        return {'label':'Đầu ra bị cắt',
+                'message':'Model chạm giới hạn đầu ra trước khi kết thúc. Xem hoạt động của lượt chạy để kiểm tra phần đã xử lý.'}
+    if incomplete_tool:
+        return {'label':'Lệnh công cụ chưa hoàn chỉnh',
+                'message':'Model gửi một phần lệnh gọi công cụ ở dạng văn bản. Pi không thể thực thi phần lệnh đó.'}
+    if pending:
+        return {'label':'Chờ xác nhận', 'message':'Chọn một phương án trong câu hỏi đang chờ để tiếp tục.'}
+    if tool_finished:
+        return {'label':'Có hoạt động công cụ',
+                'message':'Pi đã chạy công cụ trong lượt này và chưa gửi thêm câu trả lời.'}
+    return {'label':'Chưa có câu trả lời',
+            'message':'Lượt Pi đã kết thúc mà chưa có câu trả lời bằng văn bản. Bạn có thể yêu cầu Pi tiếp tục.'}
+
 
 def _options(value):
     if isinstance(value, dict):

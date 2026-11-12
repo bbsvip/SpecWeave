@@ -45,7 +45,8 @@ from planning_engine import (STEPS, SOURCE_KINDS, VERIFY_STATES, stage_current, 
 from review_queue import create_review_job, job_payload, TERMINAL
 from provider_management import owned_provider, impact as provider_impact, delete_provider as perform_provider_deletion, delete_models as perform_model_deletion
 from chat_coordination import discussion_lease, ChatBusy, ChatStopped, cancellation_requested, clear_chat_continuation
-from chat_content import display_user_message, parse_model_response
+from chat_content import (EMPTY_REPLY, OUTPUT_LIMIT_PHASES, display_user_message, parse_model_response,
+                          split_incomplete_tool_call, turn_notice)
 from chat_events import with_heartbeat
 from model_config import parse_model_settings
 from project_trash import (TRASH_RETENTION, TRASH_STATUSES, lock_trash_project, logger as trash_logger,
@@ -64,7 +65,6 @@ app = FastAPI(title="SpecWeave", version="1.0.3", docs_url=None, redoc_url=None,
 app.mount("/static",StaticFiles(directory=BASE / "static"),name="static")
 templates = Jinja2Templates(directory=BASE / "templates")
 templates.env.filters["date_short"] = lambda d: d.strftime("%d/%m/%Y %H:%M") if d else "—"
-templates.env.filters["readable_chat"] = lambda v: parse_model_response(v)[0]
 templates.env.filters["display_user_message"] = display_user_message
 templates.env.filters["pretty_json"] = lambda v: json.dumps(v, indent=2, ensure_ascii=False, default=str)
 
@@ -1208,11 +1208,39 @@ def discussion_page(pid:str,request:Request,did:str="",db:Session=Depends(get_db
         messages=[m for m in messages if not (m.run_id==active_run.id and m.role=='assistant')]
     trace_runs={r.id:r for r in (db.query(AgentRun).filter(AgentRun.id.in_([m.run_id for m in messages if m.run_id])).all()
                                   if any(m.run_id for m in messages) else [])}
+    assistant_run_ids={m.run_id for m in messages if m.role=='assistant'}
+    if active_run:
+        assistant_run_ids.add(active_run.id)
+    legacy_empty_runs={m.run_id for m in messages if m.role=='assistant' and m.run_id in trace_runs and
+                       m.content.strip() in ('',EMPTY_REPLY) and
+                       not any(e.get('type')=='outcome' for e in (trace_runs[m.run_id].events or []))}
+    legacy_tool_runs=set()
+    if legacy_empty_runs:
+        event=ChatStreamEvent.event
+        legacy_tool_runs={rid for rid, in db.query(ChatStreamEvent.run_id).filter(
+            ChatStreamEvent.run_id.in_(legacy_empty_runs),
+            event['type'].as_string()=='tool',
+            event['payload']['status'].as_string().in_(('complete','error'))
+        ).distinct()}
+    notices={}
+    replies={}
+    run_notices={}
+    for message in messages:
+        if message.role=='assistant':
+            run=trace_runs.get(message.run_id)
+            notice=turn_notice(message.content,(run.events or []) if run else [],
+                               tool_finished=message.run_id in legacy_tool_runs)
+            notices[message.id]=notice
+            if run and notice:
+                run_notices[run.id]=notice
+            cleaned,_=split_incomplete_tool_call(message.content)
+            replies[message.id]=parse_model_response(cleaned)[0] if cleaned.strip() != EMPTY_REPLY else ''
     models=db.query(Model).join(Provider).filter(Model.enabled==True,Provider.enabled==True).all()
     runs=(db.query(AgentRun).filter_by(project_id=pid,discussion_id=selected.id)
           .order_by(AgentRun.created_at.desc()).limit(7).all()) if selected else []
     response=page(request,"discussion.html",db=db,user=u,session=s,pr=pr,discussions=discussions,discussion=selected,messages=messages,
                 models=models,runs=runs,trace_runs=trace_runs,active_run=active_run,
+                assistant_run_ids=assistant_run_ids,notices=notices,replies=replies,run_notices=run_notices,
                 modes=MODES,roles=ROLES,active="discussion")
     response.headers['Cache-Control']='no-store'
     return response
@@ -1507,6 +1535,8 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
         usage={}
         thinking_trace=None
         document_output_limited=False
+        output_limited=False
+        was_draft_ready=(p.profile or {}).get('_discovery',{}).get('status')=='draft_ready'
         def emit(event_type,payload=None,**extra):
             return wire(frame(event_type,payload or {},**extra))
         try:
@@ -1528,7 +1558,8 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
             )
 
             async def stream_attempt(prompt):
-                nonlocal first_token_ms, thinking_trace, full, document_output_limited
+                nonlocal first_token_ms, thinking_trace, full, document_output_limited, output_limited
+                output_limited=False
                 attempt_usage={}
                 pi_kwargs={'role':role,'mode':mode,'run_id':run_id,'actor_id':actor_id}
                 if prompt is not None:
@@ -1554,18 +1585,25 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
                                 yield emit('timing',{'first_token_ms':first_token_ms})
                         elif typ=='final':
                             txt=payload.get('text','')
-                            if txt:full=[txt]
+                            if isinstance(txt,str):full=[txt]
+                            if payload.get('stop_reason') is not None:
+                                output_limited=payload['stop_reason']=='length'
                         elif typ=='usage':
                             for k,v in payload.items():
                                 if v is not None:
                                     attempt_usage[k]=v
                         elif typ=='error':
                             raise RuntimeError(payload.get('message','Lỗi Pi Runner'))
-                        if typ=='status' and payload.get('phase')=='document_output_limit':
-                            document_output_limited=True
-                        if typ in ('status','tool') and len(trace)<64:
+                        if typ=='status' and payload.get('phase') in OUTPUT_LIMIT_PHASES:
+                            output_limited=True
+                            if payload['phase']=='document_output_limit':
+                                document_output_limited=True
+                        is_trace_event=typ=='status' or (typ=='tool' and payload.get('status') not in ('toolcall_delta','update'))
+                        if is_trace_event and len(trace)<64:
                             item={'type':typ,'at_ms':int((time.monotonic()-clock)*1000)}
-                            if typ=='status':item['message']=str(payload.get('message',''))[:220]
+                            if typ=='status':
+                                item['message']=str(payload.get('message',''))[:220]
+                                item['phase']=str(payload.get('phase',''))[:60]
                             else:item.update({'name':str(payload.get('name',''))[:80],
                                               'id':str(payload.get('id',''))[:100],
                                               'status':str(payload.get('status',''))[:30],
@@ -1582,7 +1620,7 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
                         usage[key]=value
 
             def resolve_planning_output():
-                raw=''.join(full).strip()
+                raw,incomplete_tool=split_incomplete_tool_call(''.join(full).strip())
                 output, brief=parse_model_response(raw,interactive=bool(existing_run_id and mode=='discovery'))
                 sdb.expire_all()
                 pending=sdb.query(PlanningQuestion).filter_by(
@@ -1593,12 +1631,12 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
                         pending,_=save_question(sdb,pid,did,brief)
                     except (ValueError,TypeError,KeyError):
                         output=parse_model_response(raw)[0]
-                return output, pending, discovery
+                return output, pending, discovery, incomplete_tool
 
             async with aclosing(stream_attempt(advance_prompt if advance else None)) as events:
                 async for event in events:
                     yield event
-            output,pending,discovery=resolve_planning_output()
+            output,pending,discovery,incomplete_tool=resolve_planning_output()
             auto_next=bool(existing_run_id and data.get('auto_next') is True and mode=='discovery' and not advance)
             retry_document=bool(existing_run_id and advance and document_output_limited)
             if (auto_next or retry_document) and not pending and discovery.get('status')!='draft_ready':
@@ -1618,6 +1656,7 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
                     next_status='Pi đang thử lại với phần tài liệu ngắn hơn…'
                 # Keep the follow-up in this durable run and Pi session.
                 first_output=output
+                first_output_limited=output_limited
                 yield emit('final',{'text':first_output+'\n\n' if first_output else ''})
                 yield emit('status',{'phase':'request','message':next_status})
                 full=[]
@@ -1632,16 +1671,22 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
                     # The first prompt already ran. Keep its result instead of
                     # making the saved answer retryable and repeating tool calls.
                     full=[]
+                    output_limited=first_output_limited
                     yield emit('status',{'phase':'request','message':'Pi chưa thể tiếp tục Discovery.'})
-                next_output,pending,discovery=resolve_planning_output()
+                next_output,pending,discovery,next_incomplete=resolve_planning_output()
+                incomplete_tool=next_incomplete or (incomplete_tool and not next_output)
                 output='\n\n'.join(part for part in (first_output,next_output) if part)
-            if not output:
-                output=('Chọn một phương án để tiếp tục.' if pending else '(Không có nội dung phản hồi)')
+            draft_ready=discovery.get('status')=='draft_ready'
+            notice=turn_notice(output,trace,limited=output_limited,pending=bool(pending),
+                               handoff=draft_ready and not was_draft_ready,incomplete_tool=incomplete_tool)
+            # Persist even a null notice so a recovered retry does not inherit
+            # a limit warning from the previous attempt on reload.
+            trace.append({'type':'outcome','notice':notice})
             if (advance or auto_next) and not pending and discovery.get('status')!='draft_ready':
                 yield emit('planning_needs_input')
             if pending:
                 yield emit('planning_question',question_payload(pending))
-            if discovery.get('status')=='draft_ready':
+            if draft_ready and not was_draft_ready:
                 yield emit('planning_complete',{'status':'draft_ready','summary':discovery.get('summary',''),
                                                 'url':f'/projects/{pid}/artifacts'})
             yield emit('final', {'text':output})
@@ -1656,7 +1701,7 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
             seconds=max(0,(run.duration_ms-first_token_ms)/1000) if first_token_ms is not None else 0
             output_tps=round(usage['output_tokens']/seconds,2) if seconds>0 and isinstance(usage.get('output_tokens'),int) else None
             yield finish(sdb,run,frame('done',{'duration_ms':run.duration_ms,'first_token_ms':first_token_ms,
-                                               'usage':usage,'output_tps':output_tps}))
+                                               'usage':usage,'output_tps':output_tps,'notice':notice}))
         except ChatBusy:
             raise
         except (asyncio.CancelledError, GeneratorExit, Exception) as exc:

@@ -200,12 +200,14 @@ async function streamSession(current,data,res){
     if(event.type==='agent_start'||event.type==='turn_start')sse(res,'status',{phase:'thinking',message:'Pi đang xử lý…'});
     if(event.type==='tool_execution_start')sse(res,'tool',{name:event.toolName,id:event.toolCallId,status:'running',arguments:JSON.stringify(event.args||{}).slice(0,8000)});
     if(event.type==='tool_execution_update')sse(res,'tool',{name:event.toolName,id:event.toolCallId,status:'update'});
-    if(event.type==='tool_execution_end')sse(res,'tool',{name:event.toolName,id:event.toolCallId,status:event.isError?'error':'complete',
+    if(event.type==='tool_execution_end')sse(res,'tool',{name:event.toolName,id:event.toolCallId,status:event.isError||event.result?.details?.error?'error':'complete',
       result:JSON.stringify(event.result||{}).slice(0,8000)});
     if(event.type==='message_end'&&event.message?.role==='assistant'){
-      if(event.message.stopReason==='length'&&event.message.content?.some(block=>
-        block.type==='toolCall'&&['write_document','finish_discovery'].includes(block.name))){
-        sse(res,'status',{phase:'document_output_limit',message:'Lệnh ghi tài liệu bị cắt do giới hạn đầu ra.'});
+      if(event.message.stopReason==='length'){
+        const documentCutoff=event.message.content?.some(block=>
+          block.type==='toolCall'&&['write_document','finish_discovery'].includes(block.name));
+        sse(res,'status',{phase:documentCutoff?'document_output_limit':'output_limit',
+          message:documentCutoff?'Lệnh ghi tài liệu bị cắt do giới hạn đầu ra.':'Model đã chạm giới hạn đầu ra.'});
       }
       output+=assistantText(event.message)||partial;
       partial='';
@@ -232,7 +234,7 @@ async function streamSession(current,data,res){
     const last=sess.messages?.filter(m=>m.role==='assistant').at(-1);
     if(current.cancelled||last?.stopReason==='aborted')throw err(409,'Pi run cancelled');
     if(last?.stopReason==='error')throw err(502,'Pi model request failed');
-    sse(res,'final',{text:output+partial});
+    sse(res,'final',{text:output+partial,stop_reason:last?.stopReason});
   } catch(e) {
     loggedError(e);
     sse(res,'error',{message:safeDetail(e)});
