@@ -146,8 +146,19 @@ def build_artifacts(db, pid):
                           f'## Must-read documents\n'+ '\n'.join(f'- `{path}` — {label}' for label,path in ARTIFACTS.values())+'\n\n'
                           f'## Work plan\n{phase_list()}\n'
                           f'## Approval and known gaps\nThis bundle contains generated drafts. Review BMAD gates, findings, unresolved questions and acceptance before implementation.\n')
+    answers=[]
+    for q in questions:
+        if q.status!='answered':continue
+        a=q.answer or {}
+        labels=a.get('selected_labels') or []
+        answer=', '.join(str(x) for x in labels) if isinstance(labels,list) else str(labels)
+        if a.get('custom_answer'):answer += ('; ' if answer else '')+str(a['custom_answer'])
+        if a.get('note'):answer += '; Ghi chú: '+str(a['note'])
+        answers.append(f'- **{_clean(q.question,450)}** (`planning-question/{q.id}`): {_block(answer)}')
+    appendix=('\n\n## User-confirmed discovery answers (NOT formal approvals)\n'
+              +'\n'.join(answers[:60])+'\n') if answers else ''
     return {key:{'title':ARTIFACTS[key][0], 'path':ARTIFACTS[key][1],
-                 'content':(header+value)[:MAX_TEXT//2]}
+                 'content':(header+value+appendix)[:MAX_TEXT//2]}
             for key,value in artifacts.items()}
 
 

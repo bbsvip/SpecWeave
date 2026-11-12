@@ -14,6 +14,9 @@ export const TOOL_DEFS = [
   ['write_document','Write DRAFT Markdown only, never approve it',Type.Object({filename:short(120),content:short(50000)})],
   ['propose_decision','Propose an unapproved decision',Type.Object({title:short(250),description:short(6000),rationale:optional(4000)})],
   ['propose_requirement','Propose an unapproved requirement',Type.Object({title:short(250),description:short(6000),criteria:optional(4000),priority:optional(20)})],
+  ['finish_discovery','Mark discovery ready ONLY after complete interview and substantive draft docs; human review required',Type.Object({
+    summary:short(6000),remaining_unknowns:Type.Array(Type.String({maxLength:1000}),{maxItems:15}),evidence:short(6000)
+  })],
   ['propose_memory','Propose memory for human review',Type.Object({summary:short(2400)})],
   ['propose_planning_question','Propose a guided choice with human approval',Type.Object({
     question:short(2000),context:optional(6000),

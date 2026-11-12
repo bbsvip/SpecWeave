@@ -1,46 +1,56 @@
-# SpecWeave v1.0.0 — Pi-Native Planning Workspace
+# SpecWeave v1.0.2 — Pi-Native Continuous Discovery
 
-Ứng dụng self-hosted để xây dựng đặc tả dự án bằng các cuộc trao đổi có hướng dẫn với AI, nghiên cứu, requirements, spec graph, BMAD-inspired workflows, phê duyệt và xuất tài liệu.
+SpecWeave is a self-hosted workspace for turning project ideas into implementation-ready specifications through guided AI conversations, research, requirements management, a traceability graph, BMAD-inspired workflows, human approvals, and document exports.
 
-**Thay đổi quan trọng:** toàn bộ model inference và agent execution chạy **duy nhất trong Pi SDK in-process** của container `pi-runner`. FastAPI không tự gọi LLM, không tự chạy agent thứ hai, không duy trì OpenAI-compatible fallback agent. Các provider local vẫn dùng được thông qua **Pi ModelRuntime**. Pi cung cấp session, context/compaction, thinking/tool events và usage. Frontend không yêu cầu Node.js để build.
+**Architecture:** All model inference and agent execution run exclusively through the **in-process Pi SDK** inside the `pi-runner` service. FastAPI does not call LLMs directly, run a second agent, or maintain a fallback OpenAI-compatible agent. Local and remote OpenAI-compatible models remain available **through Pi's model runtime**. Pi owns agent sessions, context and compaction, thinking and tool events, and usage reporting. The frontend requires no Node.js build step.
 
-> **Trạng thái phát hành:** code tích hợp và automated tests được cung cấp, nhưng chưa xác minh Pi package từ npm, Docker build/runtime, OAuth OpenAI thật hoặc model thật trong môi trường biên soạn này. Không mặc định kết luận production-ready. Xem `docs/RELEASE_v1.0_PI_NATIVE.vi.md`.
+> **Release status:** The repository includes integration code and automated tests, but the Pi package installed from npm, actual Docker builds and runtime behavior, live OpenAI OAuth, and live model integrations have not been verified in the development environment used to prepare this release. Do not treat this release as production-validated. See [`docs/RELEASE_v1.0.2_CONTINUOUS_DISCOVERY.vi.md`](docs/RELEASE_v1.0.2_CONTINUOUS_DISCOVERY.vi.md) and [`docs/RELEASE_v1.0_PI_NATIVE.vi.md`](docs/RELEASE_v1.0_PI_NATIVE.vi.md) for the implementation details and validation checklist. These two documents are currently in Vietnamese.
 
-## Chức năng sản phẩm
+## Features
 
-- First-run Admin, login, session revocation, CSRF, Argon2id, quyền project owner/editor/viewer.
-- Project wizard, preset, CRUD, trash/restore, chuyển chủ sở hữu.
-- Discussion chat streaming: thinking (khi provider hỗ trợ), tool calls, usage/TTFT, SSE, stop, session history, guided questions có phương án được đề xuất.
-- Model Manager: OpenAI-compatible API key/endpoint, OpenAI OAuth **riêng tư theo chủ tài khoản**, model list, model lựa chọn từng dự án.
-- Planning: goals, requirements/criteria, quyết định, traceability graph, coverage và roadmap.
-- BMAD-inspired docs, Semantic Review và multi-role review nền, quality gates, approval, Markdown draft và export.
-- SearXNG, HTTP research, Playwright/Chromium, File Manager nhiều dự án có quota và versioning.
-- GitHub Actions → GHCR image `-web` và `-pi` có cache; PostgreSQL trong Compose hoặc kết nối ngoài.
+- **Accounts and access control:** First-run administrator setup, login, session revocation, CSRF protection, Argon2id password hashing, and project owner/editor/viewer roles.
+- **Project management:** New-project wizard, reusable presets, project CRUD, trash and recovery, and ownership transfer.
+- **AI discussion:** Streaming chat over SSE, thinking when exposed by the model, tool-call activity, usage and time-to-first-token (TTFT) metrics, stop controls, persistent discussion history, and guided questions with recommended options.
+- **Providers and models:** OpenAI-compatible API keys/endpoints, owner-scoped OpenAI OAuth, model discovery, and per-project model selection. Model execution is handled by Pi.
+- **Planning and traceability:** Goals, requirements, acceptance criteria, decisions, coverage checks, a specification graph, and a roadmap.
+- **Quality and deliverables:** BMAD-inspired draft documents, semantic review, background multi-role reviews, quality gates, human approval, Markdown document management, and exports.
+- **Research and files:** SearXNG, HTTP research, Playwright/Chromium, and a project-scoped file manager with quotas and revision history.
+- **Deployment:** Docker Compose with bundled or external PostgreSQL, plus GitHub Actions publishing cached `-web` and `-pi` images to GHCR.
 
-## Kiến trúc
+## Architecture
 
 ```text
 Browser (Jinja2 + JavaScript + SSE)
   ↕
-FastAPI (auth, ACL, PostgreSQL, documents, approvals, project-scoped tool gateway)
+FastAPI (authentication, authorization, PostgreSQL, documents,
+         approvals, project-scoped tool gateway)
   ↕
-Pi Agent Host (Node.js riêng: createAgentSession, ModelRuntime, SessionManager)
+Pi Agent Host (separate Node.js service: createAgentSession,
+               ModelRuntime, SessionManager)
   ↘ scoped tools → FastAPI
 ```
 
-Pi SDK `noTools: 'builtin'` chặn tool shell/file hệ thống, chỉ custom tools của SpecWeave qua FastAPI có HMAC capability. Data của từng dự án ở `/data/projects/<uuid>`, Pi sessions ở `<project>/.system/pi-native/<discussion-id>/sessions`. OAuth vault riêng ở `/auth-local/.pi/agent/auth.json`. API keys của provider không ghi vào Pi session files hoặc `models.json` mà chuyển vào memory runtime.
+The Pi SDK runs without built-in shell/filesystem tools (`noTools: 'builtin'`). Only SpecWeave's project-scoped custom tools are exposed through the FastAPI gateway, protected by HMAC capabilities.
 
-## Chạy Compose: PostgreSQL ngoài
+- **Project data:** `/data/projects/<project-uuid>`
+- **Pi sessions:** `<project>/.system/pi-native/<discussion-id>/sessions`
+- **Local OpenAI OAuth vault:** `/auth-local/.pi/agent/auth.json`
+
+Provider API keys are supplied to the model runtime in memory; they are not written into Pi session files or `models.json`.
+
+## Quick start: External PostgreSQL
+
+Copy the configuration template:
 
 ```sh
 cp .env.example .env
 ```
 
-Cấu hình tối thiểu:
+Set at least the following values in `.env`:
 
 ```ini
 DATABASE_URL=postgresql+psycopg://your_user:your_password@your_db_host:5432/specweave
-ENCRYPTION_KEY=VALID_32_BYTE_FERNET_BASE64
+ENCRYPTION_KEY=YOUR_VALID_32_BYTE_FERNET_BASE64_KEY
 BOOTSTRAP_TOKEN=YOUR_RANDOM_BOOTSTRAP_SECRET
 PI_RUNNER_URL=http://pi-runner:8090
 PI_RUNNER_KEY=YOUR_RANDOM_SECRET_AT_LEAST_32_CHARACTERS
@@ -48,47 +58,55 @@ COOKIE_SECURE=true
 OPENAI_OAUTH_LOCAL_MODE=false
 ```
 
-Tạo Fernet key **mới** chỉ cho bản cài mới (không đổi key nếu đã lưu provider credentials):
+**Generate a new Fernet key only for a fresh installation:**
 
 ```sh
-python3 -c "import base64,secrets;print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())"
+python3 -c "import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())"
 ```
 
-Build local (Pi service là bắt buộc):
+**Do not rotate `ENCRYPTION_KEY` casually when upgrading.** Changing it without a proper key-migration procedure prevents decryption of previously stored provider credentials. Never commit `.env` or secrets to Git.
+
+### Build locally
+
+Pi is mandatory; no `--profile pi` flag is needed:
 
 ```sh
 docker compose -f compose.external-db.yaml up -d --build
 ```
 
-Dùng GHCR image đã publish từ repository:
+### Deploy prebuilt images from GHCR
+
+After GitHub Actions has published the corresponding tag, configure:
 
 ```ini
 SPECWEAVE_IMAGE_REPO=ghcr.io/your-user/your-repository
-SPECWEAVE_IMAGE_TAG=v1.0.0
+SPECWEAVE_IMAGE_TAG=v1.0.2
 ```
+
+Set the repository name to lowercase and omit the `-web` / `-pi` suffix. The tag must actually exist in your GHCR packages. Then deploy:
 
 ```sh
 docker compose -f compose.external-db.images.yaml pull
 docker compose -f compose.external-db.images.yaml up -d --no-build
 ```
 
-Không cần `--profile pi`: image Pi luôn được chạy. Với PostgreSQL tích hợp: `docker compose up -d --build`, hoặc `docker compose -f compose.images.yaml up -d` nếu dùng GHCR.
+For **bundled PostgreSQL**, run `docker compose up -d --build`, or use `docker compose -f compose.images.yaml up -d` with prebuilt GHCR images.
 
-Khởi tạo tài khoản: `http://<server>:8080/first-run`. Với Cloudflare Tunnel dùng domain HTTPS và `COOKIE_SECURE=true`.
+Open `http://<server>:8080/first-run` to create the initial administrator account. If you expose SpecWeave through an HTTPS domain (for example, via Cloudflare Tunnel), use `COOKIE_SECURE=true`.
 
-## Nâng cấp từ v0.9.8
+## Upgrading from v0.9.8 or v1.0.x
 
-1. **Backup** PostgreSQL và các volumes `projects_data`, `openai_oauth_local` (và `postgres_data` nếu DB tích hợp).
-2. Thay code bằng v1.0.0; CI publish cả hai images từ **cùng commit/tag**.
-3. Giữ `.env`, `ENCRYPTION_KEY`, volumes và dữ liệu cũ; cấu hình Pi strong key.
-4. `docker compose ... pull`, rồi `docker compose ... up -d --no-build`.
-5. Alembic `0009_pi_native` chỉ chuyển trường `agent_backend` cũ sang `pi`; không xóa lịch sử. Pi session bắt đầu từ history đã lưu trước đó và tiếp tục ở bộ nhớ/volume của Pi.
+1. **Back up** PostgreSQL and the `projects_data` and `openai_oauth_local` volumes. Back up `postgres_data` too if you use bundled PostgreSQL.
+2. Update the source to v1.0.2, or publish the `-web` and `-pi` images from **the same commit/tag**.
+3. Preserve `.env`, `ENCRYPTION_KEY`, volumes, and existing project data. Keep `PI_RUNNER_KEY` strong and consistent across services.
+4. With GHCR images, run `docker compose ... pull`, followed by `docker compose ... up -d --no-build` using the appropriate Compose file.
+5. If upgrading from v0.9.8, Alembic revision `0009_pi_native` converts the old project `agent_backend` setting to `pi`. Existing discussion history is retained and used to seed new Pi sessions. Upgrading from v1.0.x does not require re-creating projects or clearing sessions.
 
-Không sử dụng `alembic stamp head` để bỏ qua bước migration. Không xóa `openai_oauth_local`.
+Do **not** use `alembic stamp head` to bypass an unapplied migration. Do **not** delete the `openai_oauth_local` volume.
 
-## Phát triển không package hóa Python
+## Development without Python packaging
 
-Code ở `source/`, môi trường chạy ở `.venv/` và **không nằm trong source**:
+Keep application code inside `source/` and the virtual environment outside it, in `.venv/`. Run Python files directly; no editable package installation (`pip install -e .`) is required.
 
 ```sh
 python -m venv .venv
@@ -97,9 +115,11 @@ pip install -r requirements.txt
 python source/app.py
 ```
 
-Pi Agent Host cần Node.js riêng với `@earendil-works/pi-coding-agent` và chạy `node source/pi_host.mjs` với config + project volume đúng. Không có `pip install -e .` và không có frontend Node.js build.
+The Pi Agent Host runs in a separate Node.js runtime with `@earendil-works/pi-coding-agent`. It can be started with `node source/pi_host.mjs` when its runtime configuration and project storage are correctly provided. The frontend does **not** require Node.js or a bundling/build pipeline.
 
-## Kiểm thử tự động
+When scanning or indexing the repository, exclude `.venv/`, `venv/`, `node_modules/`, caches, and other generated runtime directories.
+
+## Automated tests
 
 ```sh
 python -m pytest -q tests
@@ -107,11 +127,32 @@ python -m compileall -q source tests migrations
 node --test tests/test_openai_oauth_contract.mjs tests/test_pi_native_host.mjs
 ```
 
-`tests/test_pi_native_host.mjs` dùng Pi SDK mock để kiểm tra hợp đồng; **không phải** end-to-end với Pi thật. GitHub Actions còn build/preflight các SDK exports, còn anh tự nghiệm thu Docker, live model, OAuth và browser theo release notes.
+The Pi Native Host contract tests use a **mock Pi SDK**. They do not constitute an end-to-end test of a real Pi installation or provider. GitHub Actions also performs SDK import/export checks during the image build. Validate Docker, live model connectivity, OpenAI OAuth, and the browser experience in your deployment environment.
 
-## Tài liệu
+## Continuous discovery in v1.0.2
 
-- [`docs/RELEASE_v1.0_PI_NATIVE.vi.md`](docs/RELEASE_v1.0_PI_NATIVE.vi.md): migration, kiến trúc Pi SDK, tool policy, giới hạn và nghiệm thu.
-- [`docs/PRODUCT_ACCEPTANCE.v0.8.vi.md`](docs/PRODUCT_ACCEPTANCE.v0.8.vi.md): checklist cũ còn hữu ích cho vận hành.
-- `docs/reference/`: master spec và UI/UX blueprint gốc.
-- `docs/`: lịch sử feature releases trước đây.
+The planning workflow is designed to continue within **one discussion and one Pi session**:
+
+1. Pi evaluates the project context and asks a focused question with candidate answers and a recommendation.
+2. The user selects, customizes, or defers an option in the chat interface.
+3. Confirming an answer saves it and **streams the next Pi turn within the same request** via `/planning/questions/{qid}/answer-stream`—no additional **Send** or **AI Suggest** click is required.
+4. Pi analyzes the answer in the existing session, explains its implications, and asks the next unresolved question.
+5. Once enough information has been collected, Pi can draft Markdown documents and call `finish_discovery` to generate any missing BMAD artifacts. All generated documents remain **drafts requiring human review**, never automatically approved.
+
+The frontend also supports resuming a previously saved answer that was not yet processed by Pi. See [`docs/RELEASE_v1.0.2_CONTINUOUS_DISCOVERY.vi.md`](docs/RELEASE_v1.0.2_CONTINUOUS_DISCOVERY.vi.md) for the API behavior, edge cases, and test coverage.
+
+## Documentation
+
+- [`docs/RELEASE_v1.0.2_CONTINUOUS_DISCOVERY.vi.md`](docs/RELEASE_v1.0.2_CONTINUOUS_DISCOVERY.vi.md) — Continuous discovery, event flow, API, and validation notes (Vietnamese).
+- [`docs/RELEASE_v1.0_PI_NATIVE.vi.md`](docs/RELEASE_v1.0_PI_NATIVE.vi.md) — Pi SDK architecture, migration, tool policy, and limitations (Vietnamese).
+- [`docs/PRODUCT_ACCEPTANCE.v0.8.vi.md`](docs/PRODUCT_ACCEPTANCE.v0.8.vi.md) — Product acceptance checklist (Vietnamese).
+- `docs/reference/` — Original master specification and UI/UX blueprint.
+- `docs/` — Historical feature releases and implementation notes.
+
+## Operational and security notes
+
+- Keep the Pi runner reachable only through your trusted internal network; do not expose its management API publicly.
+- OpenAI OAuth is optional, owner-scoped, and disabled by default. Enable `OPENAI_OAUTH_LOCAL_MODE` only in an explicitly supported, individual user-controlled deployment; follow the provider's applicable terms.
+- Project tools are authorization-checked. Agent-generated decisions, requirements, and documents should be reviewed before approval or external handoff.
+- Preserve PostgreSQL and persistent project/OAuth volumes across image updates.
+- Passing automated tests does not establish production readiness; perform the deployment-specific checks documented above.

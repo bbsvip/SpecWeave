@@ -170,7 +170,8 @@ async function runStream(data,res){
       if(update.type==='text_delta'&&typeof update.delta==='string'){output+=update.delta;sse(res,'delta',{text:update.delta});}
       if(update.type==='thinking_delta'&&typeof update.delta==='string'){thought+=update.delta;sse(res,'thinking',{text:update.delta});}
       if(update.type==='toolcall_start'||update.type==='toolcall_delta'||update.type==='toolcall_end'){
-        sse(res,'tool',{name:update.toolCall?.name||'Pi tool',id:update.toolCall?.id||'',status:update.type,
+        sse(res,'tool',{name:update.toolName||update.toolCall?.name||'Pi tool',
+          id:update.id||update.toolCall?.id||String(update.contentIndex??''),status:update.type,
           arguments:typeof update.delta==='string'?update.delta.slice(0,12000):undefined});
       }
     }

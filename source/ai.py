@@ -46,6 +46,7 @@ TOOLS = [
  {"type":"function","function":{"name":"propose_decision","description":"Record a decision proposal; requires human approval.","parameters":{"type":"object","properties":{"title":{"type":"string"},"description":{"type":"string"},"rationale":{"type":"string"}},"required":["title","description"]}}},
  {"type":"function","function":{"name":"propose_requirement","description":"Record a draft requirement with acceptance criteria.","parameters":{"type":"object","properties":{"title":{"type":"string"},"description":{"type":"string"},"criteria":{"type":"string"},"priority":{"type":"string"}},"required":["title","description"]}}},
  {"type":"function","function":{"name":"propose_planning_question","description":"Present ONE interactive decision brief with 2-4 realistic options, explicit recommendation and tradeoffs. Ask the user to select, discuss, customize or defer; never approve spec automatically.","parameters":{"type":"object","properties":{"question":{"type":"string"},"context":{"type":"string"},"options":{"type":"array","minItems":2,"maxItems":4,"items":{"type":"object","properties":{"label":{"type":"string"},"description":{"type":"string"},"pros":{"type":"string"},"cons":{"type":"string"}},"required":["label","description","pros","cons"]}},"recommended_index":{"type":"integer"},"recommendation_reason":{"type":"string"},"impact":{"type":"string"},"assumptions":{"type":"array","items":{"type":"string"}},"allow_multiple":{"type":"boolean"},"sources":{"type":"array","items":{"type":"string"}}},"required":["question","options","recommended_index","recommendation_reason"]}}},
+ {"type":"function","function":{"name":"finish_discovery","description":"Only when user requirements have been clarified: register discovery completion and publish implementation-ready DRAFT artifacts for human review. Never auto-approve. Use after creating substantive documents through write_document. If critical unknowns remain, call propose_planning_question instead.","parameters":{"type":"object","properties":{"summary":{"type":"string"},"remaining_unknowns":{"type":"array","items":{"type":"string"}},"evidence":{"type":"string"}},"required":["summary","remaining_unknowns","evidence"]}}},
  {"type":"function","function":{"name":"propose_memory","description":"Write a compact proposed memory note. Never overwrite confirmed project facts.","parameters":{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}}},
 ]
 
@@ -91,7 +92,10 @@ Rules:
 - Never just ask an open-ended question and expect the user to invent options. Proactively draft 2-4 credible approaches with clear pros/cons and mark ONE recommended default with rationale.
 - In discovery/design, call propose_planning_question for interactive option cards whenever the model supports tools. Ask only ONE significant open question per turn.
 - NEVER print raw JSON describing choices/options in prose. When tools are unavailable, write clear Markdown with headings and bullet points for each option. Do not output JSON arrays or objects of options in chat.
-- When the user's latest turn is a confirmed answer to a planning question, FIRST acknowledge and evaluate its implications, update relevant draft context where permitted, THEN identify the next genuinely unanswered high-impact question. Continue in the SAME discussion. Never demand that the user click a separate button to continue.
+- The discovery interview is a LOOP. After every confirmed user answer, continue in the SAME Pi session without requiring another click. Explain implications, make draft requirements/decisions via tools where useful, and ask the NEXT most important question using propose_planning_question.
+- STOP ASKING only after you have enough grounded information on goals, users, scope, capabilities, user roles/access control, integrations, data ownership, technology/deployment, constraints, operational risks, testable acceptance and unresolved assumptions. Do not assume details based on product category.
+- When all material gaps are genuinely resolved, write DETAILED draft Markdown deliverables with write_document (not just empty outlines). Then call finish_discovery with a meaningful summary, evidence, and remaining_unknowns=[]; that tool validates whether the interview may finish, publishes missing draft artifact outlines, and never approves documents.
+- If finish_discovery returns needs_discovery, immediately ask one relevant clarification with propose_planning_question. Never claim handoff readiness when the tool rejected completion.
 - Offer the user the ability to select, discuss, customize or defer. Do not regard an AI recommendation as human approval.
 - Prioritize unanswered high-impact decisions over trivial choices. Explicitly label hypotheses and unverified assumptions.
 - Keep responses in Vietnamese unless user requests otherwise. Use clear structured Markdown.
@@ -111,6 +115,33 @@ async def tool_call(name, args, *, project, db, discussion_id=None):
         if not discussion_id: return {"error":"Requires a live discussion"}
         item, created = save_question(db,pid,discussion_id,args)
         return {"id":item.id,"status":item.status,"created":created,"recommendation":item.recommended_id}
+    if name == "finish_discovery":
+        from artifact_builder import ARTIFACTS, publish_artifacts
+        questions = db.query(PlanningQuestion).filter_by(project_id=pid,discussion_id=discussion_id).all()
+        answered = [q for q in questions if q.status=='answered']
+        pending = [q for q in questions if q.status=='pending']
+        unknowns = args.get('remaining_unknowns', [])
+        summary = str(args.get('summary','')).strip()
+        evidence = str(args.get('evidence','')).strip()
+        if (len(answered)<3 or pending or not summary or len(summary)<120 or not evidence or
+            not isinstance(unknowns,list) or any(str(x).strip() for x in unknowns)):
+            return {'status':'needs_discovery','answered':len(answered),'pending':len(pending),
+                    'message':'Cần ít nhất 3 câu trả lời, không có câu hỏi đang chờ; AI phải làm rõ mọi vấn đề quan trọng trước khi chốt.',
+                    'remaining_unknowns':unknowns if isinstance(unknowns,list) else []}
+        existing={x.path for x in db.query(Document).filter_by(project_id=pid).all()}
+        missing=[key for key,(_title,path) in ARTIFACTS.items() if path not in existing]
+        # Publish drafts only. Never overwrite an existing document, particularly an approved one.
+        records=publish_artifacts(db,pid,missing,overwrite=False) if missing else []
+        from db import Project
+        pr=db.get(Project,pid)
+        pr.profile={**(pr.profile or {}),'_discovery':{
+            'status':'draft_ready','summary':summary[:6000],
+            'evidence':evidence[:6000], 'answered_questions':len(answered),
+            'documents_created':[r['path'] for r in records],
+            'review_required':True}}
+        db.commit()
+        return {'status':'draft_ready','documents_created':[r['path'] for r in records],
+                'message':'Bản draft đã có trong Document Studio và BMAD Artifacts, cần con người review và approve.'}
     if name == "list_project_files":
         folder = args.get("folder", "")[:300]
         if folder.split("/")[0] not in ("", "inputs", "docs", "notes", "research", "decisions"):
@@ -127,8 +158,10 @@ async def tool_call(name, args, *, project, db, discussion_id=None):
         if not name_only.endswith(".md"): name_only += ".md"
         path = "docs/drafts/" + name_only
         content = str(args.get("content", ""))
-        write_text(pid, path, content)
         doc = db.query(Document).filter_by(project_id=pid,path=path).first()
+        if doc and doc.status=='approved':
+            return {'error':'Tài liệu đã duyệt, không cho phép AI ghi đè', 'path':path}
+        write_text(pid, path, content)
         if doc: doc.revision += 1; doc.status = "draft"
         else: db.add(Document(project_id=pid,path=path,title=name_only))
         db.commit()
@@ -175,7 +208,7 @@ def pi_tool_token(run_id: str, project_id: str, discussion_id: str, created_at) 
     return hmac.new(secret.encode(),payload.encode(),hashlib.sha256).hexdigest()
 
 
-async def pi_stream(project, discussion, db, model, *, role, mode, run_id, actor_id=None):
+async def pi_stream(project, discussion, db, model, *, role, mode, run_id, actor_id=None, prompt_override=None):
     """Forward Pi SDK events; no independent LLM client or tool loop exists here."""
     from db import AgentRun
     from pi_client import stream
@@ -183,7 +216,7 @@ async def pi_stream(project, discussion, db, model, *, role, mode, run_id, actor
     if not run or run.project_id!=project.id or run.discussion_id!=discussion.id:
         raise RuntimeError('Unknown Pi run')
     history=db.query(Message).filter_by(discussion_id=discussion.id).order_by(Message.created_at.desc()).limit(22).all()[::-1]
-    prompt=history[-1].content if history else ''
+    prompt=prompt_override if prompt_override is not None else (history[-1].content if history else '')
     payload={
         'project_id':project.id,'discussion_id':discussion.id,'run_id':run_id,
         'tool_token':pi_tool_token(run.id,run.project_id,run.discussion_id,run.created_at),

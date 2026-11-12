@@ -1702,3 +1702,254 @@ async def test_sse_heartbeat_does_not_cancel_waiting_model():
     assert completed==[True]
     assert any(name=='status' and payload['phase']=='waiting' for name,payload in events)
     assert events[-1]==('delta',{'text':'ok'})
+
+# v1.0.2: same-session Guided Discovery, atomic answer + Pi SSE, document handoff.
+
+def _make_discussion_with_model(client,csrf,label='guided-flow-model'):
+    provider=client.post('/api/providers',headers=csrf,json={
+        'name':'Local-Guided-Flow','base_url':'http://local.test/v1','api_key':'local-test'}).json()['id']
+    assert client.post(f'/api/providers/{provider}/models',headers=csrf,json={'model_ids':[label]}).status_code==200
+    with SessionLocal() as s:
+        mid=s.query(Model).filter_by(model_id=label).one().id
+    pid=create_project(client,csrf,'Guided Flow')
+    assert client.post(f'/api/projects/{pid}/settings',headers=csrf,
+                       json={'active_model_id':mid}).status_code==200
+    with SessionLocal() as s:
+        did=s.query(db.Discussion).filter_by(project_id=pid).one().id
+    return pid,did
+
+
+def test_answer_stream_atomic_continues_pi_and_surfaces_question(client,monkeypatch):
+    from planning import save_question
+    from db import PlanningQuestion
+    import importlib
+    module=importlib.import_module('app')
+    csrf=auth(client)
+    pid,did=_make_discussion_with_model(client,csrf)
+    with SessionLocal() as s:
+        q,_=save_question(s,pid,did,{
+            'question':'How should credentials be isolated?',
+            'options':[{'label':'Per account','pros':'Secure','cons':'More implementation'},
+                       {'label':'Shared','pros':'Simple','cons':'Risk of leaking'}],
+            'recommended_index':0,'recommendation_reason':'Data isolation is critical.'})
+        qid=q.id
+    async def fake_pi(project, discussion, dbs, model, **kw):
+        assert kw['run_id']
+        text=dbs.query(Message).filter_by(discussion_id=did,role='user').all()
+        assert len(text)==1 and 'Phương án người dùng chọn' in text[0].content
+        assert 'prompt_override' not in kw
+        yield 'status',{'phase':'thinking','message':'Pi nhận câu trả lời'}
+        yield 'thinking',{'text':'Assessing isolation tradeoffs'}
+        yield 'delta',{'text':'Đã xác nhận tài khoản riêng.'}
+        yield 'usage',{'input_tokens':140,'output_tokens':32}
+        # Real Pi tools transact via a separate gateway DB session.
+        with SessionLocal() as external:
+            save_question(external,pid,did,{
+                'question':'How will trades be audited?',
+                'options':[{'label':'Append-only ledger','pros':'Traceable','cons':'Storage'},
+                           {'label':'Event log','pros':'Lightweight','cons':'Less structured'}],
+                'recommended_index':0,'recommendation_reason':'Auditability matters.'})
+    monkeypatch.setattr(module,'pi_stream',fake_pi)
+    r=client.post(f'/api/projects/{pid}/planning/questions/{qid}/answer-stream',headers=csrf,json={
+        'selected_ids':['o1'],'custom_answer':'Separate accounts per user','note':'No shared credentials'})
+    assert r.status_code==200,r.text
+    assert '"type": "thinking"' in r.text
+    assert '"type": "delta"' in r.text
+    assert '"type": "planning_question"' in r.text
+    assert '"type": "done"' in r.text
+    with SessionLocal() as s:
+        q=s.get(PlanningQuestion,qid)
+        assert q.status=='answered' and q.answer.get('continuation_run_id')
+        msgs=s.query(Message).filter_by(discussion_id=did).all()
+        assert len(msgs)==2 and sorted(x.role for x in msgs)==['assistant','user']
+        assert s.query(PlanningQuestion).filter_by(discussion_id=did,status='pending').count()==1
+    retry=client.post(f'/api/projects/{pid}/planning/questions/{qid}/answer-stream',headers=csrf,json={
+        'selected_ids':['o1']})
+    assert retry.status_code==409
+
+
+def test_auto_advance_stays_in_same_pi_session_and_never_saves_fake_user(client,monkeypatch):
+    import importlib
+    module=importlib.import_module('app')
+    csrf=auth(client)
+    pid,did=_make_discussion_with_model(client,csrf,'advance-flow')
+    calls=[]
+    async def fake_pi(project,discussion,dbs,model,**kw):
+        calls.append(kw)
+        assert 'prompt_override' in kw
+        assert 'CÙNG session' in kw['prompt_override']
+        yield 'status',{'phase':'planning','message':'Pi đang lập câu hỏi'}
+        yield 'delta',{'text':'Đang rà những thông tin chưa rõ.'}
+    monkeypatch.setattr(module,'pi_stream',fake_pi)
+    r=client.post(f'/api/projects/{pid}/chat',headers=csrf,
+                  json={'discussion_id':did,'mode':'discovery','advance_planning':True})
+    assert r.status_code==200,r.text
+    assert '"type": "done"' in r.text
+    assert len(calls)==1
+    with SessionLocal() as s:
+        assert s.query(Message).filter_by(discussion_id=did,role='user').count()==0
+    assert client.post(f'/api/projects/{pid}/chat',headers=csrf,json={
+        'discussion_id':did,'mode':'discuss','advance_planning':True}).status_code==422
+    assert client.post(f'/api/projects/{pid}/chat',headers=csrf,json={
+        'discussion_id':did,'mode':'discovery','advance_planning':True,'message':'spoof'}).status_code==422
+
+
+@pytest.mark.asyncio
+async def test_finish_discovery_creates_unapproved_drafts_with_answers(client):
+    from planning import save_question, answer_question
+    from artifact_builder import ARTIFACTS
+    csrf=auth(client)
+    pid=create_project(client,csrf,'Draft Completion')
+    with SessionLocal() as s:
+        pr=s.get(Project,pid)
+        did=s.query(db.Discussion).filter_by(project_id=pid).one().id
+        for i in range(3):
+            q,_=save_question(s,pid,did,{
+                'question':f'Important scope question {i}?',
+                'options':[{'label':f'Selected choice {i}','pros':'Benefit','cons':'Cost'},
+                           {'label':'Alternative','pros':'Other benefit','cons':'Risk'}],
+                'recommended_index':0,'recommendation_reason':'Best fit for project scope'})
+            answer_question(s,q,{'selected_ids':['o1']})
+        invalid=await tool_call('finish_discovery',{'summary':'short','evidence':'yes','remaining_unknowns':[]},
+                                project=pr,db=s,discussion_id=did)
+        assert invalid['status']=='needs_discovery'
+        valid=await tool_call('finish_discovery',{
+            'summary':'The scope includes independent users, transactions, an auditable dashboard, separated credentials, and secure reconciliation. All critical cases and boundaries were discussed with the project owner.',
+            'evidence':'Three user-confirmed decisions are recorded in this discussion; open risks are documented in the drafts.',
+            'remaining_unknowns':[]},project=pr,db=s,discussion_id=did)
+        assert valid['status']=='draft_ready' and len(valid['documents_created'])==len(ARTIFACTS)
+        docs=s.query(Document).filter_by(project_id=pid).all()
+        assert len(docs)==len(ARTIFACTS) and all(x.status=='draft' for x in docs)
+        assert s.get(Project,pid).profile['_discovery']['status']=='draft_ready'
+        from storage import read_text
+        brief=read_text(pid,'docs/drafts/PRODUCT-BRIEF.md')
+        assert 'Selected choice 0' in brief and 'Selected choice 2' in brief
+        # Repeating completion does not overwrite or duplicate drafts.
+        again=await tool_call('finish_discovery',{
+            'summary':'The scope includes independent users, transactions, an auditable dashboard, separated credentials, and secure reconciliation. All critical cases and boundaries were discussed with the project owner.',
+            'evidence':'Three user decisions recorded.', 'remaining_unknowns':[]},
+            project=pr,db=s,discussion_id=did)
+        assert again['status']=='draft_ready' and not again['documents_created']
+        document=s.query(Document).filter_by(project_id=pid,path='docs/drafts/PRODUCT-BRIEF.md').one()
+        document.status='approved';s.commit()
+        protected=await tool_call('write_document',{'filename':'PRODUCT-BRIEF.md','content':'No overwrite'},
+                                  project=pr,db=s,discussion_id=did)
+        assert 'error' in protected
+        assert read_text(pid,'docs/drafts/PRODUCT-BRIEF.md')==brief
+
+
+def test_answer_stream_failure_allows_retry_and_is_scoped(client,monkeypatch):
+    from planning import save_question
+    from db import PlanningQuestion
+    import importlib
+    application=importlib.import_module('app')
+    csrf=auth(client)
+    pid,did=_make_discussion_with_model(client,csrf,'retry-flow')
+    other=create_project(client,csrf,'Not The Same Project')
+    with SessionLocal() as s:
+        q,_=save_question(s,pid,did,{
+            'question':'How should the system protect customer data?',
+            'options':[{'label':'Isolated storage','pros':'Privacy','cons':'Extra design'},
+                       {'label':'Shared storage','pros':'Simple','cons':'Risk'}],
+            'recommended_index':0,'recommendation_reason':'Data privacy is essential.'})
+        qid=q.id
+    answer={'selected_ids':['o1']}
+    assert client.post(f'/api/projects/{other}/planning/questions/{qid}/answer-stream',headers=csrf,json=answer).status_code==409
+    async def broken_pi(*args,**kwargs):
+        yield 'status',{'phase':'model','message':'Pi start'}
+        raise RuntimeError('Simulated transport interruption')
+    monkeypatch.setattr(application,'pi_stream',broken_pi)
+    url=f'/api/projects/{pid}/planning/questions/{qid}/answer-stream'
+    failure=client.post(url,headers=csrf,json=answer)
+    assert failure.status_code==200
+    assert '"type": "error"' in failure.text
+    with SessionLocal() as s:
+        q=s.get(PlanningQuestion,qid)
+        assert q.status=='answered' and 'continuation_run_id' not in q.answer
+        assert s.query(Message).filter_by(discussion_id=did,role='user').count()==1
+    async def recovered_pi(*args,**kwargs):
+        yield 'delta',{'text':'Recovered without storing another user message.'}
+    monkeypatch.setattr(application,'pi_stream',recovered_pi)
+    retry=client.post(f'/api/projects/{pid}/chat',headers=csrf,json={
+        'discussion_id':did,'continue_question_id':qid,'mode':'discovery'})
+    assert retry.status_code==200 and '"type": "done"' in retry.text
+    with SessionLocal() as s:
+        assert s.query(Message).filter_by(discussion_id=did,role='user').count()==1
+        assert s.query(Message).filter_by(discussion_id=did,role='assistant').count()==1
+
+
+def test_discovery_progress_and_ui_contract(client):
+    csrf=auth(client)
+    pid=create_project(client,csrf,'Progress')
+    with SessionLocal() as s:
+        did=s.query(db.Discussion).filter_by(project_id=pid).one().id
+    r=client.get(f'/api/projects/{pid}/planning/discovery-progress',params={'discussion_id':did})
+    assert r.status_code==200
+    assert r.json()['status']=='interviewing' and r.json()['answered']==0
+    assert r.json()['total_artifacts']==10
+    html=client.get(f'/projects/{pid}/discussion?did={did}').text
+    assert 'discoveryProgress' in html and 'data-discovery-ready="false"' in html
+    code=(ROOT/'source/static/js/discussion.js').read_text(encoding='utf-8')
+    assert '/answer-stream' in code and 'advance_planning:true' in code
+    assert 'planning_complete' in code and 'planning_question' in code
+    assert '/planning/questions/suggest' not in code
+
+
+def test_three_round_interview_reaches_draft_handoff_via_pi_tools(client,monkeypatch):
+    """Simulate three sequential user decisions, each followed by Pi's next step."""
+    import importlib
+    from planning import save_question
+    from db import PlanningQuestion
+    from artifact_builder import ARTIFACTS
+    application=importlib.import_module('app')
+    csrf=auth(client)
+    pid,did=_make_discussion_with_model(client,csrf,'multi-round-interview')
+    def create_q(number):
+        with SessionLocal() as s:
+            question,_=save_question(s,pid,did,{
+                'question':f'What is the scope decision number {number}?',
+                'options':[{'label':f'Option {number} A','pros':'Fits MVP','cons':'Work'},
+                           {'label':f'Option {number} B','pros':'Simple','cons':'Risk'}],
+                'recommended_index':0,'recommendation_reason':'Fits the project constraints.'})
+            return question.id
+    qid=create_q(1)
+    seen=[]
+    async def simulated_pi(project, discussion, dbs, model, **kw):
+        assert discussion.id==did
+        answered=dbs.query(PlanningQuestion).filter_by(project_id=pid,discussion_id=did,status='answered').count()
+        seen.append((answered,kw['run_id']))
+        yield 'status',{'phase':'thinking','message':'Pi assessing previous answer'}
+        yield 'delta',{'text':f'Đã phân tích quyết định thứ {answered}.'}
+        if answered<3:
+            create_q(answered+1)
+        else:
+            with SessionLocal() as gateway:
+                result=await tool_call('finish_discovery',{
+                    'summary':'The stakeholders have defined the user-facing scope, account isolation, trade reconciliation, audit trails and operational constraints. The planning record now contains three confirmed decisions and documented risks.',
+                    'evidence':'The owner answered each of the three planning questions and verified the MVP boundary.',
+                    'remaining_unknowns':[]},project=gateway.get(Project,pid),db=gateway,discussion_id=did)
+                assert result['status']=='draft_ready'
+    monkeypatch.setattr(application,'pi_stream',simulated_pi)
+    for step in range(1,4):
+        r=client.post(f'/api/projects/{pid}/planning/questions/{qid}/answer-stream',headers=csrf,
+                      json={'selected_ids':['o1']})
+        assert r.status_code==200,r.text
+        assert '"type": "done"' in r.text
+        if step<3:
+            assert '"type": "planning_question"' in r.text
+            with SessionLocal() as s:
+                q=s.query(PlanningQuestion).filter_by(project_id=pid,discussion_id=did,status='pending').one()
+                qid=q.id
+        else:
+            assert '"type": "planning_complete"' in r.text
+    assert [answered for answered,_run in seen]==[1,2,3]
+    assert len({run for _,run in seen})==3
+    r=client.get(f'/api/projects/{pid}/planning/discovery-progress',params={'discussion_id':did})
+    assert r.json()['status']=='draft_ready'
+    assert r.json()['answered']==3
+    assert r.json()['pending']==0
+    assert r.json()['drafts']==len(ARTIFACTS)
+    # User may still chat, but automatic discovery must no longer create questions.
+    after=client.post(f'/api/projects/{pid}/chat',headers=csrf,json={
+        'discussion_id':did,'mode':'discovery','advance_planning':True})
+    assert after.status_code==409

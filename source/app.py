@@ -57,7 +57,7 @@ async def lifespan(_app):
     init_db()
     yield
 
-app = FastAPI(title="SpecWeave", version="1.0.0", docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(title="SpecWeave", version="1.0.2", docs_url=None, redoc_url=None, lifespan=lifespan)
 app.mount("/static",StaticFiles(directory=BASE / "static"),name="static")
 templates = Jinja2Templates(directory=BASE / "templates")
 templates.env.filters["date_short"] = lambda d: d.strftime("%d/%m/%Y %H:%M") if d else "—"
@@ -1077,6 +1077,23 @@ def get_planning_questions(pid:str, request:Request, discussion_id:str, db:Sessi
     return {"pending":next((question_payload(q) for q in questions if q.status=="pending"),None),
             "history":[question_payload(q) for q in questions if q.status!="pending"][:15]}
 
+@app.get("/api/projects/{pid}/planning/discovery-progress")
+def discovery_progress(pid:str,request:Request,discussion_id:str,db:Session=Depends(get_db)):
+    u,s=api_guard(request,db);pr=acl(db,pid,u)
+    d=db.get(Discussion,discussion_id)
+    if not d or d.project_id!=pid:raise HTTPException(404,'Discussion not found')
+    questions=db.query(PlanningQuestion).filter_by(project_id=pid,discussion_id=discussion_id).all()
+    from artifact_builder import ARTIFACTS
+    existing={x.path for x in db.query(Document).filter_by(project_id=pid).all()}
+    state=(pr.profile or {}).get('_discovery',{})
+    return {'status':'draft_ready' if state.get('status')=='draft_ready' else 'interviewing',
+            'answered':sum(q.status=='answered' for q in questions),
+            'pending':sum(q.status=='pending' for q in questions),
+            'deferred':sum(q.status=='deferred' for q in questions),
+            'drafts':sum(path in existing for _,path in ARTIFACTS.values()),
+            'total_artifacts':len(ARTIFACTS),
+            'summary':str(state.get('summary',''))[:1200] if state.get('status')=='draft_ready' else ''}
+
 @app.post("/api/projects/{pid}/planning/questions/{qid}/answer")
 async def submit_planning_answer(pid:str, qid:str, request:Request, db:Session=Depends(get_db)):
     u,s=api_guard(request,db,True);pr=acl(db,pid,u,write=True)
@@ -1160,7 +1177,38 @@ async def new_discussion(pid:str,request:Request,db:Session=Depends(get_db)):
 @app.post("/api/projects/{pid}/chat")
 async def chat_stream(pid:str,request:Request,db:Session=Depends(get_db)):
     u,s=api_guard(request,db,True);pr=acl(db,pid,u,write=True)
-    data=await request.json()
+    return await _chat_stream_impl(pid, db, u, pr, await request.json())
+
+
+@app.post("/api/projects/{pid}/planning/questions/{qid}/answer-stream")
+async def answer_and_stream(pid:str,qid:str,request:Request,db:Session=Depends(get_db)):
+    """One atomic user interaction: persist the choice AND start Pi SSE.
+
+    Previously these were two independent frontend requests; a dropped second
+    request left a user answer in chat with no assistant response.
+    """
+    u,s=api_guard(request,db,True);pr=acl(db,pid,u,write=True)
+    payload=await request.json()
+    if not isinstance(payload,dict) or payload.get('action','answer')!='answer':
+        raise HTTPException(422,'Chỉ câu trả lời được tiếp tục qua SSE')
+    q=(db.query(PlanningQuestion).filter_by(id=qid,project_id=pid)
+       .with_for_update().one_or_none())
+    if not q or q.status!='pending':
+        raise HTTPException(409,'Câu hỏi đã xử lý hoặc không tồn tại')
+    model=db.get(Model,pr.active_model_id) if pr.active_model_id else None
+    if not model or not model.enabled or not model.provider.enabled:
+        raise HTTPException(409,'Hãy chọn model hoạt động trước khi trả lời')
+    openai_oauth_access(pr,model,u.id)
+    # The question already owns its discussion_id: never trust one from the browser.
+    answer_question(db,q,payload)
+    audit(db,u,'planning_answer_stream',pr,{'question_id':qid})
+    db.commit()
+    return await _chat_stream_impl(pid,db,u,pr,{
+        'discussion_id':q.discussion_id,'continue_question_id':qid,
+        'role':payload.get('role','analyst'), 'mode':'discovery'})
+
+
+async def _chat_stream_impl(pid, db, u, pr, data):
     did=str(data.get("discussion_id",""))
     discussion=db.get(Discussion,did)
     if not discussion or discussion.project_id!=pid:raise HTTPException(404,"Discussion not found")
@@ -1173,6 +1221,17 @@ async def chat_stream(pid:str,request:Request,db:Session=Depends(get_db)):
         if not status.get('connected'):raise HTTPException(409,'OpenAI chưa được kết nối trên Pi runtime')
     content=str(data.get("message","")).strip()
     continue_qid=str(data.get('continue_question_id') or '').strip()
+    advance=bool(data.get('advance_planning',False))
+    if advance and (continue_qid or content):
+        raise HTTPException(422,'Automatic next step must not include a user message')
+    if advance:
+        if str(data.get('mode',discussion.mode))!='discovery':
+            raise HTTPException(422,'Only discovery can advance automatically')
+        pending=db.query(PlanningQuestion).filter_by(project_id=pid,discussion_id=did,status='pending').first()
+        if pending:
+            raise HTTPException(409,'Hãy trả lời câu hỏi đang chờ trước')
+        if (pr.profile or {}).get('_discovery',{}).get('status')=='draft_ready':
+            raise HTTPException(409,'Discovery đã hoàn tất; xem tài liệu draft')
     if continue_qid:
         if content:
             raise HTTPException(422, 'Continuation cannot include a second user message')
@@ -1182,7 +1241,7 @@ async def chat_stream(pid:str,request:Request,db:Session=Depends(get_db)):
             raise HTTPException(409,'Câu trả lời không còn ở trạng thái có thể tiếp tục')
         if (q.answer or {}).get('continuation_run_id'):
             raise HTTPException(409,'Câu trả lời này đã được gửi cho AI trước đó')
-    elif not 1<=len(content)<=30000:
+    elif not advance and not 1<=len(content)<=30000:
         raise HTTPException(422,"Nội dung phải từ 1 đến 30.000 ký tự")
     role=str(data.get("role","analyst"))
     mode=str(data.get("mode",discussion.mode))
@@ -1230,9 +1289,23 @@ async def chat_stream(pid:str,request:Request,db:Session=Depends(get_db)):
         def emit(event_type,payload=None,**extra):
             return 'data: '+json.dumps({'type':event_type,'payload':payload or {},'run_id':run_id,**extra},ensure_ascii=False)+'\n\n'
         try:
-            yield emit('start',{'model':m.model_id,'backend':backend,'context_window':m.context_window,'continued':bool(continue_qid)})
-            yield emit('status',{'phase':'request','message':'Đang kết nối model…'})
-            stream=pi_stream(p,d,sdb,m,role=role,mode=mode,run_id=run_id,actor_id=actor_id)
+            yield emit('start',{'model':m.model_id,'backend':backend,'context_window':m.context_window,
+                                'continued':bool(continue_qid),'automatic':advance})
+            yield emit('status',{'phase':'request','message':'Pi đang tiếp nhận ngữ cảnh dự án…'})
+            advance_prompt=(
+                'Tiếp tục discovery trong CÙNG session. Đọc câu trả lời mới nhất và lịch sử, '
+                'đánh giá những vấn đề chưa rõ. Nếu chưa đủ thông tin, gọi tool '
+                'propose_planning_question cho MỘT câu hỏi quan trọng tiếp theo, có các phương án cụ thể. '
+                'Nếu thực sự đã đủ dữ liệu để soạn đặc tả có giá trị, sử dụng tool '
+                'write_document để soạn các bản draft chi tiết rồi gọi finish_discovery. '
+                'Không tự phê duyệt tài liệu. Nếu model không gọi được tool, hãy trả về '
+                'DUY NHẤT một JSON object cho câu hỏi theo schema sau: '
+                + QUESTION_JSON_INSTRUCTIONS
+            ) if advance else None
+            pi_kwargs={'role':role,'mode':mode,'run_id':run_id,'actor_id':actor_id}
+            if advance:
+                pi_kwargs['prompt_override']=advance_prompt
+            stream=pi_stream(p,d,sdb,m,**pi_kwargs)
             async for typ,payload in with_heartbeat(stream):
                 if cancellation_requested(run_id):
                     raise asyncio.CancelledError()
@@ -1274,12 +1347,25 @@ async def chat_stream(pid:str,request:Request,db:Session=Depends(get_db)):
             output, embedded_brief = parse_model_response(output)
             if embedded_brief:
                 try:
-                    from planning import save_question, question_payload
                     question, created = save_question(sdb,pid,did,embedded_brief)
-                    if created:
-                        yield emit('planning_question', question_payload(question))
+                    # The canonical pending-question event is emitted once, below,
+                    # whether the brief came from a tool call or parsed JSON.
                 except (ValueError,TypeError,KeyError):
                     pass  # Keep a readable model answer if structured brief validation fails.
+            # Tool calls run in a different gateway transaction. Refresh after Pi settles.
+            # This also exposes questions generated via propose_planning_question, not
+            # merely JSON embedded in assistant prose.
+            sdb.expire_all()
+            pending=sdb.query(PlanningQuestion).filter_by(project_id=pid,discussion_id=did,status='pending').order_by(PlanningQuestion.created_at.desc()).first()
+            if pending:
+                yield emit('planning_question',question_payload(pending))
+                if not ''.join(full).strip():
+                    output='Em đã tổng hợp thông tin và đề xuất câu hỏi quan trọng tiếp theo. Anh chọn một phương án bên dưới, hoặc thảo luận thêm trước khi quyết định.' 
+            p=sdb.get(Project,pid)
+            discovery=(p.profile or {}).get('_discovery',{})
+            if discovery.get('status')=='draft_ready':
+                yield emit('planning_complete',{'status':'draft_ready','summary':discovery.get('summary',''),
+                                                'url':f'/projects/{pid}/artifacts'})
             # Replace raw stream text only when normalization produced a cleaner answer.
             if output != ''.join(full).strip():
                 yield emit('final', {'text':output})
@@ -1294,11 +1380,19 @@ async def chat_stream(pid:str,request:Request,db:Session=Depends(get_db)):
         except (asyncio.CancelledError,GeneratorExit):
             run=sdb.get(AgentRun,run_id)
             run.status='cancelled';run.events=trace;run.finished_at=utcnow();run.duration_ms=int((time.monotonic()-clock)*1000)
+            if continue_qid:
+                q=sdb.get(PlanningQuestion,continue_qid)
+                if q and (q.answer or {}).get('continuation_run_id')==run_id:
+                    q.answer={k:v for k,v in q.answer.items() if k!='continuation_run_id'}
             sdb.commit()
             yield emit('error',{'message':'Đã dừng lượt chạy'},message='Đã dừng lượt chạy')
         except Exception as exc:
             run=sdb.get(AgentRun,run_id)
             run.status='error';run.events=trace;run.error=str(exc)[:700];run.finished_at=utcnow();run.duration_ms=int((time.monotonic()-clock)*1000)
+            if continue_qid:
+                q=sdb.get(PlanningQuestion,continue_qid)
+                if q and (q.answer or {}).get('continuation_run_id')==run_id:
+                    q.answer={k:v for k,v in q.answer.items() if k!='continuation_run_id'}
             sdb.commit()
             yield emit('error',{'message':str(exc)[:500]},message=str(exc)[:500])
     return StreamingResponse(produce(),media_type="text/event-stream",headers={"Cache-Control":"no-cache, no-transform","X-Accel-Buffering":"no"})
