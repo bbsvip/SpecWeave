@@ -9,6 +9,7 @@ import json
 import socket
 import uuid
 from datetime import timedelta
+from sqlalchemy import or_
 
 from db import SessionLocal, AgentRun, ChatStreamEvent, PlanningQuestion, utcnow
 
@@ -57,6 +58,9 @@ def claim_next():
         for run in stale:
             fail_run(db,run,'Worker mất kết nối; phiên Pi có thể vẫn đang chạy. Kiểm tra trạng thái trước khi gửi lại.')
         row=(db.query(AgentRun).filter(AgentRun.status=='queued')
+            # Requeued jobs back off until the prior Pi session releases its
+            # advisory lock; they must not spin or be treated as failures.
+            .filter(or_(AgentRun.lease_expires_at.is_(None),AgentRun.lease_expires_at<=now))
             .order_by(AgentRun.created_at,AgentRun.id)
             .with_for_update(skip_locked=True).first())
         if not row:
@@ -111,6 +115,10 @@ async def process_queued_run(run_id: str):
             return
     with SessionLocal() as db:
         run=db.get(AgentRun,run_id)
+        if run and run.status=='queued':
+            # Expected advisory-lock contention. Nothing was sent to Pi; the
+            # same run ID will be retried after its lease backoff.
+            return
         if run and run.status not in TERMINAL:
             fail_run(db,run,'Pi stream ended without a terminal result')
         elif run:

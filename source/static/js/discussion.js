@@ -238,8 +238,31 @@
           body,signal:controller.signal,
         });
         const data=await response.json().catch(()=>({}));
-        if(!response.ok)throw new Error(data.detail||data.message||`HTTP ${response.status}`);
-        queued=data;
+        if(response.status===409&&!answerQuestion){
+          // F5/double-submit race: a durable Pi run may already have been
+          // committed by the preceding tab. Attach it; do NOT send a second
+          // prompt or create a second run on this discussion.
+          const active=await fetch(`/api/projects/${pid}/discussions/${did}/active-run`,{
+            credentials:'same-origin',cache:'no-store',signal:controller.signal
+          });
+          if(active.ok){
+            const existing=await active.json();
+            if(existing.run_id){
+              queued={run_id:existing.run_id,
+                events_url:`/api/projects/${pid}/runs/${encodeURIComponent(existing.run_id)}/events`};
+              checkedInterruptedAnswer=true;
+              // The new message was NOT accepted. Remove its optimistic bubble
+              // and restore the input while observing the earlier Pi run.
+              if(optimistic){optimistic.article.remove();optimistic=null;}
+              if(message&&!input.value.trim())input.value=message;
+              addTimeline(panel.timeline,'status','Đã nối lại lượt Pi có sẵn; tin nhắn mới chưa được gửi');
+            }
+          }
+        }
+        if(!queued){
+          if(!response.ok)throw new Error(data.detail||data.message||`HTTP ${response.status}`);
+          queued=data;
+        }
       }
       if(!queued.run_id)throw new Error('Server chưa trả về Pi run ID');
       runId=queued.run_id;
@@ -516,12 +539,12 @@
       }
     }catch(e){progressElement.textContent='Chưa tải được tiến độ: '+e.message;}
   }
-  async function refreshPlanningQuestion(){
+  async function refreshPlanningQuestion({allowLegacyResume=false}={}){
     if(!did)return;
     try{
       const data=await sw.api(`/api/projects/${pid}/planning/questions?discussion_id=${encodeURIComponent(did)}`,{},'GET');
       renderPlanningQuestion(data.pending);
-      if(!checkedInterruptedAnswer){
+      if(allowLegacyResume&&!checkedInterruptedAnswer){
         checkedInterruptedAnswer=true;
         // Recover old sessions where the choice was persisted but the separate
         // "send to AI" request never happened (v1.0.1 and earlier).
@@ -560,15 +583,25 @@
   });
   async function reconnectActiveRun(){
     if(!did||controller)return;
+    setBusy(true,'Đang kiểm tra Pi run trên server…');
     try{
       const current=await sw.api(`/api/projects/${pid}/discussions/${did}/active-run`,{},'GET');
       if(current.run_id){
-        checkedInterruptedAnswer=true;  // It is already inside a Pi run.
+        checkedInterruptedAnswer=true; // F5 is a subscriber, never a new prompt.
         await talk({resumeRunId:current.run_id});
-      }else{
-        await refreshPlanningQuestion();
+        return;
       }
-    }catch(e){console.warn('Pi run reconnect:',e.message);await refreshPlanningQuestion();}
+      setBusy(false);
+      // Recover an old interrupted answer only after the server positively
+      // confirms there is NO queued/running run for this discussion.
+      await refreshPlanningQuestion({allowLegacyResume:true});
+    }catch(e){
+      console.warn('Pi run reconnect:',e.message);
+      setBusy(false);
+      // If the check failed, DO NOT guess that the session is idle or enqueue
+      // a replacement run; only show existing pending questions.
+      await refreshPlanningQuestion({allowLegacyResume:false});
+    }
   }
   list.scrollTop=list.scrollHeight;
   reconnectActiveRun();refreshDiscoveryProgress();

@@ -1419,14 +1419,39 @@ async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_
                     async for event in produce_locked(sdb, p, d, m):
                         yield event
             except ChatBusy:
-                obj=sdb.get(AgentRun,run_id);obj.status='error';obj.error='Another chat is running';obj.finished_at=utcnow()
-                if continue_qid:
-                    answer=sdb.get(PlanningQuestion,continue_qid)
-                    if answer and (answer.answer or {}).get('continuation_run_id')==run_id:
-                        answer.answer={k:v for k,v in answer.answer.items() if k!='continuation_run_id'}
-                sdb.commit()
-                yield 'data: '+json.dumps({'type':'error','payload':{'message':'Một lượt thảo luận đang chạy'},
-                                           'message':'Một lượt thảo luận đang chạy'},ensure_ascii=False)+'\n\n' 
+                # A previous Pi run may have committed its terminal status while
+                # still holding the advisory lock. Do NOT fail the next run: the
+                # user has already submitted it and the Pi prompt has not run.
+                if existing_run_id:
+                    obj=sdb.get(AgentRun,run_id)
+                    if obj and obj.status=='running' and not obj.cancel_requested:
+                        obj.status='queued'
+                        obj.worker_owner=None
+                        obj.lease_expires_at=utcnow()+timedelta(seconds=3)
+                        sdb.commit()
+                        yield 'data: '+json.dumps({'type':'status','run_id':run_id,
+                            'payload':{'phase':'waiting_lock',
+                                       'message':'Pi đang hoàn tất lượt trước; tự chờ để tiếp tục…'}},
+                            ensure_ascii=False)+'\n\n'
+                        return
+                obj=sdb.get(AgentRun,run_id)
+                if existing_run_id and obj and obj.cancel_requested:
+                    obj.status='cancelled';obj.finished_at=utcnow()
+                    obj.worker_owner=None;obj.lease_expires_at=None
+                    sdb.commit()
+                    yield 'data: '+json.dumps({'type':'error','run_id':run_id,
+                        'payload':{'message':'Đã hủy lượt Pi'}},ensure_ascii=False)+'\n\n'
+                    return
+                # Preserve the legacy attached-stream behavior.
+                if obj and obj.status=='running':
+                    obj.status='error';obj.error='Another chat is running';obj.finished_at=utcnow()
+                    if continue_qid:
+                        answer=sdb.get(PlanningQuestion,continue_qid)
+                        if answer and (answer.answer or {}).get('continuation_run_id')==run_id:
+                            answer.answer={k:v for k,v in answer.answer.items() if k!='continuation_run_id'}
+                    sdb.commit()
+                yield 'data: '+json.dumps({'type':'error','run_id':run_id,
+                    'payload':{'message':'Một lượt thảo luận đang chạy'}},ensure_ascii=False)+'\n\n' 
 
     async def produce_locked(sdb,p,d,m):
         full=[]
