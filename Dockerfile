@@ -11,8 +11,8 @@ RUN pip install --no-cache-dir -r /app/requirements.txt \
     && mkdir -p /ms-playwright \
     && python -m playwright install --with-deps chromium \
     && useradd -r -u 10001 -m -d /home/specweave specweave \
-    && mkdir -p /data/projects \
-    && chown -R specweave:specweave /ms-playwright /data /app
+    && mkdir -p /data/projects /auth-local/native \
+    && chown -R specweave:specweave /ms-playwright /data /app /auth-local
 COPY --chown=specweave:specweave source/ /app/source/
 COPY --chown=specweave:specweave migrations/ /app/migrations/
 COPY --chown=specweave:specweave alembic.ini entrypoint.sh /app/
