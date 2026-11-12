@@ -87,7 +87,7 @@ def start_login(provider):
     if current.get('expires_at',0)>time.time():
         raise HTTPException(409,'Đã có phiên đăng nhập, hãy hoàn tất hoặc hủy trước')
     verifier=secrets.token_urlsafe(48)
-    redirect=os.getenv('OPENAI_OAUTH_REDIRECT_URI','http://127.0.0.1:8080/auth/callback')
+    redirect=os.getenv('OPENAI_OAUTH_REDIRECT_URI','http://127.0.0.1:1455/auth/callback')
     parsed=urlsplit(redirect)
     if parsed.scheme!='http' or parsed.hostname!='127.0.0.1' or parsed.path!='/auth/callback' or parsed.query or parsed.fragment or parsed.username:
         raise HTTPException(503,'OAuth redirect phải là HTTP loopback 127.0.0.1 với đường dẫn /auth/callback')
