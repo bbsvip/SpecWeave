@@ -14,10 +14,14 @@ const DID='123e4567-e89b-42d3-a456-426614174001';
 const RID='123e4567-e89b-42d3-a456-426614174002';
 const SECRET='1234567890abcdefghijklmnopqrstuvwxyz-EXTRA';
 const fakeSdk=`
+import {readFile} from 'node:fs/promises';
 export class DefaultResourceLoader {constructor(options){this.options=options}async reload(){}}
 export const SettingsManager={inMemory:()=>({})};
 export const SessionManager={continueRecent:()=>({}),inMemory:()=>({})};
-export const ModelRuntime={create:async()=>({getModel:(provider,id)=>({provider,id}),setRuntimeApiKey:async()=>{},getAvailable:async()=>[]})};
+export const ModelRuntime={create:async options=>{
+ const registry=JSON.parse(await readFile(options.modelsPath,'utf8').catch(()=>'{"providers":{}}'));
+ return {getModel:(provider,id)=>({api:registry.providers?.[provider]?.api,...registry.providers?.[provider]?.models?.find(m=>m.id===id),provider,id}),setRuntimeApiKey:async()=>{},getAvailable:async()=>[]};
+}};
 export function defineTool(tool){return tool;}
 export async function createAgentSession(options){
  if(!['builtin','all'].includes(options.noTools))throw Error('Unsafe builtin tools');
@@ -38,7 +42,7 @@ export async function createAgentSession(options){
      emit({type:'message_update',assistantMessageEvent:{type:'thinking_delta',delta:'Considering the request.'}});
      if(options.customTools.length){emit({type:'tool_execution_start',toolName:'search_web',toolCallId:'call1',args:{query:'a'}});
        emit({type:'tool_execution_end',toolName:'search_web',toolCallId:'call1',result:{ok:true}});}
-     const text=user==='report'?'Turn '+(session.messages.length+1)+': '+beforeStart().systemPrompt:'Native Pi output';
+     const text=user==='model-report'?JSON.stringify(options.model):user==='report'?'Turn '+(session.messages.length+1)+': '+beforeStart().systemPrompt:'Native Pi output';
      emit({type:'message_update',assistantMessageEvent:{type:'text_delta',delta:text}});
      const message={role:'assistant',content:[{type:'text',text}],usage:{input:12,output:4}};
      if(user==='truncated draft'){
@@ -106,6 +110,26 @@ test('Pi Host handles chat and planning through same SDK and exposes native SSE'
    assert.match(await truncated.text(),/"phase":"document_output_limit"/);
    assert.equal((await post(x.base,'/run',{...requestData,project_id:'../x'})).status,422);
    assert.equal((await post(x.base,'/oauth/openai/start',{})).status,503);
+ }finally{await stopSandbox(x);}
+});
+
+test('Custom model settings reach chat and completion and refresh an existing session',async()=>{
+ const x=await startSandbox();
+ try{
+   const custom={...requestData,message:'model-report',context_window:262144,max_output_tokens:32768,
+     api:'openai-completions',compat:{maxTokensField:'max_tokens'},sampling_params:{temperature:0.7,top_p:0.95}};
+   const completion=await(await post(x.base,'/complete',custom)).json();
+   const model=JSON.parse(completion.text);
+   assert.equal(model.contextWindow,262144);assert.equal(model.maxTokens,32768);
+   assert.equal(model.api,'openai-completions');
+   assert.deepEqual(model.compat,custom.compat);assert.deepEqual(model.samplingParams,custom.sampling_params);
+   const first=await(await post(x.base,'/run',custom)).text();
+   assert.ok(first.includes('32768'));
+   const changed=await(await post(x.base,'/run',{...custom,max_output_tokens:65536,sampling_params:{temperature:0.3}})).text();
+   const frames=changed.split('\n').filter(line=>line.startsWith('data: ')).map(line=>JSON.parse(line.slice(6)));
+   const updated=JSON.parse(frames.find(frame=>frame.type==='final').payload.text);
+   assert.equal(updated.maxTokens,65536);assert.deepEqual(updated.samplingParams,{temperature:0.3});
+   assert.equal((await post(x.base,'/run',{...custom,max_output_tokens:262144})).status,422);
  }finally{await stopSandbox(x);}
 });
 

@@ -11,7 +11,7 @@ from openai_oauth_gateway import require_access, runner_config
 
 def model_payload(project, model, actor_id=None):
     require_access(project, model, actor_id)
-    return {
+    payload = {
         'project_id': project.id,
         'provider_base': model.provider.base_url,
         'provider_key': '' if model.provider.kind=='openai-oauth' else decrypt(model.provider.encrypted_key),
@@ -21,12 +21,20 @@ def model_payload(project, model, actor_id=None):
         'context_window': model.context_window,
         'thinking': project.thinking_level,
     }
+    if model.provider.kind!='openai-oauth':
+        payload.update(max_output_tokens=model.max_output_tokens,api=model.api,
+                       compat=model.compat or {},sampling_params=model.sampling_params or {})
+    return payload
 
 
 async def complete(project, model, actor_id, *, system_context, message, discussion_id=None, max_tokens=None):
     """Stateless Pi session for a single structured planning or review task."""
     url, headers = runner_config()
     payload = model_payload(project, model, actor_id)
+    if max_tokens is not None and model.provider.kind!='openai-oauth':
+        from model_config import integer_setting
+        payload['max_output_tokens']=min(model.max_output_tokens,
+            integer_setting(max_tokens,'Max output tokens',128,2097152))
     payload.update({'discussion_id':discussion_id or project.id,
                     'system_context':str(system_context)[:30000],
                     'message':str(message)[:125000]})

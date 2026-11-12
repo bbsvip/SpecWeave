@@ -39,6 +39,62 @@ def test_provider_edit_and_details_visible(client):
     assert client.post(f'/api/providers/{pid}',headers=csrf,json={'name':'   '}).status_code==422
 
 
+def test_custom_model_limits_and_sampling_reach_pi_and_validate(client):
+    from pi_client import model_payload
+
+    csrf=auth(client)
+    provider,models=add_provider(client,csrf)
+    mid=models['qwen27b']
+    path=f'/api/providers/{provider}/models/{mid}'
+    settings={'context_window':262144,'max_output_tokens':32768,'reasoning':True,
+              'api':'openai-completions','compat':{'maxTokensField':'max_tokens','thinkingFormat':'qwen'},
+              'sampling_params':{'temperature':0.7,'top_p':0.95,'top_k':40,'seed':12}}
+    result=client.post(path,headers=csrf,json=settings)
+    assert result.status_code==200,result.text
+    project=create_project(client,csrf)
+    with SessionLocal() as session:
+        model=session.get(Model,mid)
+        payload=model_payload(session.get(Project,project),model)
+        for key in ('context_window','max_output_tokens','api','compat','sampling_params'):
+            assert payload[key]==settings[key]
+        assert model.reasoning
+    invalid=[{'max_output_tokens':262144},{'max_output_tokens':True},{'context_window':3.5},
+             {'sampling_params':{'max_tokens':1}},{'sampling_params':{'temperature':9}},
+             {'compat':{'supportsDeveloperRole':'false'}},{'compat':{'headers':{}}},
+             {'api':'openai-responses'}]
+    for patch in invalid:
+        response=client.post(path,headers=csrf,json=patch)
+        assert response.status_code==422,(patch,response.text)
+    with SessionLocal() as session:
+        model=session.get(Model,mid)
+        assert model.max_output_tokens==32768 and model.context_window==262144
+    assert client.post(path,headers=csrf,json={'api':'openai-responses','compat':{}}).status_code==200
+    html=client.get(f'/settings/providers/{provider}').text
+    assert 'max_output_tokens' in html and 'sampling_params' in html
+    with SessionLocal() as session:
+        owner=session.get(Project,project).owner_id
+        row=session.get(Provider,provider)
+        row.kind='openai-oauth';row.owner_id=owner;session.commit()
+    assert client.post(path,headers=csrf,json={'max_output_tokens':16384}).status_code==422
+    assert 'name="max_output_tokens"' not in client.get(f'/settings/providers/{provider}').text
+
+
+def test_new_custom_model_uses_validated_runtime_settings(client):
+    csrf=auth(client)
+    provider,_=add_provider(client,csrf)
+    path=f'/api/providers/{provider}/models'
+    bad=client.post(path,headers=csrf,json={'model_ids':['bad-limits'],'context_window':32768,'max_output_tokens':65536})
+    assert bad.status_code==422
+    result=client.post(path,headers=csrf,json={'model_ids':['long-context'],'context_window':262144,
+                                              'max_output_tokens':65536,'sampling_params':{'top_p':0.9}})
+    assert result.status_code==200,result.text
+    with SessionLocal() as session:
+        row=session.query(Model).filter_by(provider_id=provider,model_id='long-context').one()
+        assert row.context_window==262144 and row.max_output_tokens==65536
+        assert row.sampling_params=={'top_p':0.9}
+        assert session.query(Model).filter_by(provider_id=provider,model_id='bad-limits').count()==0
+
+
 def test_delete_provider_preserves_reviews_and_resets_projects(client):
     csrf=auth(client)
     pid,model_ids=add_provider(client,csrf)

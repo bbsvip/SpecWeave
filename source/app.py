@@ -47,6 +47,7 @@ from provider_management import owned_provider, impact as provider_impact, delet
 from chat_coordination import discussion_lease, ChatBusy, ChatStopped, cancellation_requested, clear_chat_continuation
 from chat_content import display_user_message, parse_model_response
 from chat_events import with_heartbeat
+from model_config import parse_model_settings
 from project_trash import (TRASH_RETENTION, TRASH_STATUSES, lock_trash_project, logger as trash_logger,
                            project_has_active_work, purge_project)
 
@@ -1943,7 +1944,9 @@ async def add_models(provider_id:str,request:Request,db:Session=Depends(get_db))
     u,s=api_guard(request,db,True);admin_only(u)
     p=db.get(Provider,provider_id)
     if not p:raise HTTPException(404,"Provider not found")
-    data=await request.json();models=data.get("model_ids",[])
+    data=await request.json()
+    settings=parse_model_settings(data,custom=p.kind!='openai-oauth')
+    models=data.get("model_ids",[])
     if not isinstance(models,list) or len(models)>100:raise HTTPException(422,"Invalid model list")
     if p.kind=='openai-oauth':
         if p.owner_id!=u.id:raise HTTPException(403,'Not your OpenAI connection')
@@ -1956,8 +1959,7 @@ async def add_models(provider_id:str,request:Request,db:Session=Depends(get_db))
         name=str(name).strip()[:300]
         if not name:continue
         if not db.query(Model).filter_by(provider_id=provider_id,model_id=name).first():
-            m=Model(provider_id=provider_id,model_id=name,name=name,reasoning=bool(data.get("reasoning",False)),
-                    context_window=int(data.get("context_window",32768)))
+            m=Model(provider_id=provider_id,model_id=name,name=name,**settings)
             db.add(m);created.append(name)
     audit(db,u,"models_create",details={"count":len(created)});db.commit();return {"created":created}
 
@@ -2503,17 +2505,12 @@ async def update_model(provider_id:str,mid:str,request:Request,db:Session=Depend
     if model.provider.kind=='openai-oauth' and model.provider.owner_id!=u.id:
         raise HTTPException(403,'OpenAI OAuth account belongs to another user')
     data=await request.json()
+    settings=parse_model_settings(data,model=model,custom=model.provider.kind!='openai-oauth')
     if 'enabled' in data:
         if not isinstance(data['enabled'],bool):raise HTTPException(422,'Invalid enabled flag')
         model.enabled=data['enabled']
-    if 'reasoning' in data:
-        if not isinstance(data['reasoning'],bool):raise HTTPException(422,'Invalid reasoning flag')
-        model.reasoning=data['reasoning']
-    if 'context_window' in data:
-        try:size=int(data['context_window'])
-        except (TypeError,ValueError):raise HTTPException(422,'Invalid context window')
-        if not 1024<=size<=2097152:raise HTTPException(422,'Context window out of range')
-        model.context_window=size
+    for key,value in settings.items():
+        setattr(model,key,value)
     audit(db,u,'model_update',details={'model_id':mid});db.commit()
     return {'ok':True}
 

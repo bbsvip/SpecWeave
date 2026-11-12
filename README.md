@@ -4,14 +4,14 @@ SpecWeave is a self-hosted workspace for turning project ideas into implementati
 
 **Architecture:** All model inference and agent execution run exclusively through the **in-process Pi SDK** in the Node.js Pi Host inside the `web` container. FastAPI does not call LLMs directly, run a second agent, or maintain a fallback OpenAI-compatible agent. Local and remote OpenAI-compatible models remain available **through Pi's model runtime**. Pi owns agent sessions, context and compaction, thinking and tool events, and usage reporting. The frontend requires no Node.js build step.
 
-> **Verification:** Local tests exercise the real Pi SDK with a local OpenAI-compatible test provider and the AI Discussion page in Edge. Docker builds and runtime, PostgreSQL deployment, and live model/OAuth integrations still need deployment verification.
+> **Verification:** Local tests exercise the real Pi SDK with a local OpenAI-compatible test provider and the AI Discussion page in Edge. The deployed Docker/PostgreSQL setup has produced four drafts through Strata. The advanced model settings below still need deployment verification; complete Strata handoff and live OAuth remain unverified.
 
 ## Features
 
 - **Accounts and access control:** First-run administrator setup, login, session revocation, CSRF protection, Argon2id password hashing, and project owner/editor/viewer roles.
 - **Project management:** New-project wizard, reusable presets, project CRUD, ownership transfer, and owner-only recovery or permanent deletion from project trash.
 - **AI discussion:** Detached PostgreSQL-backed chat jobs that continue after tabs close, replayable SSE over EventSource (with reconnect and cursor), thinking when exposed by the model, tool-call activity, usage and time-to-first-token (TTFT) metrics, stop controls, persistent discussion history, and guided questions with recommended options.
-- **Providers and models:** OpenAI-compatible API keys/endpoints, owner-scoped OpenAI OAuth, model discovery, and per-project model selection. Model execution is handled by Pi.
+- **Providers and models:** OpenAI-compatible API keys/endpoints, owner-scoped OpenAI OAuth, model discovery, per-project model selection, and advanced custom-model limits, protocol, compatibility and sampling settings. Model execution is handled by Pi.
 - **Planning and traceability:** Goals, requirements, acceptance criteria, decisions, coverage checks, a specification graph, and a roadmap.
 - **Quality and deliverables:** BMAD-inspired draft documents, semantic review, background multi-role reviews, quality gates, human approval, Markdown document management, and exports.
 - **Research and files:** SearXNG, HTTP research, Playwright/Chromium, and a project-scoped file manager with quotas and revision history.
@@ -36,7 +36,15 @@ The project owner has 30 days from the time a project enters trash to restore it
 
 Alembic revision `0011_project_trash` backfills the deletion time from the most recent soft-delete audit event, then uses the last project update when the event is unavailable. Projects already past 30 days become eligible on upgrade. Deploy the updated `web` and `review-worker` together. The worker scans on startup and every five minutes, and retries interrupted purges. Review existing trash before upgrading if it contains a project you still need.
 
-On the deployed Strata build tested on November 12, 2026, the third confirmed answer produced PRD and Architecture drafts. Two more document tool calls hit the provider's output limit, and the interview remained open. The fixes above are verified locally. Full handoff with Strata on the updated Docker deployment is pending.
+On the deployed Strata build tested on November 12, 2026, all four requested drafts were eventually saved. The interview still remained open after subsequent length-limited responses. The application had registered this custom model with a 32,768-token context and an 8,192-token output limit; these local defaults did not describe Strata's advertised 256k context. Full handoff with corrected settings on the updated Docker deployment is pending.
+
+## Advanced custom model configuration
+
+Open **Settings → Providers → provider details → model**. API-key models expose separate **Context window** and **Max output** limits. Context is the total available input/output capacity; max output caps one model response, including reasoning when the provider counts it there. Enter the provider's actual supported limits. For example, a 256k context can be configured as `262144`; this does not imply that the provider supports 256k output. Pi may reduce the requested output to fit the remaining context.
+
+The expandable advanced section supports **Chat Completions** or **Responses**, a validated compatibility JSON object, and sampling parameters such as `temperature`, `top_p`, `top_k`, `min_p`, penalties and `seed`. For a Chat Completions endpoint that expects `max_tokens`, use `{"maxTokensField":"max_tokens"}` in Compatibility. Leave `{}` to retain Pi's endpoint defaults. Responses accepts only its supported compatibility flags. Unsupported keys and invalid limits return validation errors without saving partial changes. These controls apply only to custom API-key models; OAuth uses Pi's catalog.
+
+Migration `0012_custom_model_config` preserves existing context values and adds output defaults of 8,192 tokens, reduced for legacy models with smaller contexts. Changing a setting refreshes the model runtime on the next turn while retaining the discussion transcript. An already running turn keeps its current configuration. Both `web` and `review-worker` must run the matching image. The local regression script exercises form persistence and the actual Pi SDK request body across consecutive turns; live Strata verification remains a separate deployment check.
 
 ## Architecture
 

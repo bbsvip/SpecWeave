@@ -24,12 +24,14 @@ from e2e_local import free_port
 
 ROOT = Path(__file__).resolve().parents[1]
 calls = []
+provider_requests = []
 releases = {name: threading.Event() for name in ('alpha', 'bravo', 'stop-test')}
 posts = []
 
 class Provider(BaseHTTPRequestHandler):
     def do_POST(self):
         request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        provider_requests.append(request)
         messages = request['messages']
         name = [m['content'] for m in messages if m['role'] == 'user'][-1]
         if isinstance(name, list):
@@ -94,8 +96,10 @@ def run(scratch):
         client = stack.enter_context(httpx.Client(base_url=web, trust_env=False, timeout=15))
         def wait_until_healthy(url):
             for _ in range(100):
+                if url==pi and host.poll() is not None:
+                    raise RuntimeError('Pi host exited; check the pinned SDK dependencies')
                 try:
-                    if client.get(url+'/health').is_success:
+                    if client.get(url+'/health',timeout=1).is_success:
                         break
                 except httpx.TransportError:
                     pass
@@ -126,9 +130,40 @@ def run(scratch):
         with sync_playwright() as p:
             browser=p.chromium.launch(executable_path=os.getenv('CHROMIUM_EXECUTABLE'))
             context=browser.new_context()
-            context.route('https://**/*', lambda route: route.abort())
+            # Load the same pinned UI assets as Docker; keep every other external
+            # destination blocked. Model requests still use only our local fixture.
+            context.route('https://**/*', lambda route: route.continue_()
+                          if route.request.url.startswith('https://cdn.jsdelivr.net/npm/') else route.abort())
             context.add_cookies([{'name':'specweave_session','value':client.cookies['specweave_session'],'url':web}])
             errors=[]
+            def configure_model(output, temperature, capture=False):
+                page=context.new_page()
+                page.set_viewport_size({'width':1440,'height':1000})
+                page.on('pageerror',lambda e:errors.append(str(e)))
+                page.goto(f'{web}/settings/providers/{provider_id}')
+                form=page.locator('.model-config-form')
+                form.locator('[name=context_window]').fill('262144')
+                form.locator('[name=max_output_tokens]').fill(str(output))
+                form.locator('summary').click()
+                form.locator('[name=compat]').fill('{"maxTokensField":"max_tokens"}')
+                form.locator('[name=sampling_params]').fill(json.dumps({'temperature':temperature,'top_p':0.95}))
+                with page.expect_navigation():
+                    form.locator('.model-save').click()
+                expect(form.locator('[name=max_output_tokens]')).to_have_value(str(output))
+                expect(form.locator('[name=context_window]')).to_have_value('262144')
+                form.locator('summary').click()
+                if capture:
+                    page.evaluate('document.fonts.ready')
+                    page.evaluate('window.scrollTo(0,0)')
+                    screenshot_dir=os.getenv('E2E_SCREENSHOT_DIR')
+                    if screenshot_dir:
+                        page.screenshot(path=str(Path(screenshot_dir)/'custom-model-desktop.png'),full_page=True,animations='disabled')
+                    page.set_viewport_size({'width':390,'height':844})
+                    assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), 'Provider settings overflow on mobile'
+                    if screenshot_dir:
+                        page.screenshot(path=str(Path(screenshot_dir)/'custom-model-mobile.png'),full_page=True,animations='disabled')
+                page.close()
+            configure_model(32768,0.7,capture=True)
             def visit(key, before_load=None):
                 page=context.new_page()
                 page.on('pageerror',lambda e:errors.append(str(e)))
@@ -148,6 +183,10 @@ def run(scratch):
             a=visit(did)
             send(a,'alpha')
             live(a,'Pi alpha đang chạy')
+            assert provider_requests[-1]['max_tokens']==32768, provider_requests[-1].keys()
+            assert provider_requests[-1]['temperature']==0.7
+            assert provider_requests[-1]['top_p']==0.95
+            assert 'max_completion_tokens' not in provider_requests[-1]
             a.reload()
             live(a,'Pi alpha đang chạy')
             assert len(posts)==1,posts
@@ -181,24 +220,33 @@ def run(scratch):
             b=visit(bid)
             expect(b.locator('.message-agent .message-content').filter(has_text='Pi bravo đang chạy · hoàn tất')).to_have_count(1)
 
-            host.terminate()
-            host.wait(5)
-            start('pi-restarted',['node','source/pi_host.mjs'])
-            wait_until_healthy(pi)
             a.locator('#agentRole').select_option('architect')
+            configure_model(65536,0.3)
             send(a,'charlie')
             expect(a.locator('.message-agent .message-content').filter(has_text='Pi charlie đang chạy · hoàn tất')).to_have_count(1,timeout=15000)
             sent=json.dumps(calls[-1][1],ensure_ascii=False)
             assert 'alpha' in sent and 'bravo' not in sent
             assert 'BMAD Architect' in sent
+            assert provider_requests[-1]['max_tokens']==65536
+            assert provider_requests[-1]['temperature']==0.3
+
+            host.terminate()
+            host.wait(5)
+            host=start('pi-restarted',['node','source/pi_host.mjs'])
+            wait_until_healthy(pi)
+            send(a,'delta')
+            expect(a.locator('.message-agent .message-content').filter(has_text='Pi delta đang chạy · hoàn tất')).to_have_count(1,timeout=15000)
+            sent=json.dumps(calls[-1][1],ensure_ascii=False)
+            assert 'alpha' in sent and 'charlie' in sent and 'bravo' not in sent
+            assert provider_requests[-1]['max_tokens']==65536
 
             send(b,'stop-test')
             live(b,'Pi stop-test đang chạy')
             b.locator('#stopChat').click()
             expect(b.locator('.turn-live-label')).to_have_text('Đã dừng',timeout=15000)
             releases['stop-test'].set()
-            assert [name for name,_ in calls]==['alpha','bravo','charlie','stop-test']
-            assert sum(url.endswith('/chat/start') for url in posts)==4
+            assert [name for name,_ in calls]==['alpha','bravo','charlie','delta','stop-test']
+            assert sum(url.endswith('/chat/start') for url in posts)==5
             assert sum(url.endswith('/cancel') for url in posts)==1
             assert not errors,errors
             browser.close()

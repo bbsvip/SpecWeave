@@ -72,7 +72,7 @@ def test_fresh_database_migrates_to_head():
         with engine.connect() as conn:
             names = set(sa.inspect(conn).get_table_names())
             assert set(Base.metadata.tables) <= names
-            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0011_project_trash'
+            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0012_custom_model_config'
             # Confirm that a real FK references the previously missing table.
             fks = sa.inspect(conn).get_foreign_keys('review_jobs')
             assert any(fk['referred_table'] == 'spec_reviews' for fk in fks)
@@ -95,7 +95,7 @@ def test_legacy_schema_without_alembic_version_is_adopted():
         _alembic({**os.environ, 'DATABASE_URL': url})
         with engine.connect() as conn:
             assert conn.execute(sa.text('SELECT count(*) FROM system_settings')).scalar_one() == 1
-            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0011_project_trash'
+            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0012_custom_model_config'
         engine.dispose()
 
 
@@ -116,4 +116,28 @@ def test_existing_trash_uses_last_soft_delete_timestamp(tmp_path):
     _alembic(env)
     with engine.connect() as conn:
         assert conn.execute(sa.select(projects.c.deleted_at)).scalar_one().isoformat() == '2026-10-01T12:00:00'
+    engine.dispose()
+
+
+def test_custom_model_upgrade_preserves_existing_limits_and_credentials(tmp_path):
+    url = f'sqlite:///{tmp_path / "models.db"}'
+    env = {**os.environ, 'DATABASE_URL': url}
+    _alembic(env)
+    engine = sa.create_engine(url)
+    with engine.begin() as conn:
+        # Reproduce the deployed 0011 schema rather than relying on create_all.
+        for column in ('max_output_tokens', 'api', 'compat', 'sampling_params'):
+            conn.execute(sa.text(f'ALTER TABLE models DROP COLUMN {column}'))
+        conn.execute(sa.text("INSERT INTO providers (id,name,base_url,encrypted_key,kind,created_at) "
+                             "VALUES ('provider','Custom','https://example.invalid/v1','encrypted-test-key','custom',CURRENT_TIMESTAMP)"))
+        conn.execute(sa.text("INSERT INTO models (id,provider_id,name,model_id,context_window,reasoning,enabled) "
+                             "VALUES ('long','provider','Long','long',262144,1,1), "
+                             "('small','provider','Small','small',4096,0,1)"))
+        conn.execute(sa.text("UPDATE alembic_version SET version_num = '0011_project_trash'"))
+    _alembic(env)
+    with engine.connect() as conn:
+        rows = conn.execute(sa.text('SELECT id,context_window,max_output_tokens,api,compat,sampling_params FROM models ORDER BY id')).all()
+        assert rows == [('long',262144,8192,'openai-completions','{}','{}'),
+                        ('small',4096,4095,'openai-completions','{}','{}')]
+        assert conn.execute(sa.text('SELECT encrypted_key FROM providers')).scalar_one() == 'encrypted-test-key'
     engine.dispose()

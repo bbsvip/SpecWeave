@@ -111,12 +111,27 @@
       if(!confirm('Xóa API key của provider này? Việc gọi model có thể ngừng hoạt động.'))return;
       act(async()=>{await api(`/api/providers/${pid}`,{clear_api_key:true});location.reload();},'');
     });
-    document.querySelectorAll('.model-save').forEach(button=>button.addEventListener('click',()=>act(async()=>{
-      const id=button.dataset.id;
-      const size=document.querySelector(`.model-context[data-id="${id}"]`).value;
-      const reasoning=document.querySelector(`.model-reasoning[data-id="${id}"]`).value==='true';
-      await api(`/api/providers/${pid}/models/${id}`,{context_window:Number(size),reasoning});location.reload();
-    },'')));
+    document.querySelectorAll('.model-config-form').forEach(form=>form.addEventListener('submit',async event=>{
+      event.preventDefault();
+      const button=form.querySelector('.model-save');
+      if(button.disabled)return;
+      const values=new FormData(form);
+      const payload={context_window:Number(values.get('context_window')),reasoning:values.get('reasoning')==='true'};
+      try{
+        if(form.dataset.custom==='true'){
+          payload.max_output_tokens=Number(values.get('max_output_tokens'));
+          payload.api=values.get('api');
+          for(const key of ['compat','sampling_params']){
+            try{payload[key]=JSON.parse(values.get(key)||'{}');}
+            catch{throw Error(`${key} cần JSON hợp lệ`);}
+          }
+          if(payload.max_output_tokens>=payload.context_window)throw Error('Max output phải nhỏ hơn context window');
+        }
+        button.disabled=true;
+        await api(`/api/providers/${pid}/models/${form.dataset.id}`,payload);
+        location.reload();
+      }catch(error){sw.toast(error.message,'error');button.disabled=false;}
+    }));
   }
   document.querySelectorAll('.provider-toggle').forEach(button=>button.addEventListener('click',()=>act(async()=>{
     await api(`/api/providers/${button.dataset.id}`,{enabled:button.dataset.enabled==='true'});location.reload();

@@ -75,7 +75,7 @@ async function checkedProject(id){
 }
 function modelSignature(data){
   return sha(JSON.stringify([data.auth_mode,data.provider_base,data.model_id,data.reasoning,
-    data.context_window,sha(data.provider_key||'')]));
+    data.context_window,data.max_output_tokens,data.api,data.compat,data.sampling_params,sha(data.provider_key||'')]));
 }
 async function runtimeFor(data,scope){
   if(data.auth_mode==='openai-oauth'){
@@ -93,12 +93,20 @@ async function runtimeFor(data,scope){
   if(!['http:','https:'].includes(url.protocol))throw err(422,'Unsupported model endpoint');
   const modelId=String(data.model_id||'');
   if(!/^[\w.:-]{1,120}$/.test(modelId))throw err(422,'Invalid model ID');
+  const api=data.api||'openai-completions';
+  if(!['openai-completions','openai-responses'].includes(api))throw err(422,'Unsupported custom model API');
+  const contextWindow=data.context_window??32768;
+  const maxTokens=data.max_output_tokens??Math.min(8192,contextWindow-1);
+  if(!Number.isInteger(contextWindow)||contextWindow<1024||contextWindow>2097152||
+     !Number.isInteger(maxTokens)||maxTokens<128||maxTokens>=contextWindow){
+    throw err(422,'Invalid custom model token limits');
+  }
   await mkdir(scope,{recursive:true,mode:0o700});
   const modelsPath=join(scope,'models.json');
-  const registry={providers:{specweave:{baseUrl:data.provider_base.replace(/\/$/,''),api:'openai-completions',authHeader:true,
+  const registry={providers:{specweave:{baseUrl:data.provider_base.replace(/\/$/,''),api,authHeader:true,
     models:[{id:modelId,name:modelId,reasoning:Boolean(data.reasoning),input:['text'],
       cost:{input:0,output:0,cacheRead:0,cacheWrite:0},
-      contextWindow:Math.max(4096,Math.min(Number(data.context_window)||32768,2_000_000)),maxTokens:8192}]}}};
+      contextWindow,maxTokens,compat:data.compat||{},samplingParams:data.sampling_params||{}}]}}};
   await writeFile(modelsPath,JSON.stringify(registry),{mode:0o600});
   const modelRuntime=await ModelRuntime.create({authPath:join(scope,'auth.json'),modelsPath});
   // Runtime-only credential. Never persist provider API key into Pi sessions/models JSON.
