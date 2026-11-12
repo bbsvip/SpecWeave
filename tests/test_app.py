@@ -1024,7 +1024,7 @@ def test_0003_migration_creates_review_queue_without_deleting_old_data(tmp_path,
     assert set(inspect(eng).get_table_names())>=missing
     with eng.connect() as conn:
         assert conn.execute(text("SELECT username FROM users WHERE username='legacy'")).scalar()=='legacy'
-        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0009_pi_native'
+        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0010_detached_chat'
         assert 'cancel_requested' in [x['name'] for x in inspect(eng).get_columns('agent_runs')]
     eng.dispose()
 
@@ -1142,7 +1142,7 @@ def test_0004_fresh_database_migration_is_idempotent(tmp_path, monkeypatch):
     command.upgrade(cfg,'head')
     eng=create_engine(url)
     with eng.connect() as conn:
-        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0009_pi_native'
+        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0010_detached_chat'
         assert any(col['name']=='cancel_requested' for col in __import__('sqlalchemy').inspect(eng).get_columns('agent_runs'))
     eng.dispose()
 
@@ -1890,7 +1890,7 @@ def test_discovery_progress_and_ui_contract(client):
     html=client.get(f'/projects/{pid}/discussion?did={did}').text
     assert 'discoveryProgress' in html and 'data-discovery-ready="false"' in html
     code=(ROOT/'source/static/js/discussion.js').read_text(encoding='utf-8')
-    assert '/answer-stream' in code and 'advance_planning:true' in code
+    assert '/answer-start' in code and 'advance_planning:true' in code and 'EventSource' in code
     assert 'planning_complete' in code and 'planning_question' in code
     assert '/planning/questions/suggest' not in code
 

@@ -30,6 +30,34 @@
     }
     return raw;
   }
+  function decodeToolUnicode(text){
+    return String(text).replace(/\\u([0-9a-fA-F]{4})/g,(_m,h)=>String.fromCharCode(parseInt(h,16)));
+  }
+  function decodeToolTree(value){
+    if(typeof value==='string')return decodeToolUnicode(value);
+    if(Array.isArray(value))return value.map(decodeToolTree);
+    if(value&&typeof value==='object'){
+      return Object.fromEntries(Object.entries(value).map(([key,val])=>[decodeToolUnicode(key),decodeToolTree(val)]));
+    }
+    return value;
+  }
+  function formatToolValue(value){
+    // Display only. Pi receives the original arguments unchanged.
+    if(value===null||value===undefined)return '';
+    let parsed=value;
+    if(typeof parsed==='string'){
+      try{parsed=JSON.parse(parsed);}catch{}
+      if(typeof parsed==='string'){
+        try{parsed=JSON.parse(parsed);}catch{}
+      }
+    }
+    if(typeof parsed==='object'&&parsed!==null){
+      // JSON.stringify emits actual UTF-8 Vietnamese characters, not \u escapes.
+      return JSON.stringify(decodeToolTree(parsed),null,2);
+    }
+    const text=String(parsed);
+    return decodeToolUnicode(text);
+  }
   function renderMarkdown(node,content){
     if(window.marked&&window.DOMPurify){
       node.innerHTML=DOMPurify.sanitize(marked.parse(content,{breaks:true}),{USE_PROFILES:{html:true}});
@@ -87,7 +115,7 @@
     const live=make('div','turn-live-heading');
     const spinner=make('span','turn-loader');spinner.setAttribute('aria-hidden','true');
     const heading=make('span','turn-live-label','Pi Agent đang chuẩn bị phiên…');live.append(spinner,heading);
-    const helper=make('div','turn-live-helper','Kết nối SSE · Thinking · Tools · Nội dung đang sinh');
+    const helper=make('div','turn-live-helper','Pi chạy nền trên server · Có thể rời trang · SSE tự kết nối lại');
     const details=make('details','turn-activity');details.open=true;
     const summary=make('summary','','Hoạt động của agent · đang chạy');
     const inner=make('div','turn-activity-body');
@@ -148,12 +176,12 @@
       parser.push(decoder.decode());parser.finish();
     }finally{reader.releaseLock();}
   }
-  async function talk({continueQuestionId=null,answerQuestion=null,advancePlanning=false}={}){
+  async function talk({continueQuestionId=null,answerQuestion=null,advancePlanning=false,resumeRunId=null}={}){
     if(controller||!did)return false;
     // The answer-stream endpoint saves the choice and starts the Pi run in ONE
     // request. A completed decision must not depend on an unrelated second POST.
-    const message=(continueQuestionId||answerQuestion||advancePlanning)?'':input.value.trim();
-    if(!continueQuestionId&&!answerQuestion&&!advancePlanning&&!message)return false;
+    const message=(continueQuestionId||answerQuestion||advancePlanning||resumeRunId)?'':input.value.trim();
+    if(!continueQuestionId&&!answerQuestion&&!advancePlanning&&!resumeRunId&&!message)return false;
     let optimistic=null;
     if(message){input.value='';input.style.height='auto';optimistic=addMessage('user',message);}
     if(answerQuestion){
@@ -188,19 +216,33 @@
       if(headerUsage)headerUsage.textContent=panel.metrics.textContent;
     },350);
     try{
+      // Start a durable job; the browser owns only its EventSource subscriber.
+      // Closing/navigating the tab never aborts the Pi run.
       const target=answerQuestion?
-        `/api/projects/${pid}/planning/questions/${encodeURIComponent(answerQuestion.question.id)}/answer-stream`:
-        `/api/projects/${pid}/chat`;
+        `/api/projects/${pid}/planning/questions/${encodeURIComponent(answerQuestion.question.id)}/answer-start`:
+        `/api/projects/${pid}/chat/start`;
       const payload=answerQuestion?
         {...answerQuestion.data,role,mode:'discovery'}:
         {discussion_id:did,message,role,mode,...(continueQuestionId?{continue_question_id:continueQuestionId}:{}),
          ...(advancePlanning?{advance_planning:true}: {})};
-      const response=await fetch(target,{
-        method:'POST',credentials:'same-origin',
-        headers:{'Content-Type':'application/json','X-CSRF-Token':sw.csrf},
-        body:JSON.stringify(payload),signal:controller.signal,
-      });
-      if(!response.ok){const payload=await response.json().catch(()=>({}));throw new Error(payload.detail||payload.message||`HTTP ${response.status}`);}
+      let queued;
+      if(resumeRunId){
+        queued={run_id:resumeRunId,events_url:`/api/projects/${pid}/runs/${encodeURIComponent(resumeRunId)}/events`};
+        addTimeline(panel.timeline,'status','Đã nối lại Pi run trên server');
+      }else{
+        const body=JSON.stringify(payload);
+        const keepalive=new TextEncoder().encode(body).length<60000;
+        const response=await fetch(target,{
+          method:'POST',credentials:'same-origin',keepalive,
+          headers:{'Content-Type':'application/json','X-CSRF-Token':sw.csrf},
+          body,signal:controller.signal,
+        });
+        const data=await response.json().catch(()=>({}));
+        if(!response.ok)throw new Error(data.detail||data.message||`HTTP ${response.status}`);
+        queued=data;
+      }
+      if(!queued.run_id)throw new Error('Server chưa trả về Pi run ID');
+      runId=queued.run_id;
       answerAccepted=Boolean(answerQuestion);
       if(answerQuestion)renderPlanningQuestion(null);
       const handleFrame=(ev)=>{
@@ -255,10 +297,10 @@
           item.title.textContent=(p.status==='complete'?'✓ ':p.status==='running'?'◌ ':'↻ ')+name+' · '+toolStatus;
           if(['complete','toolcall_end'].includes(p.status))item.details.classList.add('tool-complete');
           if(p.arguments!==undefined){
-            const args=typeof p.arguments==='string'?p.arguments:JSON.stringify(p.arguments,null,2);
+            const args=formatToolValue(p.arguments);
             item.args=p.status==='toolcall_delta'?(item.args||'')+args:args;
           }
-          if(p.result!==undefined)item.result=typeof p.result==='string'?p.result:JSON.stringify(p.result,null,2);
+          if(p.result!==undefined)item.result=formatToolValue(p.result);
           if(p.summary)item.progress=String(p.summary);
           item.text.textContent=[
             item.args!==null?'Input\n'+item.args:null,
@@ -302,8 +344,35 @@
           throw new Error(ev.message||p.message||'Agent error');
         }
       };
-      await readSSE(response,handleFrame);
-      if(!completed)throw new Error('Kết nối bị ngắt trước khi có sự kiện hoàn thành');
+      await new Promise((resolve,reject)=>{
+        const url=queued.events_url||`/api/projects/${pid}/runs/${encodeURIComponent(runId)}/events`;
+        const source=new EventSource(url,{withCredentials:true});
+        let settled=false;
+        const finish=(error)=>{
+          if(settled)return;
+          settled=true;source.close();
+          controller?.signal.removeEventListener('abort',onAbort);
+          error?reject(error):resolve();
+        };
+        const onAbort=()=>finish(new DOMException('Đã ngắt theo dõi; Pi chỉ hủy khi bấm Dừng','AbortError'));
+        controller.signal.addEventListener('abort',onAbort,{once:true});
+        source.onmessage=(raw)=>{
+          if(settled)return;
+          try{
+            const frame=JSON.parse(raw.data);
+            handleFrame(frame);
+            if(frame.type==='done')finish();
+            else if(frame.type==='error')finish(new Error(frame.payload?.message||'Pi run failed'));
+          }catch(e){finish(e);}
+        };
+        source.onerror=()=>{
+          if(settled)return;
+          // EventSource reconnects with Last-Event-ID, so no duplicate Pi call.
+          panel.heading.textContent='Mất kết nối, đang nối lại và tải các sự kiện còn thiếu…';
+          state.textContent='Đang kết nối lại…';
+        };
+      });
+      if(!completed)throw new Error('Pi run đã kết thúc nhưng thiếu sự kiện done');
       flushRender();
       panel.metrics.textContent=describeUsage(usage,firstTokenMs,elapsedMs,contextWindow,full.length,outputTps);
       if(headerUsage)headerUsage.textContent=panel.metrics.textContent;
@@ -489,5 +558,18 @@
     const name=prompt('Tên phiên thảo luận:','Phiên thảo luận mới');if(!name)return;
     await sw.act(async()=>{const data=await sw.api(`/api/projects/${pid}/discussions`,{title:name,mode:'discovery'});location.href=data.redirect;},'');
   });
-  list.scrollTop=list.scrollHeight;refreshPlanningQuestion();refreshDiscoveryProgress();
+  async function reconnectActiveRun(){
+    if(!did||controller)return;
+    try{
+      const current=await sw.api(`/api/projects/${pid}/discussions/${did}/active-run`,{},'GET');
+      if(current.run_id){
+        checkedInterruptedAnswer=true;  // It is already inside a Pi run.
+        await talk({resumeRunId:current.run_id});
+      }else{
+        await refreshPlanningQuestion();
+      }
+    }catch(e){console.warn('Pi run reconnect:',e.message);await refreshPlanningQuestion();}
+  }
+  list.scrollTop=list.scrollHeight;
+  reconnectActiveRun();refreshDiscoveryProgress();
 })();

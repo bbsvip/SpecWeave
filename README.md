@@ -1,21 +1,30 @@
-# SpecWeave v1.0.2 — Pi-Native Continuous Discovery
+# SpecWeave v1.0.3 — Pi-Native Background Conversations
 
 SpecWeave is a self-hosted workspace for turning project ideas into implementation-ready specifications through guided AI conversations, research, requirements management, a traceability graph, BMAD-inspired workflows, human approvals, and document exports.
 
 **Architecture:** All model inference and agent execution run exclusively through the **in-process Pi SDK** inside the `pi-runner` service. FastAPI does not call LLMs directly, run a second agent, or maintain a fallback OpenAI-compatible agent. Local and remote OpenAI-compatible models remain available **through Pi's model runtime**. Pi owns agent sessions, context and compaction, thinking and tool events, and usage reporting. The frontend requires no Node.js build step.
 
-> **Release status:** The repository includes integration code and automated tests, but the Pi package installed from npm, actual Docker builds and runtime behavior, live OpenAI OAuth, and live model integrations have not been verified in the development environment used to prepare this release. Do not treat this release as production-validated. See [`docs/RELEASE_v1.0.2_CONTINUOUS_DISCOVERY.vi.md`](docs/RELEASE_v1.0.2_CONTINUOUS_DISCOVERY.vi.md) and [`docs/RELEASE_v1.0_PI_NATIVE.vi.md`](docs/RELEASE_v1.0_PI_NATIVE.vi.md) for the implementation details and validation checklist. These two documents are currently in Vietnamese.
+> **Release status:** The repository includes integration code and automated tests, but the Pi package installed from npm, actual Docker builds and runtime behavior, live OpenAI OAuth, and live model integrations have not been verified in the development environment used to prepare this release. Do not treat this release as production-validated. See [`docs/RELEASE_v1.0.3_DETACHED_PI_CHAT.vi.md`](docs/RELEASE_v1.0.3_DETACHED_PI_CHAT.vi.md) and [`docs/RELEASE_v1.0_PI_NATIVE.vi.md`](docs/RELEASE_v1.0_PI_NATIVE.vi.md) for the implementation details and validation checklist. These two documents are currently in Vietnamese.
 
 ## Features
 
 - **Accounts and access control:** First-run administrator setup, login, session revocation, CSRF protection, Argon2id password hashing, and project owner/editor/viewer roles.
 - **Project management:** New-project wizard, reusable presets, project CRUD, trash and recovery, and ownership transfer.
-- **AI discussion:** Streaming chat over SSE, thinking when exposed by the model, tool-call activity, usage and time-to-first-token (TTFT) metrics, stop controls, persistent discussion history, and guided questions with recommended options.
+- **AI discussion:** Detached PostgreSQL-backed chat jobs that continue after tabs close, replayable SSE over EventSource (with reconnect and cursor), thinking when exposed by the model, tool-call activity, usage and time-to-first-token (TTFT) metrics, stop controls, persistent discussion history, and guided questions with recommended options.
 - **Providers and models:** OpenAI-compatible API keys/endpoints, owner-scoped OpenAI OAuth, model discovery, and per-project model selection. Model execution is handled by Pi.
 - **Planning and traceability:** Goals, requirements, acceptance criteria, decisions, coverage checks, a specification graph, and a roadmap.
 - **Quality and deliverables:** BMAD-inspired draft documents, semantic review, background multi-role reviews, quality gates, human approval, Markdown document management, and exports.
 - **Research and files:** SearXNG, HTTP research, Playwright/Chromium, and a project-scoped file manager with quotas and revision history.
 - **Deployment:** Docker Compose with bundled or external PostgreSQL, plus GitHub Actions publishing cached `-web` and `-pi` images to GHCR.
+
+
+## Background chat and reconnect (v1.0.3)
+
+Chat, decision answers and Pi thinking/tool/usage events are now **independent of the browser tab**. The web application creates a PostgreSQL-backed `agent_runs` job and immediately returns its ID. The existing **review-worker** service runs the Pi task, persists event frames in `chat_stream_events`, and the browser subscribes via an `EventSource` GET endpoint. Switching pages, disconnecting from the network or closing the tab only closes the observer connection; it **does not cancel the Pi run**.
+
+When returning to the same discussion, the UI discovers any active run and replays its stored events using SSE event IDs and `Last-Event-ID`. The explicit **Stop** button is the only normal action that sends cancellation to the agent. Do not disable the `review-worker` container: it now processes both AI review and chat jobs. A worker or Pi Host restart during an active inference can still interrupt the task; for safety, an interrupted run is marked failed rather than silently re-executed. This is intentional to avoid duplicate tool side effects.
+
+The `0010_detached_chat` Alembic migration creates the event log and lease fields. Back up PostgreSQL before deploying and keep all existing volumes. Tool call input/output JSON is pretty-printed in UTF-8 in the UI, including legacy escaped Unicode strings; the actual tool arguments are not changed. Full details: [`docs/RELEASE_v1.0.3_DETACHED_PI_CHAT.vi.md`](docs/RELEASE_v1.0.3_DETACHED_PI_CHAT.vi.md) (Vietnamese).
 
 ## Architecture
 
@@ -139,7 +148,7 @@ The planning workflow is designed to continue within **one discussion and one Pi
 4. Pi analyzes the answer in the existing session, explains its implications, and asks the next unresolved question.
 5. Once enough information has been collected, Pi can draft Markdown documents and call `finish_discovery` to generate any missing BMAD artifacts. All generated documents remain **drafts requiring human review**, never automatically approved.
 
-The frontend also supports resuming a previously saved answer that was not yet processed by Pi. See [`docs/RELEASE_v1.0.2_CONTINUOUS_DISCOVERY.vi.md`](docs/RELEASE_v1.0.2_CONTINUOUS_DISCOVERY.vi.md) for the API behavior, edge cases, and test coverage.
+The frontend also supports resuming a previously saved answer that was not yet processed by Pi. See [`docs/RELEASE_v1.0.3_DETACHED_PI_CHAT.vi.md`](docs/RELEASE_v1.0.3_DETACHED_PI_CHAT.vi.md) for the API behavior, edge cases, and test coverage.
 
 ## Documentation
 

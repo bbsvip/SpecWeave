@@ -23,6 +23,7 @@ TABLES_0002 = {
     'trace_suggestions', 'workflow_checkpoints',
 }
 TABLES_0003 = {'review_jobs', 'review_job_steps', 'login_attempts'}
+TABLES_0010 = {'chat_stream_events'}
 
 
 def _baseline_names():
@@ -39,8 +40,9 @@ def test_migrations_create_tables_in_fk_dependency_order():
     baseline = _baseline_names()
     assert baseline & TABLES_0002 == set()
     assert baseline & TABLES_0003 == set()
+    assert baseline & TABLES_0010 == set()
     created = set()
-    for stage in (baseline, TABLES_0002, TABLES_0003):
+    for stage in (baseline, TABLES_0002, TABLES_0003, TABLES_0010):
         # The ORM graph can grow in later versions, but migrations must not
         # try creating a table before any of its referenced tables exist.
         for table in Base.metadata.sorted_tables:
@@ -70,7 +72,7 @@ def test_fresh_database_migrates_to_head():
         with engine.connect() as conn:
             names = set(sa.inspect(conn).get_table_names())
             assert set(Base.metadata.tables) <= names
-            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0009_pi_native'
+            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0010_detached_chat'
             # Confirm that a real FK references the previously missing table.
             fks = sa.inspect(conn).get_foreign_keys('review_jobs')
             assert any(fk['referred_table'] == 'spec_reviews' for fk in fks)
@@ -93,4 +95,4 @@ def test_legacy_schema_without_alembic_version_is_adopted():
         _alembic({**os.environ, 'DATABASE_URL': url})
         with sa.create_engine(url).connect() as conn:
             assert conn.execute(sa.text('SELECT count(*) FROM system_settings')).scalar_one() == 1
-            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0009_pi_native'
+            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0010_detached_chat'

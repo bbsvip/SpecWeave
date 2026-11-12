@@ -78,7 +78,7 @@ def question_payload(item):
     }
 
 
-def answer_question(db: Session, question: PlanningQuestion, data: dict):
+def answer_question(db: Session, question: PlanningQuestion, data: dict, *, commit: bool = True):
     if question.status != 'pending':
         raise HTTPException(409, 'Câu hỏi này đã được xử lý')
     action = str(data.get('action', 'answer'))
@@ -87,7 +87,7 @@ def answer_question(db: Session, question: PlanningQuestion, data: dict):
     if action == 'defer':
         question.status = 'deferred'
         question.answer = {'note': str(data.get('note', ''))[:1000]}
-        db.commit()
+        if commit:db.commit()
         return question
     selected = data.get('selected_ids', [])
     if not isinstance(selected, list) or len(selected) > 4:
@@ -114,7 +114,7 @@ def answer_question(db: Session, question: PlanningQuestion, data: dict):
         f'Phương án người dùng chọn: {answer_text}{details}\n'
         'Đây là câu trả lời xác nhận trong trao đổi, KHÔNG phải quyết định đã được duyệt trong Decision Center.'
     )))
-    db.commit()
+    if commit:db.commit()
     return question
 
 

@@ -24,7 +24,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from db import (get_db, init_db, SessionLocal, utcnow, User, AuthSession, Project, Membership,
-                Preset, Provider, Model, Discussion, Message, AgentRun, Decision, Requirement,
+                Preset, Provider, Model, Discussion, Message, AgentRun, ChatStreamEvent, Decision, Requirement,
                 Document, ResearchItem, SystemSetting, Audit, PlanningQuestion,
                 ProjectGoal, TraceLink, PlanPhase, PhaseDependency, PhaseReview,
                 SpecReview, ReviewFinding, EvidenceAssessment, TraceSuggestion, WorkflowCheckpoint, ReviewJob, LoginAttempt)
@@ -57,12 +57,38 @@ async def lifespan(_app):
     init_db()
     yield
 
-app = FastAPI(title="SpecWeave", version="1.0.2", docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(title="SpecWeave", version="1.0.3", docs_url=None, redoc_url=None, lifespan=lifespan)
 app.mount("/static",StaticFiles(directory=BASE / "static"),name="static")
 templates = Jinja2Templates(directory=BASE / "templates")
 templates.env.filters["date_short"] = lambda d: d.strftime("%d/%m/%Y %H:%M") if d else "—"
 templates.env.filters["readable_chat"] = lambda v: parse_model_response(v)[0]
 templates.env.filters["pretty_json"] = lambda v: json.dumps(v, indent=2, ensure_ascii=False, default=str)
+
+def pretty_tool_value(value):
+    """Unicode-safe display, never alters the actual Pi tool arguments."""
+    def decode(obj):
+        if isinstance(obj,str):
+            return re.sub(r'\\u([0-9a-fA-F]{4})',lambda m:chr(int(m.group(1),16)),obj)
+        if isinstance(obj,list):return [decode(item) for item in obj]
+        if isinstance(obj,dict):return {decode(str(k)):decode(v) for k,v in obj.items()}
+        return obj
+    if value is None:return ''
+    if isinstance(value,(dict,list)):
+        return json.dumps(decode(value),ensure_ascii=False,indent=2)
+    raw=str(value)
+    try:
+        obj=json.loads(raw)
+        if isinstance(obj,str):
+            try:obj=json.loads(obj)
+            except (ValueError,TypeError):pass
+        if isinstance(obj,(dict,list)):
+            return json.dumps(decode(obj),ensure_ascii=False,indent=2)
+        if isinstance(obj,str):raw=obj
+    except (ValueError,TypeError):pass
+    return decode(raw)
+
+templates.env.filters['pretty_tool']=pretty_tool_value
+
 STAGES = ["discovery","requirements","solution_design","ux_design","spec_review","approved"]
 ROLE_LABELS = {"analyst":"Analyst","pm":"Product Manager","architect":"Architect","ux":"UX Designer","reviewer":"Critical Reviewer","planner":"Planning"}
 
@@ -136,7 +162,7 @@ def nonempty(data, key, default=""):
 def health(db:Session=Depends(get_db)):
     from sqlalchemy import text
     db.execute(text("SELECT 1"))
-    return {"status":"ok", "app":"SpecWeave", "version":"0.8.0"}
+    return {"status":"ok", "app":"SpecWeave", "version":"1.0.3"}
 
 @app.get("/first-run",response_class=HTMLResponse)
 def bootstrap_page(request:Request,db:Session=Depends(get_db)):
@@ -1180,6 +1206,111 @@ async def chat_stream(pid:str,request:Request,db:Session=Depends(get_db)):
     return await _chat_stream_impl(pid, db, u, pr, await request.json())
 
 
+@app.post("/api/projects/{pid}/chat/start")
+async def chat_start(pid:str,request:Request,db:Session=Depends(get_db)):
+    """Start a durable Pi run. The tab is a subscriber, never the job owner."""
+    u,s=api_guard(request,db,True);pr=acl(db,pid,u,write=True)
+    data=await request.json()
+    if not isinstance(data,dict):raise HTTPException(422,'Invalid chat payload')
+    return await _chat_stream_impl(pid,db,u,pr,data,queue_only=True)
+
+
+@app.post("/api/projects/{pid}/planning/questions/{qid}/answer-start")
+async def answer_and_start(pid:str,qid:str,request:Request,db:Session=Depends(get_db)):
+    """Atomically accept one answer and enqueue its Pi continuation."""
+    u,s=api_guard(request,db,True);pr=acl(db,pid,u,write=True)
+    payload=await request.json()
+    if not isinstance(payload,dict) or payload.get('action','answer')!='answer':
+        raise HTTPException(422,'Invalid decision answer')
+    lock_project_write(db,pid)
+    q=(db.query(PlanningQuestion).filter_by(id=qid,project_id=pid)
+       .with_for_update().one_or_none())
+    if not q or q.status!='pending':
+        raise HTTPException(409,'Câu hỏi đã được trả lời hoặc không tồn tại')
+    model=db.get(Model,pr.active_model_id) if pr.active_model_id else None
+    if not model or not model.enabled or not model.provider.enabled:
+        raise HTTPException(409,'Hãy chọn model trước khi trả lời')
+    openai_oauth_access(pr,model,u.id)
+    answer_question(db,q,payload,commit=False)
+    audit(db,u,'planning_answer_background',pr,{'question_id':qid})
+    return await _chat_stream_impl(pid,db,u,pr,{
+        'discussion_id':q.discussion_id,'continue_question_id':qid,
+        'role':payload.get('role','analyst'),'mode':'discovery'},queue_only=True)
+
+
+@app.get("/api/projects/{pid}/discussions/{did}/active-run")
+def active_discussion_run(pid:str,did:str,request:Request,db:Session=Depends(get_db)):
+    u,s=api_guard(request,db);acl(db,pid,u)
+    d=db.get(Discussion,did)
+    if not d or d.project_id!=pid:raise HTTPException(404,'Discussion not found')
+    run=(db.query(AgentRun).filter_by(project_id=pid,discussion_id=did)
+        .filter(AgentRun.status.in_(['queued','running']))
+        .order_by(AgentRun.created_at.desc()).first())
+    return {'run_id':run.id,'status':run.status} if run else {'run_id':None,'status':'idle'}
+
+
+@app.get("/api/projects/{pid}/runs/{run_id}/events")
+def detached_run_events(pid:str,run_id:str,request:Request,after:int=0,db:Session=Depends(get_db)):
+    """Replayable SSE: persisted event IDs, auto-reconnect and no model lifecycle coupling."""
+    u,s=api_guard(request,db);acl(db,pid,u)
+    run=db.get(AgentRun,run_id)
+    if not run or run.project_id!=pid:raise HTTPException(404,'Run not found')
+    header=request.headers.get('last-event-id','')
+    if header.isdigit():after=max(after,int(header))
+    after=max(0,min(after,2147483647))
+    # Revalidate access periodically even on a long-lived SSE connection.
+    subscriber_id=u.id
+    subscriber_session_id=s.id
+    async def frames():
+        cursor=after
+        last_heartbeat=time.monotonic()
+        last_acl=0.0
+        while True:
+            if await request.is_disconnected():break
+            if time.monotonic()-last_acl>10:
+                with SessionLocal() as authdb:
+                    viewer=authdb.get(User,subscriber_id)
+                    auth_session=authdb.get(AuthSession,subscriber_session_id)
+                    target=authdb.get(Project,pid)
+                    member=(authdb.query(Membership.id).filter_by(project_id=pid,user_id=subscriber_id).first())
+                    allowed=(bool(viewer and viewer.enabled and auth_session and
+                        auth_session.revoked_at is None and target and target.status!='deleted' and
+                        (target.owner_id==subscriber_id or member)))
+                if not allowed:break
+                last_acl=time.monotonic()
+            with SessionLocal() as conn:
+                rows=(conn.query(ChatStreamEvent)
+                    .filter(ChatStreamEvent.run_id==run_id,ChatStreamEvent.id>cursor)
+                    .order_by(ChatStreamEvent.id).limit(150).all())
+                status=conn.get(AgentRun,run_id).status
+                entries=[(row.id,row.event) for row in rows]
+            for seq,event in entries:
+                cursor=seq
+                yield 'id: '+str(seq)+'\ndata: '+json.dumps(event,ensure_ascii=False)+'\n\n'
+            if entries:
+                last_heartbeat=time.monotonic()
+                continue
+            if status in ('completed','cancelled','error'):
+                # Catch legacy runs whose terminal event was not written by the worker.
+                with SessionLocal() as conn:
+                    tail=(conn.query(ChatStreamEvent).filter_by(run_id=run_id)
+                          .order_by(ChatStreamEvent.id.desc()).first())
+                    latest=conn.get(AgentRun,run_id)
+                if not tail or tail.event.get('type') not in ('done','error'):
+                    if status=='completed':
+                        event={'type':'done','run_id':run_id,'payload':{'duration_ms':latest.duration_ms,'usage':latest.usage or {}}}
+                    else:
+                        event={'type':'error','run_id':run_id,'payload':{'message':latest.error or status}}
+                    yield 'data: '+json.dumps(event,ensure_ascii=False)+'\n\n'
+                break
+            if time.monotonic()-last_heartbeat>=12:
+                yield ': keepalive\n\n'
+                last_heartbeat=time.monotonic()
+            await asyncio.sleep(.35)
+    return StreamingResponse(frames(),media_type='text/event-stream',headers={
+        'Cache-Control':'no-cache, no-transform','X-Accel-Buffering':'no'})
+
+
 @app.post("/api/projects/{pid}/planning/questions/{qid}/answer-stream")
 async def answer_and_stream(pid:str,qid:str,request:Request,db:Session=Depends(get_db)):
     """One atomic user interaction: persist the choice AND start Pi SSE.
@@ -1208,7 +1339,7 @@ async def answer_and_stream(pid:str,qid:str,request:Request,db:Session=Depends(g
         'role':payload.get('role','analyst'), 'mode':'discovery'})
 
 
-async def _chat_stream_impl(pid, db, u, pr, data):
+async def _chat_stream_impl(pid, db, u, pr, data, *, queue_only=False, existing_run_id=None):
     did=str(data.get("discussion_id",""))
     discussion=db.get(Discussion,did)
     if not discussion or discussion.project_id!=pid:raise HTTPException(404,"Discussion not found")
@@ -1239,7 +1370,8 @@ async def _chat_stream_impl(pid, db, u, pr, data):
                                                discussion_id=did).with_for_update().one_or_none())
         if not q or q.status!='answered':
             raise HTTPException(409,'Câu trả lời không còn ở trạng thái có thể tiếp tục')
-        if (q.answer or {}).get('continuation_run_id'):
+        previous=(q.answer or {}).get('continuation_run_id')
+        if previous and previous!=existing_run_id:
             raise HTTPException(409,'Câu trả lời này đã được gửi cho AI trước đó')
     elif not advance and not 1<=len(content)<=30000:
         raise HTTPException(422,"Nội dung phải từ 1 đến 30.000 ký tự")
@@ -1247,14 +1379,31 @@ async def _chat_stream_impl(pid, db, u, pr, data):
     mode=str(data.get("mode",discussion.mode))
     if role not in ROLES:role="analyst"
     if mode not in MODES:mode="discovery"
-    run=AgentRun(project_id=pid,discussion_id=did,model_name=model.model_id,thinking=pr.thinking_level)
-    db.add(run)
+    if queue_only:
+        # Serialize enqueue by project row. Only one pending/running Pi run per
+        # discussion: prevents double clicks and cross-worker race conditions.
+        lock_project_write(db,pid)
+        busy=(db.query(AgentRun).filter_by(project_id=pid,discussion_id=did)
+              .filter(AgentRun.status.in_(['queued','running'])).first())
+        if busy:raise HTTPException(409,'Phiên đang có Pi run; hãy theo dõi run hiện tại')
+    run=(db.get(AgentRun,existing_run_id) if existing_run_id else
+         AgentRun(project_id=pid,discussion_id=did,model_name=model.model_id,
+           thinking=pr.thinking_level,status='queued' if queue_only else 'running',
+           requester_id=u.id,request_payload={**dict(data),'_active_model_id':model.id}))
+    if not existing_run_id:db.add(run)
     db.flush()
-    if continue_qid:
-        # Persist the correlation before streaming so reconnects cannot send the same choice twice.
+    if continue_qid and not existing_run_id:
+        # Persist the correlation so browser reconnect never resends the choice.
         q.answer={**(q.answer or {}),'continuation_run_id':run.id}
+    if queue_only:
+        if content:
+            db.add(Message(discussion_id=did,role='user',content=content,run_id=run.id))
+        db.add(ChatStreamEvent(run_id=run.id,event={'type':'status','run_id':run.id,
+               'payload':{'phase':'queued','message':'Pi đã nhận công việc, đang đợi worker…'}},created_at=utcnow()))
     db.commit()
     run_id=run.id
+    if queue_only:
+        return {'run_id':run_id,'status':'queued','events_url':f'/api/projects/{pid}/runs/{run_id}/events'}
     backend='pi'
     actor_id=u.id
 
@@ -1264,8 +1413,8 @@ async def _chat_stream_impl(pid, db, u, pr, data):
             p=sdb.get(Project,pid);d=sdb.get(Discussion,did);m=sdb.get(Model,p.active_model_id)
             try:
                 async with discussion_lease(did):
-                    if content:
-                        sdb.add(Message(discussion_id=did,role="user",content=content))
+                    if content and not sdb.query(Message).filter_by(discussion_id=did,run_id=run_id,role='user').first():
+                        sdb.add(Message(discussion_id=did,role="user",content=content,run_id=run_id))
                         sdb.commit()
                     async for event in produce_locked(sdb, p, d, m):
                         yield event
@@ -1450,7 +1599,13 @@ async def cancel_run(pid:str,run_id:str,request:Request,db:Session=Depends(get_d
     u,s=api_guard(request,db,True);acl(db,pid,u,write=True)
     run=db.get(AgentRun,run_id)
     if not run or run.project_id!=pid:raise HTTPException(404,"Run not found")
-    if run.status=="running":
+    if run.status=='queued':
+        run.cancel_requested=True
+        run.status='cancelled';run.finished_at=utcnow()
+        db.add(ChatStreamEvent(run_id=run.id,event={'type':'error','run_id':run.id,
+             'payload':{'message':'Đã hủy trước khi Pi bắt đầu'}},created_at=utcnow()))
+        db.commit()
+    elif run.status=='running':
         run.cancel_requested=True
         db.commit()
         from pi_client import abort as pi_abort

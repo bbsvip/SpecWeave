@@ -153,8 +153,20 @@ class AgentRun(Base):
     events = Column(JSON, nullable=False, default=list)
     first_token_ms = Column(Integer, nullable=True)
     duration_ms = Column(Integer, nullable=True)
+    request_payload = Column(JSON, nullable=False, default=dict)
+    requester_id = Column(String(36), nullable=True)
+    worker_owner = Column(String(100), nullable=True)
+    lease_expires_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=utcnow)
     finished_at = Column(DateTime, nullable=True)
+
+class ChatStreamEvent(Base):
+    """Append-only, cursor-replayable Pi events. A browser is never the job owner."""
+    __tablename__ = 'chat_stream_events'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(36), ForeignKey('agent_runs.id'), nullable=False, index=True)
+    event = Column(JSON, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
 
 class Decision(Base):
     __tablename__ = "decisions"
