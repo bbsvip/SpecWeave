@@ -1720,11 +1720,13 @@ def oauth_status(request:Request,db:Session=Depends(get_db)):
 @app.post('/api/openai/oauth/start')
 def oauth_start(request:Request,db:Session=Depends(get_db)):
     user=oauth_guard(request,db,True)
-    db.get(User,user.id,with_for_update=True)
     provider=owner_oauth_provider(db,user,lock=True)
     if not provider:
-        provider=Provider(name='ChatGPT / Codex OAuth',kind='openai-oauth',base_url=openai_oauth.API,owner_id=user.id,enabled=False)
-        db.add(provider);db.flush()
+        db.get(User,user.id,with_for_update=True)
+        provider=owner_oauth_provider(db,user,lock=True)
+        if not provider:
+            provider=Provider(name='ChatGPT / Codex OAuth',kind='openai-oauth',base_url=openai_oauth.API,owner_id=user.id,enabled=False)
+            db.add(provider);db.flush()
     result=openai_oauth.start_login(provider)
     audit(db,user,'openai_oauth_login_started',details={'provider_id':provider.id})
     db.commit()
@@ -1741,13 +1743,11 @@ def oauth_poll(login_id:str,request:Request,db:Session=Depends(get_db)):
 
 
 @app.post('/api/openai/oauth/login/{login_id}/answer')
-async def oauth_answer(login_id:str,request:Request,db:Session=Depends(get_db)):
+def oauth_answer(login_id:str,request:Request,body:dict,db:Session=Depends(get_db)):
     user=oauth_guard(request,db,True)
     provider=owner_oauth_provider(db,user,lock=True)
     if not provider:raise HTTPException(404,'Login not found')
-    body=await request.json()
-    if not isinstance(body,dict):raise HTTPException(422,'Invalid OAuth callback')
-    result=await openai_oauth.finish_login(provider,login_id,body.get('value'))
+    result=asyncio.run(openai_oauth.finish_login(provider,login_id,body.get('value')))
     for model in db.query(Model).filter_by(provider_id=provider.id):
         model.api='openai-responses'
         model.compat={key:value for key,value in (model.compat or {}).items() if key in ('supportsDeveloperRole','supportsStrictMode')}

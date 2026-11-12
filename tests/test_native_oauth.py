@@ -1,6 +1,9 @@
 import asyncio
 import json
 import time
+import threading
+from types import SimpleNamespace
+from uuid import uuid4
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
@@ -114,3 +117,34 @@ def test_invalid_signed_identity_is_rejected_and_login_can_be_cancelled(client,m
     assert client.post('/api/openai/oauth/cancel',headers=csrf,json={}).status_code==200
     assert 'login' not in openai_oauth.read_vault(provider_id)
     assert client.post('/api/openai/oauth/start',headers=csrf,json={}).status_code==200
+
+
+@pytest.mark.asyncio
+async def test_concurrent_refresh_waits_without_blocking_the_event_loop(monkeypatch,tmp_path):
+    monkeypatch.setenv('OPENAI_OAUTH_LOCAL_HOME',str(tmp_path/'vault'))
+    provider=SimpleNamespace(id=str(uuid4()),owner_id='owner',kind='openai-oauth',enabled=True)
+    openai_oauth.write_vault(provider.id,{'registration':{'client_id':'fixture-client'},'token':{
+        'access_token':'old-access','refresh_token':'old-refresh','expires_at':0,'scope':openai_oauth.SCOPES}})
+    lock=threading.Lock()
+    class LockedSession:
+        held=False
+        def __enter__(self):return self
+        def __exit__(self,*args):self.commit()
+        def get(self,*args,**kwargs):
+            assert lock.acquire(timeout=.5),'The row-lock wait blocked the event loop'
+            self.held=True
+            return provider
+        def commit(self):
+            if self.held:lock.release();self.held=False
+    monkeypatch.setattr(openai_oauth,'SessionLocal',LockedSession)
+    calls=[]
+    async def exchange(request):
+        calls.append(request.url.path)
+        await asyncio.sleep(.02)
+        return httpx.Response(200,json={'access_token':'new-access','refresh_token':'new-refresh','expires_in':3600})
+    monkeypatch.setattr(openai_oauth,'client',lambda:httpx.AsyncClient(transport=httpx.MockTransport(exchange)))
+    results=await asyncio.wait_for(asyncio.gather(
+        openai_oauth.authorization(provider.id,'owner'),openai_oauth.authorization(provider.id,'owner')),timeout=2)
+    assert results==[{'Authorization':'Bearer new-access'}]*2
+    assert len(calls)==1
+    assert openai_oauth.read_vault(provider.id)['token']['refresh_token']=='new-refresh'

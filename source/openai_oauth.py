@@ -1,5 +1,6 @@
 """Owner-scoped native ChatGPT OAuth. Credentials stay in an encrypted local vault."""
 import base64
+import asyncio
 import hashlib
 import json
 import os
@@ -13,6 +14,7 @@ from uuid import UUID, uuid4
 import httpx
 import jwt
 from fastapi import HTTPException
+from starlette.concurrency import run_in_threadpool
 
 from db import Provider, SessionLocal
 from security import decrypt, encrypt
@@ -179,6 +181,12 @@ async def finish_login(provider, login_id, callback):
 
 
 async def authorization(provider_id, owner_id):
+    # Keep the entire row-locked refresh independent of the web event loop.
+    # A second synchronous DB writer must not prevent the lock owner from finishing.
+    return await run_in_threadpool(lambda:asyncio.run(_authorization(provider_id,owner_id)))
+
+
+async def _authorization(provider_id, owner_id):
     """Serialize token rotation with the provider row across web and worker processes."""
     with SessionLocal() as db:
         provider=db.get(Provider,provider_id,with_for_update=True)
