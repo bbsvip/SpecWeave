@@ -50,7 +50,8 @@ async function startSandbox(){
  const projectRoot=join(dir,'projects');await mkdir(join(projectRoot,PID),{recursive:true});
  const port=await freePort();const child=spawn(process.execPath,[join(dir,'pi_host.mjs')],{
    cwd:dir,env:{...process.env,PORT:String(port),PROJECTS_ROOT:projectRoot,PI_RUNNER_KEY:SECRET,
-     SPECWEAVE_HOST_TEST:'',OPENAI_OAUTH_LOCAL_MODE:'false',OPENAI_OAUTH_LOCAL_HOME:join(dir,'auth')},
+     SPECWEAVE_HOST_TEST:'',SPECWEAVE_PI_SAFE_RESOURCES_DIR:join(dir,'safe-resources'),
+     OPENAI_OAUTH_LOCAL_MODE:'false',OPENAI_OAUTH_LOCAL_HOME:join(dir,'auth')},
    stdio:['ignore','pipe','pipe']});
  let error='';child.stderr.on('data',d=>error+=d.toString());
  const base='http://127.0.0.1:'+port;

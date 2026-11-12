@@ -16,7 +16,13 @@ import {oauthEnabled,oauthStatus,oauthBusy,oauthStart,oauthPoll,oauthAnswer,oaut
 
 const PORT=Number(process.env.PORT||8090);
 const ROOT=resolve(process.env.PROJECTS_ROOT||'/data/projects');
-const SAFE_RESOURCES='/runner/safe-resources'; // never discover user-uploaded extensions, skills or bash tools
+// The container owns /runner, but the unprivileged GitHub Actions test runner does not.
+// A test may override ONLY this resource directory, never agent/project session paths.
+// Keep it isolated from project uploads so Pi cannot discover user extensions/skills.
+const SAFE_RESOURCES=resolve(process.env.SPECWEAVE_PI_SAFE_RESOURCES_DIR||'/runner/safe-resources');
+if(SAFE_RESOURCES===ROOT||SAFE_RESOURCES.startsWith(ROOT+sep)){
+  throw new Error('Pi resources directory must be outside project storage');
+}
 const AUTH=oauthPaths.AUTH;
 const MODEL_REGISTRY=join(oauthPaths.HOME,'.pi','agent','models.json');
 const sessions=new Map();
