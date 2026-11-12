@@ -45,7 +45,7 @@
   if (prSettings) {
     const id=prSettings.dataset.project, path=`/api/projects/${id}/settings`;
     document.getElementById('saveProjectGeneral')?.addEventListener('click',()=>sw.act(()=>sw.api(path,{name:sw.val('projectName'),description:sw.val('projectDescription'),stage:sw.val('projectStage'),ui_required:sw.val('projectUiRequired')==='auto'?null:sw.val('projectUiRequired')==='true',quality_review_required:sw.val('projectReviewRequired')==='true'})));
-    document.getElementById('saveProjectAI')?.addEventListener('click',()=>sw.act(()=>sw.api(path,{active_model_id:sw.val('projectModel'),thinking_level:sw.val('projectThinking'),agent_backend:sw.val('projectBackend')})));
+    document.getElementById('saveProjectAI')?.addEventListener('click',()=>sw.act(()=>sw.api(path,{active_model_id:sw.val('projectModel'),thinking_level:sw.val('projectThinking')})));
     document.getElementById('addMember')?.addEventListener('click',()=>sw.act(async()=>{await sw.api(`/api/projects/${id}/members`,{username:sw.val('memberUsername'),role:sw.val('memberRole')});location.reload();}));
     document.getElementById('archiveProject')?.addEventListener('click',()=>{
       if(sw.confirm('Đổi trạng thái archive cho dự án này?')) sw.act(async()=>{await sw.api(`/api/projects/${id}/archive`);location.reload();});

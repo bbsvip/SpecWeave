@@ -26,7 +26,7 @@ def runner_config():
     url=os.environ.get('PI_RUNNER_URL','').rstrip('/')
     key=os.environ.get('PI_RUNNER_KEY','')
     if not url or len(key)<32:
-        raise HTTPException(503,'A local Pi runner and a strong PI_RUNNER_KEY are required for OpenAI OAuth')
+        raise HTTPException(503,'A Pi SDK Agent Host and a strong PI_RUNNER_KEY are required for OpenAI OAuth')
     return url,{'X-Runner-Key':key}
 
 
@@ -50,20 +50,3 @@ async def relay(method,path,body=None,timeout=30):
     return result
 
 
-async def completion(project,model,actor_id,messages,thinking='medium'):
-    require_access(project,model,actor_id)
-    if model.provider.kind!='openai-oauth':
-        raise HTTPException(400,'Not an OpenAI OAuth model')
-    # The Pi sidecar NEVER receives the encrypted API key from any provider.
-    chunks=[]
-    for message in messages[-24:]:
-        role=str(message.get('role','user')).upper()
-        if role not in ('SYSTEM','DEVELOPER','USER','ASSISTANT'):continue
-        text=message.get('content','')
-        if isinstance(text,list):text=' '.join(x.get('text','') for x in text if isinstance(x,dict))
-        chunks.append(f'[{role}]\n{str(text)[:20000]}')
-    result=await relay('POST','/oauth/openai/complete',{
-        'prompt':'You are continuing a SpecWeave planning/review task. Follow the instructions and project data below.\n\n'+'\n\n'.join(chunks)[:110000],
-        'model_id':model.model_id,'thinking':thinking
-    },timeout=185)
-    return result

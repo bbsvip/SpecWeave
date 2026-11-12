@@ -33,11 +33,12 @@ services:
       MAX_PROJECT_FILES: ${MAX_PROJECT_FILES:-50000}
       SPECWEAVE_MIGRATIONS_MANAGED: "true"
       SEARXNG_URL: ${SEARXNG_URL:-}
-      PI_RUNNER_URL: ${PI_RUNNER_URL:-}
+      PI_RUNNER_URL: ${PI_RUNNER_URL:-http://pi-runner:8090}
       PI_RUNNER_KEY: ${PI_RUNNER_KEY:-}
       OPENAI_OAUTH_LOCAL_MODE: ${OPENAI_OAUTH_LOCAL_MODE:-false}
     depends_on:
       db: {condition: service_healthy}
+      pi-runner: {condition: service_started}
     volumes:
       - projects_data:/data
     security_opt:
@@ -55,7 +56,7 @@ services:
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY in .env}
       SPECWEAVE_MIGRATIONS_MANAGED: "true"
       OPENAI_OAUTH_LOCAL_MODE: ${OPENAI_OAUTH_LOCAL_MODE:-false}
-      PI_RUNNER_URL: ${PI_RUNNER_URL:-}
+      PI_RUNNER_URL: ${PI_RUNNER_URL:-http://pi-runner:8090}
       PI_RUNNER_KEY: ${PI_RUNNER_KEY:-}
     depends_on:
       db: {condition: service_healthy}
@@ -66,7 +67,6 @@ services:
       - no-new-privileges:true
     networks: [private, public]
   pi-runner:
-    profiles: [pi]
     image: ${SPECWEAVE_IMAGE_REPO:?Set SPECWEAVE_IMAGE_REPO in .env}-pi:${SPECWEAVE_IMAGE_TAG:-main}
     restart: unless-stopped
     init: true

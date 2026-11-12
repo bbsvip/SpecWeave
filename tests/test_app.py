@@ -210,11 +210,11 @@ def test_streaming_chat_persists_response(client, monkeypatch):
     with SessionLocal() as s:
         discussion=s.query(db.Discussion).filter_by(project_id=pid).first()
         did=discussion.id
-    async def stub_compatible(project, discussion, db, model, *, role, mode):
+    async def stub_compatible(project, discussion, db, model, *, role, mode, run_id=None, actor_id=None):
         yield 'delta', {'text':'Spec'}
         yield 'delta', {'text':' confirmed'}
         yield 'final', {'text':'Spec confirmed'}
-    monkeypatch.setattr(application,'compatible_stream',stub_compatible)
+    monkeypatch.setattr(application,'pi_stream',stub_compatible)
     response=client.post(f'/api/projects/{pid}/chat',headers=csrf,json={'discussion_id':did,'message':'Please interview me','role':'analyst','mode':'discovery'})
     assert response.status_code==200,response.text[:500]
     assert '"type": "done"' in response.text
@@ -285,23 +285,19 @@ def test_proactive_question_generation_without_pi_tool_calls(client,monkeypatch)
     assert client.post(f'/api/projects/{pid}/settings',headers=csrf,json={'active_model_id':mid,'agent_backend':'pi'}).status_code==200
     with SessionLocal() as s:
         did=s.query(db.Discussion).filter_by(project_id=pid).one().id
-    import httpx
     output={
         'question':'Should the MVP run as a single service or separate workers?',
         'context':'The MVP will use Docker',
         'options':[{'label':'One service','description':'Simpler','pros':'Simple deployment','cons':'Difficult scaling'},
                    {'label':'Separate worker','description':'Two containers','pros':'Isolation','cons':'More setup'}],
-        'recommended_index':0, 'recommendation_reason':'Lower complexity for MVP',
+        'recommended_index':0,'recommendation_reason':'Lower complexity for MVP',
         'assumptions':['Light initial traffic']
     }
-    def handler(request):
-        assert request.url.path=='/v1/chat/completions'
-        payload=json.loads(request.content)
-        assert payload['stream'] is False
-        assert 'JSON' in payload['messages'][0]['content']
-        return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps(output)}}]})
-    real_client=httpx.AsyncClient
-    monkeypatch.setattr(module.httpx,'AsyncClient',lambda **kwargs: real_client(transport=httpx.MockTransport(handler)))
+    import pi_client
+    async def fake_complete(project,model,actor_id,**kwargs):
+        assert 'JSON' in kwargs['system_context']
+        return {'text':json.dumps(output),'usage':{}}
+    monkeypatch.setattr(pi_client,'complete',fake_complete)
     first=client.post(f'/api/projects/{pid}/planning/questions/suggest',headers=csrf,json={'discussion_id':did})
     assert first.status_code==200,first.text
     assert first.json()['created'] and first.json()['question']['recommended_id']=='o1'
@@ -802,7 +798,7 @@ async def test_background_review_four_roles_and_provenance(client,monkeypatch):
     assert client.post(url,headers=csrf,json={}).status_code==409
     calls=[]
     async def model_fake(session, project, model, *, lens=None, prior_reviews=None,
-                         max_output_tokens=None, include_usage=False, release_db_before_http=False):
+                         max_output_tokens=None, include_usage=False, release_db_before_http=False, actor_id=None):
         calls.append((lens,len(prior_reviews or []),release_db_before_http))
         return lens+' summary',[{'severity':'high' if lens=='qa' else 'warning',
                'category':'risk','description':'No tested recovery behavior for external API failures',
@@ -975,31 +971,23 @@ def test_login_throttle_is_db_backed_and_does_not_store_usernames(client):
 @pytest.mark.asyncio
 async def test_model_review_usage_and_cross_role_context(client,monkeypatch):
     import planning_engine
-    import httpx
+    import pi_client
     from db import Requirement
     csrf=auth(client)
     pid=configured_review_project(client,csrf)
     with SessionLocal() as s:
         req=Requirement(project_id=pid,code='REQ-101',title='Recover on failure',
                         criteria='After API timeout show retry state')
-        s.add(req);s.commit()
-        rid=req.id
+        s.add(req);s.commit();rid=req.id
     seen=[]
-    def handler(request):
-        data=json.loads(request.content)
-        seen.append(data)
-        assert 'PRIOR_REVIEW_OBSERVATIONS' in data['messages'][1]['content']
-        return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps({
-            'summary':'Sources were checked',
-            'findings':[{'severity':'warning','category':'risk','description':'Retry policy is not fully specified',
-                         'source_type':'requirement','source_id':rid}]})}}],
-            'usage':{'completion_tokens':66}})
-    real_class=httpx.AsyncClient
-    class FakeClient(real_class):
-        def __init__(self,*args,**kwargs):
-            kwargs['transport']=httpx.MockTransport(handler)
-            super().__init__(*args,**kwargs)
-    monkeypatch.setattr(planning_engine.httpx,'AsyncClient',FakeClient)
+    async def fake_complete(project,model,actor_id,**kwargs):
+        seen.append(kwargs)
+        assert 'PRIOR_REVIEW_OBSERVATIONS' in kwargs['message']
+        return {'text':json.dumps({'summary':'Sources were checked','findings':[
+            {'severity':'warning','category':'risk','description':'Retry policy is not fully specified',
+            'source_type':'requirement','source_id':rid}]}),
+            'usage':{'output_tokens':66}}
+    monkeypatch.setattr(pi_client,'complete',fake_complete)
     with SessionLocal() as s:
         project=s.get(Project,pid)
         model=s.get(Model,project.active_model_id)
@@ -1009,7 +997,7 @@ async def test_model_review_usage_and_cross_role_context(client,monkeypatch):
         assert summary=='Sources were checked'
         assert used==66 and not estimated
         assert len(items)==1 and items[0]['source_id']==rid
-        assert seen[0]['max_tokens']==1500
+        assert 'PROJECT_DATA' in seen[0]['message']
 
 
 def test_0003_migration_creates_review_queue_without_deleting_old_data(tmp_path,monkeypatch):
@@ -1036,7 +1024,7 @@ def test_0003_migration_creates_review_queue_without_deleting_old_data(tmp_path,
     assert set(inspect(eng).get_table_names())>=missing
     with eng.connect() as conn:
         assert conn.execute(text("SELECT username FROM users WHERE username='legacy'")).scalar()=='legacy'
-        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0008_conversation_stream'
+        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0009_pi_native'
         assert 'cancel_requested' in [x['name'] for x in inspect(eng).get_columns('agent_runs')]
     eng.dispose()
 
@@ -1077,18 +1065,18 @@ async def test_pi_tool_bridge_caps_and_project_scope(client, monkeypatch):
 
 
 def test_pi_runner_has_custom_only_allowlist_and_project_restricted_env():
-    """No native Pi bash/read/write tools; only explicit extension is exposed."""
-    runner=(ROOT/'source/pi_runner.py').read_text()
-    extension=(ROOT/'source/pi_tools.ts').read_text()
-    assert '--no-builtin-tools' in runner
-    assert '--no-mcp' in runner
-    assert '--extension' in runner and '/runner/pi_tools.ts' in runner
-    assert '--tools' in runner
-    assert 'SPECWEAVE_TOOL_TOKEN' in runner
-    assert 'PI_TOOL_URL' in runner
-    assert 'name: "propose_planning_question"' in extension
-    assert 'X-Specweave-Token' in extension
-    assert 'exec(' not in extension and 'spawn(' not in extension
+    """Pi SDK is the only agent; no built-in shell or independent completion loop."""
+    host=(ROOT/'source/pi_host.mjs').read_text()
+    tools=(ROOT/'source/pi_host_tools.mjs').read_text()
+    ai=(ROOT/'source/ai.py').read_text()
+    assert 'createAgentSession(' in host and 'SessionManager.continueRecent' in host
+    assert "noTools:withTools?'builtin':'all'" in host
+    assert 'tools:[]' not in host and 'customTools:withTools?createScopedTools(active):[]' in host
+    assert 'X-Specweave-Token' in tools and 'X-Specweave-Run' in tools
+    assert 'propose_planning_question' in tools and 'tool_token' in ai
+    assert 'compatible_stream' not in ai
+    assert 'pi --mode rpc' not in (ROOT/'Dockerfile.runner').read_text()
+
 
 @pytest.mark.asyncio
 async def test_chat_coordination_lease_and_cancel_persistence(client):
@@ -1154,7 +1142,7 @@ def test_0004_fresh_database_migration_is_idempotent(tmp_path, monkeypatch):
     command.upgrade(cfg,'head')
     eng=create_engine(url)
     with eng.connect() as conn:
-        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0008_conversation_stream'
+        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0009_pi_native'
         assert any(col['name']=='cancel_requested' for col in __import__('sqlalchemy').inspect(eng).get_columns('agent_runs'))
     eng.dispose()
 
@@ -1356,7 +1344,7 @@ async def test_multi_model_review_selection_provenance_export_and_validation(cli
     assert job['role_models']==roles
     calls=[]
     async def fake_review(db_session,project,model,*,lens=None,prior_reviews=None,
-                          max_output_tokens=None,include_usage=False,release_db_before_http=False):
+                          max_output_tokens=None,include_usage=False,release_db_before_http=False,actor_id=None):
         calls.append((lens,model.id))
         return f'Checked by {model.model_id}',[],16,False
     monkeypatch.setattr(review_queue,'model_review',fake_review)
@@ -1510,22 +1498,17 @@ def test_openai_oauth_event_whitelist_and_redaction():
 @pytest.mark.asyncio
 async def test_openai_oauth_completion_never_relays_credentials(monkeypatch):
     from types import SimpleNamespace
-    import openai_oauth_gateway as gateway
+    import pi_client
     monkeypatch.setenv('OPENAI_OAUTH_LOCAL_MODE','true')
-    project=SimpleNamespace(owner_id='owner-one')
-    provider=SimpleNamespace(kind='openai-oauth',owner_id='owner-one',enabled=True,encrypted_key='DO_NOT_SEND')
-    model=SimpleNamespace(provider=provider,enabled=True,model_id='known-openai-model')
-    seen=[]
-    async def fake_relay(method,path,body=None,timeout=30):
-        seen.append((method,path,body))
-        return {'text':'Test response','usage_estimated':True}
-    monkeypatch.setattr(gateway,'relay',fake_relay)
-    result=await gateway.completion(project,model,'owner-one',[
-        {'role':'system','content':'Plan a project'},{'role':'user','content':'Hello'}],thinking='medium')
-    assert result['text']=='Test response'
-    assert seen[0][1]=='/oauth/openai/complete'
-    assert 'DO_NOT_SEND' not in json.dumps(seen)
-    with pytest.raises(Exception):await gateway.completion(project,model,'other-user',[],thinking='medium')
+    project=SimpleNamespace(id='project-one',owner_id='owner-one',thinking_level='medium')
+    provider=SimpleNamespace(kind='openai-oauth',owner_id='owner-one',enabled=True,
+                             encrypted_key='DO_NOT_SEND',base_url='pi://openai')
+    model=SimpleNamespace(provider=provider,enabled=True,model_id='known-openai-model',
+                          reasoning=True,context_window=32768)
+    payload=pi_client.model_payload(project,model,'owner-one')
+    assert payload['auth_mode']=='openai-oauth'
+    assert payload['provider_key']=='' and 'DO_NOT_SEND' not in json.dumps(payload)
+    with pytest.raises(Exception):pi_client.model_payload(project,model,'other-user')
 
 
 def test_openai_oauth_model_catalog_is_enforced(client, monkeypatch):
@@ -1625,13 +1608,13 @@ def test_chat_continues_answer_once_with_usage_and_no_duplicate_message(client, 
     assert res.status_code==200
     assert 'answered' in res.text
 
-    async def simulated(project, discussion, db, model, *, role, mode):
+    async def simulated(project, discussion, db, model, *, role, mode, run_id=None, actor_id=None):
         assert db.query(Message).filter_by(discussion_id=did,role='user').count()==1
         yield 'status',{'phase':'reasoning','message':'Đang phân tích…'}
         yield 'delta',{'text':'Đã hiểu. Mỗi người có tài khoản riêng.'}
         yield 'usage',{'input_tokens':123,'output_tokens':27,'cache_read_tokens':10,'source':'provider'}
         yield 'final',{'text':'Đã hiểu. Mỗi người có tài khoản riêng.'}
-    monkeypatch.setattr(application,'compatible_stream',simulated)
+    monkeypatch.setattr(application,'pi_stream',simulated)
     url=f'/api/projects/{pid}/chat'
     answer=client.post(url,headers=csrf,json={'discussion_id':did,'continue_question_id':qid,'message':'','role':'analyst','mode':'discovery'})
     assert answer.status_code==200,answer.text
@@ -1671,39 +1654,38 @@ def test_usage_normalization_distinguishes_provider_from_estimates():
 
 
 @pytest.mark.asyncio
-async def test_compatible_stream_usage_without_choices_and_optional_fallback(client,monkeypatch):
-    import ai
+async def test_pi_sdk_stream_forwards_native_events(client,monkeypatch):
+    import pi_client
     import httpx
     csrf=auth(client)
-    provider=client.post('/api/providers',headers=csrf,json={'name':'NoStreamOptions','base_url':'http://model.internal/v1','api_key':'x'}).json()['id']
-    client.post(f'/api/providers/{provider}/models',headers=csrf,json={'model_ids':['old-server']})
+    provider=client.post('/api/providers',headers=csrf,json={
+        'name':'Native Pi Stream','base_url':'http://model.internal/v1','api_key':'x'}).json()['id']
+    client.post(f'/api/providers/{provider}/models',headers=csrf,json={'model_ids':['pi-model']})
     pid=create_project(client,csrf)
-    attempts=[]
+    requests=[]
     def handler(request):
-        body=json.loads(request.content)
-        attempts.append(body)
-        if 'stream_options' in body:
-            return httpx.Response(400,text='unknown parameter stream_options')
-        packets=[
-            {'choices':[{'delta':{'content':'Hello'}}]},
-            {'choices':[],'usage':{'prompt_tokens':99,'completion_tokens':7}},
-        ]
-        return httpx.Response(200,content=''.join('data: '+json.dumps(x)+'\n\n' for x in packets)+'data: [DONE]\n\n',headers={'Content-Type':'text/event-stream'})
-    real_client=httpx.AsyncClient
-    monkeypatch.setattr(ai.httpx,'AsyncClient',lambda **kwargs:real_client(transport=httpx.MockTransport(handler)))
-    with SessionLocal() as s:
-        project=s.get(Project,pid)
-        discussion=s.query(db.Discussion).filter_by(project_id=pid).one()
-        model=s.query(Model).filter_by(model_id='old-server').one()
-        s.add(Message(discussion_id=discussion.id,role='user',content='Hi'));s.commit()
-        events=[]
-        async for event in ai.compatible_stream(project,discussion,s,model,role='analyst',mode='discuss'):
-            events.append(event)
-    assert len(attempts)==2
-    assert 'stream_options' in attempts[0] and 'stream_options' not in attempts[1]
+        body=json.loads(request.content);requests.append(body)
+        assert request.url.path=='/run'
+        assert body['auth_mode']=='api_key' and body['model_id']=='pi-model'
+        packets=[{'type':'thinking','payload':{'text':'Available model reasoning'}},
+                 {'type':'tool','payload':{'name':'search_web','status':'complete'}},
+                 {'type':'delta','payload':{'text':'Hello'}},
+                 {'type':'usage','payload':{'source':'pi','input_tokens':99,'output_tokens':7}},
+                 {'type':'final','payload':{'text':'Hello'}}]
+        data=''.join('data: '+json.dumps(x)+'\n\n' for x in packets)
+        return httpx.Response(200,content=data,headers={'Content-Type':'text/event-stream'})
+    real=httpx.AsyncClient
+    monkeypatch.setattr(pi_client,'runner_config',lambda:('http://pi-runner:8090',{'X-Runner-Key':'x'*32}))
+    monkeypatch.setattr(pi_client.httpx,'AsyncClient',lambda **kw:real(transport=httpx.MockTransport(handler)))
+    with SessionLocal() as db_session:
+        project=db_session.get(Project,pid)
+        model=db_session.query(Model).filter_by(model_id='pi-model').one()
+        events=[x async for x in pi_client.stream(project,model,None,{'message':'Hi','run_id':'run'})]
     assert ('delta',{'text':'Hello'}) in events
-    assert any(k=='usage' and v.get('input_tokens')==99 and v.get('output_tokens')==7 for k,v in events)
     assert events[-1]==('final',{'text':'Hello'})
+    assert any(k=='usage' and v['output_tokens']==7 for k,v in events)
+    assert requests and requests[0]['provider_base']=='http://model.internal/v1'
+
 
 @pytest.mark.asyncio
 async def test_sse_heartbeat_does_not_cancel_waiting_model():

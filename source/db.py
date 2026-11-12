@@ -58,7 +58,7 @@ class Project(Base):
     profile = Column(JSON, default=dict, nullable=False)
     active_model_id = Column(String(36), nullable=True)
     thinking_level = Column(String(20), default="medium")
-    agent_backend = Column(String(20), default="compatible")
+    agent_backend = Column(String(20), default="pi")
     revision = Column(Integer, default=1)
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)

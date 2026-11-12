@@ -201,7 +201,7 @@ async def process_claimed_job(job_id: str, worker_id: str = WORKER_ID) -> bool:
                 model_db, model_project, model_config, lens=role,
                 prior_reviews=prior if role=="synthesis" else None,
                 max_output_tokens=max_tokens, include_usage=True,
-                release_db_before_http=True, **({"actor_id":job.requester_id} if model.provider.kind=="openai-oauth" else {}))
+                release_db_before_http=True, actor_id=job.requester_id)
     except Exception as exc:
         with SessionLocal() as db:
             job=db.query(ReviewJob).filter_by(id=job_id).with_for_update().first()

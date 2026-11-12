@@ -1,4 +1,4 @@
-"""Project-scoped planning agent. OpenAI-compatible streaming/tool loop and optional Pi RPC runner."""
+"""Project-scoped planning context and scoped tool gateway. Pi SDK is the only agent."""
 import json
 import hmac
 import hashlib
@@ -166,148 +166,29 @@ async def tool_call(name, args, *, project, db, discussion_id=None):
         return {"title":out["title"],"url":out["url"],"content":out["text"][:18000]}
     return {"error":"Unknown tool"}
 
-def api_endpoint(base):
-    base = base.rstrip("/")
-    if base.endswith("/chat/completions"): return base
-    if base.endswith("/v1"): return base + "/chat/completions"
-    return base + "/v1/chat/completions"
-
-async def compatible_stream(project, discussion, db, model, *, role, mode):
-    """SSE-backed OpenAI-compatible tool loop; usage counted only when provider reports it."""
-    history = db.query(Message).filter_by(discussion_id=discussion.id).order_by(Message.created_at.desc()).limit(16).all()[::-1]
-    messages = [{'role':'system','content':plan_prompt(project,db,role,mode)}]
-    messages += [{'role':x.role,'content':x.content[:14000]} for x in history]
-    provider = model.provider
-    key = decrypt(provider.encrypted_key)
-    headers = {'Content-Type':'application/json'}
-    if key: headers['Authorization']='Bearer '+key
-    url=api_endpoint(provider.base_url)
-    total_usage={}
-    all_visible=[]
-    async with httpx.AsyncClient(timeout=httpx.Timeout(180,connect=20),trust_env=False) as client:
-        for turn in range(6):
-            payload = {'model':model.model_id,'messages':messages,'stream':True,
-                       'stream_options':{'include_usage':True},'temperature':0.6,
-                       'max_tokens':min(8192,int(os.environ.get('MAX_OUTPUT_TOKENS','4096')))}
-            if turn < 5: payload['tools']=TOOLS;payload['tool_choice']='auto'
-            if provider.kind=='openai' and model.reasoning and project.thinking_level!='off':
-                payload.pop('temperature',None)
-                payload['reasoning_effort']=project.thinking_level if project.thinking_level in ('low','medium','high') else 'medium'
-            accumulated=[]
-            calls={}
-            seen_reasoning=False
-            reasoning_chars=0
-            try:
-                # Some local endpoints reject stream_options or tool calling.
-                # Downgrade only those OPTIONAL capabilities and keep streaming.
-                for attempt in range(3):
-                    retry=False
-                    async with client.stream('POST',url,json=payload,headers=headers) as response:
-                        if response.status_code>=400:
-                            error=(await response.aread()).decode(errors='replace')[:400]
-                            if response.status_code in (400,422) and 'stream_options' in payload:
-                                payload.pop('stream_options',None)
-                                yield 'status',{'phase':'model','message':'Provider không hỗ trợ usage streaming; tiếp tục nhận phản hồi.'}
-                                retry=True
-                            elif response.status_code in (400,422) and 'tools' in payload:
-                                payload.pop('tools',None);payload.pop('tool_choice',None)
-                                yield 'status',{'phase':'model','message':'Provider không hỗ trợ tool calling; chuyển sang chat thuần.'}
-                                retry=True
-                            else:
-                                raise RuntimeError(f'Provider HTTP {response.status_code}: {error}')
-                        else:
-                            async for line in response.aiter_lines():
-                                if not line.startswith('data:'):continue
-                                raw=line[5:].strip()
-                                if not raw or raw=='[DONE]':continue
-                                try: event=json.loads(raw)
-                                except (ValueError,TypeError):continue
-                                if not isinstance(event,dict):continue
-                                usage=normalize_usage(event.get('usage'),source='provider')
-                                if usage:
-                                    total_usage=accumulate_usage(total_usage,usage)
-                                    yield 'usage',dict(total_usage)
-                                choices=event.get('choices') or []
-                                if not choices:continue
-                                delta=choices[0].get('delta') or {}
-                                reasoning = delta.get('reasoning_content') or delta.get('reasoning')
-                                if isinstance(reasoning, str) and reasoning:
-                                    if not seen_reasoning:
-                                        seen_reasoning=True
-                                        yield 'status', {'phase':'reasoning','message':'Model đang phân tích…'}
-                                    # Send only data actually exposed by the provider.
-                                    if reasoning_chars < 60_000:
-                                        part = reasoning[:60_000-reasoning_chars]
-                                        reasoning_chars += len(part)
-                                        yield 'thinking', {'text':part}
-                                text=delta.get('content')
-                                if isinstance(text,str) and text:
-                                    accumulated.append(text)
-                                    all_visible.append(text)
-                                    yield 'delta',{'text':text}
-                                for call in delta.get('tool_calls') or []:
-                                    idx=call.get('index',0)
-                                    old=calls.setdefault(idx,{'id':'','name':'','arguments':''})
-                                    if call.get('id'):old['id']=call['id']
-                                    fn=call.get('function') or {}
-                                    old['name']+=fn.get('name','')
-                                    old['arguments']+=fn.get('arguments','')
-                    if not retry:break
-                else:
-                    raise RuntimeError('Provider rejected stream_options/tool calling even after fallback')
-            except httpx.HTTPError as exc:
-                raise RuntimeError(f'Không kết nối được model provider: {type(exc).__name__}') from exc
-            if not calls:
-                yield 'final',{'text':''.join(all_visible) or '(Model trả về phản hồi trống)'}
-                return
-            tool_calls=[{'id':c['id'] or f'call_{idx}','type':'function','function':{'name':c['name'],'arguments':c['arguments']}}
-                        for idx,c in sorted(calls.items())]
-            messages.append({'role':'assistant','content':''.join(accumulated) or None,'tool_calls':tool_calls})
-            for call in tool_calls:
-                name=call['function']['name']
-                yield 'tool',{'name':name,'id':call['id'],'status':'running','arguments':safe_tool_preview(call['function']['arguments'])}
-                try:
-                    args=json.loads(call['function']['arguments'] or '{}')
-                    result=await tool_call(name,args,project=project,db=db,discussion_id=discussion.id)
-                except Exception as exc:
-                    result={'error':str(exc)[:500]}
-                messages.append({'role':'tool','tool_call_id':call['id'],'content':json.dumps(result,ensure_ascii=False)[:19000]})
-                yield 'tool',{'name':name,'id':call['id'],'status':'complete','result':safe_tool_preview(result)}
-    yield 'final',{'text':''.join(all_visible) or 'Agent đã đạt giới hạn số lượt gọi công cụ.'}
-
 def pi_tool_token(run_id: str, project_id: str, discussion_id: str, created_at) -> str:
-    """Per-run capability token; model cannot choose or expand project scope."""
+    """Per-run capability signed by FastAPI, verified only by the tool gateway."""
     secret = os.environ.get("PI_RUNNER_KEY", "")
     if len(secret) < 32:
-        raise RuntimeError("PI_RUNNER_KEY must be at least 32 characters for Pi tool bridge")
+        raise RuntimeError("PI_RUNNER_KEY must be at least 32 characters")
     payload=f"pi-tools:{run_id}:{project_id}:{discussion_id}:{created_at.isoformat()}"
     return hmac.new(secret.encode(),payload.encode(),hashlib.sha256).hexdigest()
 
 
 async def pi_stream(project, discussion, db, model, *, role, mode, run_id, actor_id=None):
-    require_access(project,model,actor_id)
-    url = os.environ.get("PI_RUNNER_URL", "").rstrip("/")
-    if not url:
-        raise RuntimeError("Chưa cấu hình PI_RUNNER_URL")
-    history = db.query(Message).filter_by(discussion_id=discussion.id).order_by(Message.created_at.desc()).limit(1).all()
-    prompt = history[0].content if history else ""
+    """Forward Pi SDK events; no independent LLM client or tool loop exists here."""
     from db import AgentRun
-    run = db.get(AgentRun,run_id)
-    if not run or run.project_id != project.id or run.discussion_id != discussion.id:
-        raise RuntimeError("Unknown Pi run")
-    payload = {"project_id":project.id,"discussion_id":discussion.id,"run_id":run_id,
-               "tool_token":pi_tool_token(run.id,run.project_id,run.discussion_id,run.created_at),
-               "message":prompt,
-               "system_context":plan_prompt(project,db,role,mode),"provider_base":model.provider.base_url,
-               "provider_key":decrypt(model.provider.encrypted_key) if model.provider.kind!="openai-oauth" else "",
-               "auth_mode":"openai-oauth" if model.provider.kind=="openai-oauth" else "api_key",
-               "model_id":model.model_id,
-               "reasoning":model.reasoning,"context_window":model.context_window,"thinking":project.thinking_level}
-    headers = {"X-Runner-Key":os.environ.get("PI_RUNNER_KEY","")}
-    async with httpx.AsyncClient(timeout=httpx.Timeout(360,connect=15),trust_env=False) as client:
-        async with client.stream("POST",url+"/run",json=payload,headers=headers) as response:
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                if line.startswith("data: "):
-                    obj=json.loads(line[6:])
-                    yield obj.get("type","status"), obj.get("payload",{})
+    from pi_client import stream
+    run=db.get(AgentRun,run_id)
+    if not run or run.project_id!=project.id or run.discussion_id!=discussion.id:
+        raise RuntimeError('Unknown Pi run')
+    history=db.query(Message).filter_by(discussion_id=discussion.id).order_by(Message.created_at.desc()).limit(22).all()[::-1]
+    prompt=history[-1].content if history else ''
+    payload={
+        'project_id':project.id,'discussion_id':discussion.id,'run_id':run_id,
+        'tool_token':pi_tool_token(run.id,run.project_id,run.discussion_id,run.created_at),
+        'message':prompt,'system_context':plan_prompt(project,db,role,mode),
+        'bootstrap_history':[{'role':x.role,'content':x.content[:1800]} for x in history[:-1]],
+    }
+    async for kind, content in stream(project,model,actor_id,payload):
+        yield kind,content

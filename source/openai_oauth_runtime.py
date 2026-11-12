@@ -279,64 +279,6 @@ async def diagnostics():
     return status
 
 
-async def available_models():
-    require_local()
-    # Query the ACTUAL installed Pi model catalog; do not invent model IDs.
-    proc=await asyncio.create_subprocess_exec('pi','--list-models','openai',
-        env={**os.environ,'HOME':str(LOCAL_HOME)},
-        stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL)
-    try:stdout,_=await asyncio.wait_for(proc.communicate(),timeout=18)
-    except asyncio.TimeoutError:
-        proc.kill();await proc.wait();raise HTTPException(504,'Pi model catalog timed out')
-    if proc.returncode:raise HTTPException(502,'Unable to read local Pi model catalog')
-    names=[]
-    for raw in stdout.decode(errors='replace').splitlines():
-        parts=raw.strip().split()
-        if len(parts)>=2 and parts[0]=='openai' and re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9._:-]{1,120}',parts[1]):
-            names.append(parts[1])
-    return {'models':list(dict.fromkeys(names))[:200]}
-
-
-async def complete(prompt, model_id, thinking='medium'):
-    """No tools, no persistent Pi session: used by Guided Planning and BMAD Review."""
-    require_local()
-    async with AUTH_USE_LOCK:
-        return await _complete_unlocked(prompt, model_id, thinking)
-
-async def _complete_unlocked(prompt, model_id, thinking='medium'):
-    require_local()
-    if not public_status()['connected']:
-        raise HTTPException(409,'OpenAI account is not connected in local Pi runtime')
-    if not isinstance(prompt,str) or len(prompt)>115000:raise HTTPException(422,'Prompt too large')
-    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,119}',model_id):raise HTTPException(422,'Invalid model ID')
-    cmd=['pi','--mode','rpc','--no-session','--no-builtin-tools','--no-extensions','--no-skills',
-         '--no-context-files','--no-mcp','--no-approve','--provider','openai','--model',model_id,
-         '--thinking',thinking if thinking in ('off','minimal','low','medium','high','xhigh') else 'medium']
-    proc=await asyncio.create_subprocess_exec(*cmd,env={**os.environ,'HOME':str(LOCAL_HOME)},
-           cwd=str(LOCAL_HOME),stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,
-           stderr=asyncio.subprocess.DEVNULL)
-    chunks=[]
-    try:
-        proc.stdin.write((json.dumps({'id':'oauth-complete','type':'prompt','message':prompt})+'\n').encode('utf8'))
-        await proc.stdin.drain()
-        deadline=asyncio.get_running_loop().time()+170
-        while True:
-            remaining=deadline-asyncio.get_running_loop().time()
-            if remaining<=0:raise HTTPException(504,'OpenAI completion timed out')
-            raw=await asyncio.wait_for(proc.stdout.readline(),timeout=remaining)
-            if not raw:break
-            try: event=json.loads(raw)
-            except ValueError:continue
-            if event.get('type')=='response' and event.get('command')=='prompt' and not event.get('success'):
-                raise HTTPException(502,'Pi rejected model completion')
-            if event.get('type')=='message_update' and (event.get('assistantMessageEvent') or {}).get('type')=='text_delta':
-                chunks.append((event['assistantMessageEvent'].get('delta') or '')[:20000])
-            if event.get('type')=='agent_settled':break
-        text=''.join(chunks)
-        if not text:raise HTTPException(502,'OpenAI model returned no content')
-        return {'text':text[:150000], 'usage':{'completion_tokens':max(1,(len(text)+3)//4)}, 'usage_estimated':True}
-    finally:
-        if proc.returncode is None:
-            proc.terminate()
-            try:await asyncio.wait_for(proc.wait(),timeout=3)
-            except asyncio.TimeoutError:proc.kill();await proc.wait()
+# Retired compatibility shim for historical OAuth regression tests only.
+# Production OAuth is exclusively managed by source/pi_host_oauth.mjs and Pi.
+# This file no longer contains model invocations or agent/session logic.

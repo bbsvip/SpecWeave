@@ -44,7 +44,7 @@ def test_stream_persists_thinking_tool_usage_and_normalized_answer(client,monkey
     with SessionLocal() as session:
         did=session.query(db.Discussion).filter_by(project_id=pid).one().id
 
-    async def simulated(project,discussion,session,model,*,role,mode):
+    async def simulated(project,discussion,session,model,*,role,mode,run_id=None,actor_id=None):
         yield 'status',{'phase':'reasoning','message':'Model đang phân tích'}
         yield 'thinking',{'text':'Cân nhắc các giới hạn của từng phương án.'}
         yield 'tool',{'id':'t1','name':'search_web','status':'running','arguments':'{"query":"risk"}'}
@@ -55,7 +55,7 @@ def test_stream_persists_thinking_tool_usage_and_normalized_answer(client,monkey
         yield 'delta',{'text':answer}
         yield 'usage',{'source':'provider','input_tokens':198,'output_tokens':45}
         yield 'final',{'text':answer}
-    monkeypatch.setattr(application,'compatible_stream',simulated)
+    monkeypatch.setattr(application,'pi_stream',simulated)
     response=client.post(f'/api/projects/{pid}/chat',headers=csrf,
              json={'discussion_id':did,'message':'Hãy phân tích các phương án','role':'analyst','mode':'discovery'})
     assert response.status_code==200,response.text

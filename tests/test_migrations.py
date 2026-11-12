@@ -70,7 +70,7 @@ def test_fresh_database_migrates_to_head():
         with engine.connect() as conn:
             names = set(sa.inspect(conn).get_table_names())
             assert set(Base.metadata.tables) <= names
-            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0008_conversation_stream'
+            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0009_pi_native'
             # Confirm that a real FK references the previously missing table.
             fks = sa.inspect(conn).get_foreign_keys('review_jobs')
             assert any(fk['referred_table'] == 'spec_reviews' for fk in fks)
@@ -93,4 +93,4 @@ def test_legacy_schema_without_alembic_version_is_adopted():
         _alembic({**os.environ, 'DATABASE_URL': url})
         with sa.create_engine(url).connect() as conn:
             assert conn.execute(sa.text('SELECT count(*) FROM system_settings')).scalar_one() == 1
-            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0008_conversation_stream'
+            assert conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one() == '0009_pi_native'

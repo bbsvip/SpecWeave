@@ -32,8 +32,8 @@ from security import (hash_password, verify_password, new_session, current_auth,
                       check_csrf, encrypt, decrypt, validate_encryption_key, SESSION_COOKIE)
 from storage import (DATA_ROOT, PROJECTS_ROOT, project_root, resolve, init_project, list_entries,
                      read_text, write_text, remove, move, atomic_text, project_usage, enforce_project_quota, storage_limits)
-from ai import compatible_stream, pi_stream, tool_call, pi_tool_token, TOOLS, ROLES, MODES, plan_prompt, api_endpoint
-from openai_oauth_gateway import enabled as openai_oauth_enabled, require_access as openai_oauth_access, relay as openai_oauth_relay, completion as openai_oauth_completion
+from ai import pi_stream, tool_call, pi_tool_token, TOOLS, ROLES, MODES, plan_prompt
+from openai_oauth_gateway import enabled as openai_oauth_enabled, require_access as openai_oauth_access, relay as openai_oauth_relay
 from planning import save_question, question_payload, answer_question, QUESTION_JSON_INSTRUCTIONS
 from intelligence import (coverage_report, graph_payload, report_markdown, link_nodes,
                           project_node, add_phase_dependency, phase_review_blockers)
@@ -57,7 +57,7 @@ async def lifespan(_app):
     init_db()
     yield
 
-app = FastAPI(title="SpecWeave", version="0.9.8", docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(title="SpecWeave", version="1.0.0", docs_url=None, redoc_url=None, lifespan=lifespan)
 app.mount("/static",StaticFiles(directory=BASE / "static"),name="static")
 templates = Jinja2Templates(directory=BASE / "templates")
 templates.env.filters["date_short"] = lambda d: d.strftime("%d/%m/%Y %H:%M") if d else "—"
@@ -334,7 +334,7 @@ async def update_project(pid:str,request:Request,db:Session=Depends(get_db)):
         pr.active_model_id=mid
     if "thinking_level" in data and data["thinking_level"] in ("off","minimal","low","medium","high","xhigh","max"):
         pr.thinking_level=data["thinking_level"]
-    if "agent_backend" in data and data["agent_backend"] in ("compatible","pi"):pr.agent_backend=data["agent_backend"]
+    pr.agent_backend='pi'  # Pi SDK is the only available agent engine
     if "profile" in data:
         if not isinstance(data["profile"],dict):raise HTTPException(422,'Project profile must be an object')
         if len(json.dumps(data["profile"],ensure_ascii=False).encode('utf-8'))>64*1024:
@@ -1090,10 +1090,9 @@ async def submit_planning_answer(pid:str, qid:str, request:Request, db:Session=D
 
 @app.post("/api/projects/{pid}/planning/questions/suggest")
 async def suggest_planning_question(pid:str,request:Request,db:Session=Depends(get_db)):
-    """Generate a decision card even on Pi sessions without custom tool support.
+    """Generate a decision card through a one-shot Pi SDK AgentSession.
 
-    This path uses the project's OpenAI-compatible model, not Pi custom tools.
-    It only proposes; saving/approving a design remains a human action.
+    The output remains a proposal; only humans approve project decisions.
     """
     u,s=api_guard(request,db,True);pr=acl(db,pid,u,write=True)
     data=await request.json()
@@ -1111,23 +1110,12 @@ async def suggest_planning_question(pid:str,request:Request,db:Session=Depends(g
     messages=[{"role":"system","content":system}]
     messages += [{"role":m.role,"content":m.content[:2500]} for m in history]
     messages.append({"role":"user","content":"Đọc hồ sơ dự án và đề xuất câu hỏi QUAN TRỌNG NHẤT chưa được trả lời. Kèm 2-4 phương án có phân tích và một đề xuất mặc định. Chỉ trả JSON."})
-    key=decrypt(model.provider.encrypted_key) if model.provider.kind!='openai-oauth' else ''
-    headers={"Content-Type":"application/json"}
-    if key:headers["Authorization"]="Bearer "+key
-    payload={"model":model.model_id,"messages":messages,"stream":False,
-             "max_tokens":min(3000,int(os.environ.get("MAX_OUTPUT_TOKENS","4096")))}
-    if model.provider.kind=="openai" and model.reasoning and pr.thinking_level in ("low","medium","high"):
-        payload["reasoning_effort"]=pr.thinking_level
+    from pi_client import complete as pi_complete
     try:
-        if model.provider.kind=='openai-oauth':
-            outcome=await openai_oauth_completion(pr,model,u.id,messages,pr.thinking_level)
-            content=outcome['text']
-        else:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(125,connect=15),trust_env=False) as client:
-                response=await client.post(api_endpoint(model.provider.base_url),headers=headers,json=payload)
-            if response.status_code>=400:
-                raise HTTPException(502,f"Model provider HTTP {response.status_code}: {response.text[:200]}")
-            content=response.json().get("choices",[{}])[0].get("message",{}).get("content","")
+        outcome=await pi_complete(pr,model,u.id,system_context=system,
+            message='\n\n'.join(f"[{m['role'].upper()}] {m['content']}" for m in messages[1:]),
+            discussion_id=did)
+        content=outcome['text']
         if isinstance(content,list):
             content="".join(str(x.get("text", "")) for x in content if isinstance(x,dict))
         raw=str(content).strip()
@@ -1138,7 +1126,7 @@ async def suggest_planning_question(pid:str,request:Request,db:Session=Depends(g
         audit(db,u,"planning_question_proposed",pr,{"question_id":item.id})
         db.commit()
         return {"question":question_payload(item),"created":created}
-    except (httpx.RequestError,ValueError,KeyError,IndexError,TypeError,json.JSONDecodeError) as exc:
+    except (ValueError,KeyError,IndexError,TypeError,json.JSONDecodeError) as exc:
         raise HTTPException(502,"Không tạo được phương án có cấu trúc từ model. Hãy thử model khác hoặc tiếp tục chat.") from exc
 
 # ------------------------ Discussions & Agent ------------------------
@@ -1208,7 +1196,7 @@ async def chat_stream(pid:str,request:Request,db:Session=Depends(get_db)):
         q.answer={**(q.answer or {}),'continuation_run_id':run.id}
     db.commit()
     run_id=run.id
-    backend="pi" if model.provider.kind=="openai-oauth" else pr.agent_backend
+    backend='pi'
     actor_id=u.id
 
     async def produce():
@@ -1244,7 +1232,7 @@ async def chat_stream(pid:str,request:Request,db:Session=Depends(get_db)):
         try:
             yield emit('start',{'model':m.model_id,'backend':backend,'context_window':m.context_window,'continued':bool(continue_qid)})
             yield emit('status',{'phase':'request','message':'Đang kết nối model…'})
-            stream=pi_stream(p,d,sdb,m,role=role,mode=mode,run_id=run_id,actor_id=actor_id) if backend=='pi' else compatible_stream(p,d,sdb,m,role=role,mode=mode)
+            stream=pi_stream(p,d,sdb,m,role=role,mode=mode,run_id=run_id,actor_id=actor_id)
             async for typ,payload in with_heartbeat(stream):
                 if cancellation_requested(run_id):
                     raise asyncio.CancelledError()
@@ -1364,13 +1352,15 @@ async def internal_pi_tool(request: Request, db: Session = Depends(get_db)):
     return result
 
 @app.post("/api/projects/{pid}/runs/{run_id}/cancel")
-def cancel_run(pid:str,run_id:str,request:Request,db:Session=Depends(get_db)):
+async def cancel_run(pid:str,run_id:str,request:Request,db:Session=Depends(get_db)):
     u,s=api_guard(request,db,True);acl(db,pid,u,write=True)
     run=db.get(AgentRun,run_id)
     if not run or run.project_id!=pid:raise HTTPException(404,"Run not found")
     if run.status=="running":
         run.cancel_requested=True
         db.commit()
+        from pi_client import abort as pi_abort
+        await pi_abort(pid,run.discussion_id,run_id)
     return {"ok":True,"status":run.status,"cancel_requested":bool(run.cancel_requested)}
 
 @app.get("/api/projects/{pid}/discussions/{did}/messages")
