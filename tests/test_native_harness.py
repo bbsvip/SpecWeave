@@ -110,11 +110,47 @@ def test_discovery_rejects_premature_handoff_and_finishes_three_rounds(client, m
         job=client.post(f'/api/projects/{pid}/planning/questions/{qid}/answer-start',headers=csrf,
                         json={'selected_ids':['o1']}).json()
     assert len(requests)==10
-    assert 'không có công cụ gọi trực tiếp' in requests[0]['messages'][0]['content']
-    assert 'Không hỏi lại thông tin đã có' in requests[0]['messages'][0]['content']
-    assert 'không có công cụ gọi trực tiếp' in requests[-1]['messages'][0]['content']
+    assert 'no callable tools' in requests[0]['messages'][0]['content']
+    assert 'Do not repeat answered questions' in requests[0]['messages'][0]['content']
+    assert 'no callable tools' in requests[-1]['messages'][0]['content']
     assert requests[6]['max_tokens']>=requests[5]['max_tokens']
     assert read_text(pid,'docs/drafts/PRD.md').strip()==DRAFT
+
+
+def test_discovery_preserves_unknowns_across_draft_and_handoff(client, monkeypatch):
+    from harness import validate_plan
+
+    csrf=auth(client)
+    pid,did=_make_discussion_with_model(client,csrf,'native-unresolved')
+    seed_answers(pid,did)
+    with SessionLocal() as session:
+        session.get(db.Project,pid).profile={'documents':['PRD']}
+        session.commit()
+    unknown='Thời lượng tối đa cần người dùng xác nhận.'
+    plan={**PLAN,'remaining_unknowns':[unknown]}
+    seen=[]
+    def provider(request):
+        body=json.loads(request.content)
+        seen.append(body)
+        return completion(json.dumps(plan,ensure_ascii=False) if len(seen)==1 else DRAFT)
+    install_provider(monkeypatch,provider)
+    job=client.post(f'/api/projects/{pid}/chat/start',headers=csrf,json={
+        'discussion_id':did,'advance_planning':True,'mode':'discovery'}).json()
+    assert asyncio.run(run_once())==job['run_id']
+    with SessionLocal() as session:
+        run=session.get(db.AgentRun,job['run_id'])
+        assert run.status=='completed',run.error
+        assert session.get(db.Project,pid).profile['_discovery']['remaining_unknowns']==[unknown]
+    assert unknown in seen[1]['messages'][-1]['content']
+    assert '## Các điểm cần xác nhận\n\n- '+unknown in read_text(pid,'docs/drafts/PRD.md')
+    facts={'questions':[{'status':'answered'}]*3}
+    for invalid in (None, 'unknown', [None], [''], ['x'*601]):
+        with pytest.raises(ValueError):
+            validate_plan(json.dumps({**plan,'remaining_unknowns':invalid}),facts)
+    with pytest.raises(ValueError):
+        validate_plan(json.dumps(plan),{'questions':[{'status':'answered'}]*2})
+    with pytest.raises(ValueError):
+        validate_plan(json.dumps(plan),{'questions':[{'status':'answered'}]*3+[{'status':'pending'}]})
 
 
 def test_expired_worker_reconciles_written_file_without_second_model_call(client, monkeypatch):

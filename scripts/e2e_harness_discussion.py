@@ -45,14 +45,14 @@ class Provider(BaseHTTPRequestHandler):
                        'model':'local-test','choices':[{'index':0,'delta':delta,'finish_reason':reason}]}
             self.wfile.write(('data: '+json.dumps(payload,ensure_ascii=False)+'\n\n').encode())
             self.wfile.flush()
-        if name.startswith(('Create ONE decision brief', 'Trả duy nhất một JSON')):
+        if name.startswith(('Create ONE decision brief', 'Return exactly one JSON object')):
             brief={'question':f'Cần lưu lịch sử quyết định theo cách nào trong lượt {len(calls)}?',
                    'context':'Kiểm thử câu hỏi neo và lịch sử với provider cục bộ.',
                    'options':[{'label':label,'description':'Phương án kiểm thử.','pros':'Có lịch sử để kiểm tra.','cons':'Cần dung lượng lưu trữ.'}
                               for label in ('Lưu đầy đủ','Lưu tối giản')],
                    'recommended_index':0,'recommendation_reason':'Cần lưu đầy đủ để có thể quay lại và kiểm tra.',
                    'impact':'Ảnh hưởng lịch sử thảo luận.','assumptions':[],'sources':[]}
-            text=json.dumps({'action':'ask','question':brief},ensure_ascii=False) if name.startswith('Trả duy nhất') else json.dumps(brief,ensure_ascii=False)
+            text=json.dumps({'action':'ask','question':brief},ensure_ascii=False) if name.startswith('Return exactly') else json.dumps(brief,ensure_ascii=False)
             chunk({'content':text},'stop')
             self.wfile.write(b'data: [DONE]\n\n');self.wfile.flush()
             return

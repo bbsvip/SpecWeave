@@ -24,12 +24,12 @@ SYSTEM = '\n\n'.join((_INSTRUCTIONS / name).read_text(encoding='utf-8').strip()
                     for name in ('SYSTEM.md', 'AGENTS.md'))
 CORE_DRAFTS = ('prd', 'architecture', 'ux', 'roadmap')
 DRAFT_OUTLINES = {
-    'PRD':'Vấn đề, người dùng, mục tiêu đo được, phạm vi và ngoài phạm vi, yêu cầu và tiêu chí nghiệm thu.',
-    'Architecture':'Thành phần và luồng dữ liệu, mô hình lưu trữ, bất biến, xử lý lỗi, bảo mật và triển khai.',
-    'UX / UI Design':'Hành trình theo vai trò, màn hình, trạng thái rỗng/đang tải/lỗi, khả năng truy cập và nghiệm thu.',
-    'Roadmap':'Mốc triển khai, phụ thuộc, thứ tự ưu tiên, điều kiện hoàn thành và rủi ro.',
-    'API Specification':'Hợp đồng request/response, quyền, kiểm tra đầu vào, lỗi và chống gửi trùng.',
-    'Acceptance Tests':'Tiền điều kiện, thao tác, kết quả mong đợi, trường hợp lỗi và đối chiếu yêu cầu.',
+    'PRD':'Problem, users, measurable goals, scope and exclusions, requirements and acceptance criteria.',
+    'Architecture':'Components and data flows, storage model, invariants, error handling, security and deployment.',
+    'UX / UI Design':'Role-based journeys, screens, empty/loading/error states, accessibility and acceptance.',
+    'Roadmap':'Delivery milestones, dependencies, priorities, completion criteria and risks.',
+    'API Specification':'Request/response contracts, authorization, input validation, errors and idempotency.',
+    'Acceptance Tests':'Preconditions, actions, expected results, error cases and requirement traceability.',
 }
 TOOL_MAP = {tool['function']['name']:tool for tool in TOOLS}
 READ_TOOLS = {'list_project_files','read_project_file'}
@@ -90,14 +90,14 @@ def fact_digest(facts):
 def facts_text(facts, limit):
     """Give newest confirmed answers priority over older supporting detail."""
     sections = [
-        ('Dự án', {'name':facts['project'], 'description':facts['description']}),
-        ('Câu hỏi và câu trả lời', list(reversed(facts['questions']))),
-        ('Quyết định đã duyệt', facts['approved_decisions']),
-        ('Hồ sơ', facts['profile']),
-        ('Mục tiêu', facts['goals']),
-        ('Ghi chú người dùng', facts['user_notes']),
-        ('Yêu cầu đã duyệt', facts['approved_requirements']),
-        ('Tư liệu nghiên cứu', facts['research']),
+        ('Project', {'name':facts['project'], 'description':facts['description']}),
+        ('Questions and answers', list(reversed(facts['questions']))),
+        ('Approved decisions', facts['approved_decisions']),
+        ('Profile', facts['profile']),
+        ('Goals', facts['goals']),
+        ('User notes', facts['user_notes']),
+        ('Approved requirements', facts['approved_requirements']),
+        ('Research', facts['research']),
     ]
     # Retain valid JSON for each record, including question/answer correlation.
     lines = []
@@ -131,8 +131,12 @@ def validate_plan(raw, facts, *, questions_only=False):
         answered = sum(q['status']=='answered' for q in facts['questions'])
         waiting = any(q['status']=='pending' for q in facts['questions'])
         summary, evidence = bounded(plan.get('summary'),1600), bounded(plan.get('evidence'),1800)
-        if answered >= 3 and not waiting and plan.get('remaining_unknowns') == [] and len(summary) >= 80 and evidence:
-            return {'action':'draft','summary':summary,'evidence':evidence}
+        unknowns = plan.get('remaining_unknowns')
+        if (answered >= 3 and not waiting and isinstance(unknowns, list) and len(unknowns) <= 20
+                and all(isinstance(item, str) and item.strip() and len(item) <= 600 for item in unknowns)
+                and len(summary) >= 80 and evidence):
+            return {'action':'draft','summary':summary,'evidence':evidence,
+                    'remaining_unknowns':[item.strip() for item in unknowns]}
     raise ValueError('Discovery chưa đủ điều kiện bàn giao')
 
 
@@ -140,14 +144,16 @@ def plan_instruction(questions_only):
     if questions_only:
         return QUESTION_JSON_INSTRUCTIONS
     return (
-        'Trả duy nhất một JSON object. Nếu chưa có 3 câu trả lời hoặc còn thiếu quyết định quan trọng '
-        'về mục tiêu, phạm vi, quyền, dữ liệu, vận hành hoặc tiêu chí nghiệm thu, trả '
-        '{"action":"ask","question":{...}}. Chọn vấn đề có ảnh hưởng lớn nhất, không lặp câu hỏi đã hỏi. '
-        'Schema của object question: ' + QUESTION_JSON_INSTRUCTIONS +
-        '\nNếu đủ dữ kiện để soạn bản nháp, trả {"action":"draft","summary":"tóm tắt từ 80 ký tự",'
-        '"evidence":"dẫn chứng từ hồ sơ và câu trả lời","remaining_unknowns":[]}. '
-        'Nếu người dùng yêu cầu soạn và dữ kiện nền đã đủ, đưa điểm còn thiếu có thể rà soát sau vào giả định trong summary thay vì tiếp tục hỏi. '
-        'Không soạn tài liệu trong bước này.'
+        'Return exactly one JSON object. With fewer than three answered questions, or when a material '
+        'decision is essential before drafting, return {"action":"ask","question":{...}}. '
+        'Choose the highest-impact unanswered issue; do not repeat past questions. '
+        'The question object follows this schema: ' + QUESTION_JSON_INSTRUCTIONS +
+        '\nWhen there is enough foundation to draft, return {"action":"draft",'
+        '"summary":"Vietnamese summary of at least 80 characters",'
+        '"evidence":"Vietnamese evidence from the profile and answers",'
+        '"remaining_unknowns":["unresolved issue"]}. An empty list is valid when none remain. '
+        'If the user asks for drafts, preserve non-blocking unknowns in remaining_unknowns '
+        'instead of asking more questions. Do not write documents in this step.'
     )
 
 
@@ -200,11 +206,11 @@ class Harness:
             output = self.cap(2400 if attempt == 0 else 4200)
             prompt = plan_instruction(questions_only)
             if attempt:
-                prompt += '\nLần trước chưa tạo được JSON hợp lệ. Chỉ trả object ngắn, tối đa 2 phương án nếu cần hỏi.'
+                prompt += '\nThe previous response did not meet the required schema. Return a concise JSON object; use two options if asking.'
             context = facts_text(facts,self.context_budget(output))
-            system = SYSTEM + '\nBước lập kế hoạch chỉ trả JSON; không có công cụ gọi trực tiếp. Harness sẽ lưu câu hỏi hoặc soạn bản nháp sau khi kiểm tra.'
+            system = SYSTEM + '\nThis planning step only returns JSON and has no callable tools. The harness validates and saves the next question or writes drafts.'
             messages = budget_messages(system, prompt + '\n\n' + context +
-                                       ('\n\nYêu cầu mới nhất: '+latest if latest else ''),
+                                       ('\n\nLatest user request: '+latest if latest else ''),
                                        [],context_window=self.context_window,output_budget=output)
             async for kind, item in self.request(messages,output,thinking='off',visible=False):
                 if kind == 'result':
@@ -297,6 +303,7 @@ class Harness:
         plan = state['plan']
         project.profile = {**project.profile,'_discovery':{
             'status':'draft_ready','summary':plan['summary'],'evidence':plan['evidence'],
+            'remaining_unknowns':plan.get('remaining_unknowns',[]),
             'answered_questions':sum(q['status']=='answered' for q in facts['questions']),
             'documents_created':[records[path.lower()].path for path in requested],
             'review_required':True,
@@ -307,7 +314,7 @@ class Harness:
     async def draft_content(self, path, facts, plan):
         filename = path.rsplit('/',1)[-1]
         kind = next((label for label,target in WIZARD_DOCUMENTS.items() if path==target),filename)
-        outline = DRAFT_OUTLINES.get(kind,'Mục tiêu, chi tiết phù hợp, kiểm chứng và các giả định.')
+        outline = DRAFT_OUTLINES.get(kind,'Goals, relevant details, verification and assumptions.')
         refs = []
         support = [ARTIFACTS[key][1] for key in CORE_DRAFTS if ARTIFACTS[key][1]!=path]
         for record in named_draft_records(self.db,self.pid,support).values():
@@ -321,21 +328,26 @@ class Harness:
             if len(references.encode('utf-8')) > budget//3:
                 references = ''
             prompt = (
-                f'Soạn tài liệu {filename} dành riêng cho dự án. Trả trực tiếp Markdown, bắt đầu bằng tiêu đề #. '
-                f'Bố cục cần có: {outline} '
-                'Chỉ khẳng định những gì được xác nhận trong dữ liệu. Giữ trạng thái bản nháp để người dùng duyệt. '
-                + ('Giới hạn 400 từ.' if attempt else 'Giới hạn 850 từ.')
-                + '\nTóm tắt đã kiểm tra: ' + plan['summary']
+                f'Write {filename} for this project in Vietnamese. Return Markdown directly, starting with a # heading. '
+                f'Cover: {outline} '
+                'State only confirmed facts as facts. Identify unresolved issues and assumptions explicitly; this is a draft for human review. '
+                + ('Limit to 400 words.' if attempt else 'Limit to 850 words.')
+                + '\nValidated summary: ' + plan['summary']
+                + '\nUnresolved issues (do not claim they are confirmed): ' + json.dumps(plan.get('remaining_unknowns',[]),ensure_ascii=False)
                 + '\n\n' + facts_text(facts,budget-len(references.encode('utf-8')))
             )
             if references:
-                prompt += '\n\nTài liệu liên quan, tham khảo theo trạng thái đã ghi:\n'+references
-            system = SYSTEM + '\nBước này chỉ soạn nội dung Markdown; không có công cụ gọi trực tiếp. Harness kiểm tra và lưu bản nháp.'
+                prompt += '\n\nRelated documents; respect their recorded status:\n'+references
+            system = SYSTEM + '\nThis step only generates Markdown and has no callable tools. The harness validates and saves the draft.'
             messages = budget_messages(system,prompt,[],context_window=self.context_window,output_budget=output)
             async for kind,item in self.request(messages,output,thinking='off',visible=False):
                 if kind == 'result':
                     content = item.text.strip()
                     if item.reason == 'stop' and not item.calls and len(content) >= 160 and content.startswith('# '):
+                        unknowns = plan.get('remaining_unknowns',[])
+                        if unknowns:
+                            content += '\n\n## Các điểm cần xác nhận\n\n' + '\n'.join(
+                                '- ' + ' '.join(issue.split()) for issue in unknowns)
                         yield 'draft',content+'\n'
                         return
                 else:
@@ -452,7 +464,7 @@ class Harness:
                         or row.created_at >= datetime.fromisoformat(project.profile['_discovery']['branch_started_at']))]
         self.db.commit()
         output = self.cap(self.output_limit)
-        capabilities = '\nCông cụ được phép trong chế độ này: ' + ', '.join(sorted(allowed)) + '. Chỉ gọi khi được cung cấp trong request hiện tại.'
+        capabilities = '\nTools permitted in this mode: ' + ', '.join(sorted(allowed)) + '. Call a tool only when it is offered in the current request.'
         system = SYSTEM+'\n'+ROLES[role]+'\n'+MODES[mode]+capabilities+'\n'+facts_text(facts,self.context_budget(output))
         messages = budget_messages(system,prompt,history,context_window=self.context_window,output_budget=output)
         response_items = list(messages)
@@ -540,7 +552,7 @@ async def harness_stream(project, discussion, db, model, *, role, mode, run_id, 
     async with model_client() as client:
         harness = Harness(db,project,discussion,model,run,client)
         events = (harness.discovery(prompt,payload.get('_checkpoint')) if use_workflow
-                  else harness.conversation(prompt or 'Tiếp tục từ câu trả lời gần nhất.',role,mode))
+                  else harness.conversation(prompt or 'Continue from the latest saved answer.',role,mode))
         async with aclosing(events):
             async for event in events:
                 yield event
