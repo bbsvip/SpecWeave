@@ -66,7 +66,7 @@ def test_discovery_rejects_premature_handoff_and_finishes_three_rounds(client, m
         session.get(db.Project,pid).profile={'documents':['PRD','Architecture','UX / UI Design','Roadmap']}
         session.commit()
     responses=iter([
-        (json.dumps(PLAN),'stop'),  # Must not hand off without three answers.
+        (json.dumps({**PLAN,'remaining_unknowns':['Cần làm rõ phạm vi.']}),'stop'),
         *[(json.dumps({'action':'ask','question':{**BRIEF,'question':f'Câu hỏi phạm vi số {number}?'}}),'stop')
           for number in (1,2,3)],
         (json.dumps(PLAN),'stop'),
@@ -117,7 +117,7 @@ def test_discovery_rejects_premature_handoff_and_finishes_three_rounds(client, m
     assert read_text(pid,'docs/drafts/PRD.md').strip()==DRAFT
 
 
-def test_discovery_preserves_unknowns_across_draft_and_handoff(client, monkeypatch):
+def test_discovery_asks_about_unknowns_before_drafting(client, monkeypatch):
     from harness import validate_plan
 
     csrf=auth(client)
@@ -132,7 +132,13 @@ def test_discovery_preserves_unknowns_across_draft_and_handoff(client, monkeypat
     def provider(request):
         body=json.loads(request.content)
         seen.append(body)
-        return completion(json.dumps(plan,ensure_ascii=False) if len(seen)==1 else DRAFT)
+        if len(seen)==1:
+            return completion(json.dumps(plan,ensure_ascii=False))
+        if len(seen)==2:
+            return completion(json.dumps({**BRIEF,'question':'Thời lượng tối đa của cuộc họp là bao nhiêu?'},ensure_ascii=False))
+        if len(seen)==3:
+            return completion(json.dumps(PLAN,ensure_ascii=False))
+        return completion(DRAFT)
     install_provider(monkeypatch,provider)
     job=client.post(f'/api/projects/{pid}/chat/start',headers=csrf,json={
         'discussion_id':did,'advance_planning':True,'mode':'discovery'}).json()
@@ -140,17 +146,24 @@ def test_discovery_preserves_unknowns_across_draft_and_handoff(client, monkeypat
     with SessionLocal() as session:
         run=session.get(db.AgentRun,job['run_id'])
         assert run.status=='completed',run.error
-        assert session.get(db.Project,pid).profile['_discovery']['remaining_unknowns']==[unknown]
+        question=session.query(db.PlanningQuestion).filter_by(discussion_id=did,status='pending').one()
+        qid=question.id
+        assert session.query(db.Document).filter_by(project_id=pid).count()==0
     assert unknown in seen[1]['messages'][-1]['content']
-    assert '## Các điểm cần xác nhận\n\n- '+unknown in read_text(pid,'docs/drafts/PRD.md')
+    job=client.post(f'/api/projects/{pid}/planning/questions/{qid}/answer-start',headers=csrf,
+                    json={'selected_ids':['o1']}).json()
+    assert asyncio.run(run_once())==job['run_id']
+    with SessionLocal() as session:
+        assert session.get(db.AgentRun,job['run_id']).status=='completed'
+        assert session.get(db.Project,pid).profile['_discovery']['status']=='draft_ready'
+    assert read_text(pid,'docs/drafts/PRD.md').strip()==DRAFT
     facts={'questions':[{'status':'answered'}]*3}
-    for invalid in (None, 'unknown', [None], [''], ['x'*601]):
+    for invalid in (None, 'unknown', [None], [''], ['x'*601], [unknown]):
         with pytest.raises(ValueError):
             validate_plan(json.dumps({**plan,'remaining_unknowns':invalid}),facts)
+    assert validate_plan(json.dumps(PLAN),{'questions':[{'status':'answered'}]*2})['action']=='draft'
     with pytest.raises(ValueError):
-        validate_plan(json.dumps(plan),{'questions':[{'status':'answered'}]*2})
-    with pytest.raises(ValueError):
-        validate_plan(json.dumps(plan),{'questions':[{'status':'answered'}]*3+[{'status':'pending'}]})
+        validate_plan(json.dumps(PLAN),{'questions':[{'status':'answered'}]*3+[{'status':'pending'}]})
 
 
 def test_expired_worker_reconciles_written_file_without_second_model_call(client, monkeypatch):

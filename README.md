@@ -22,7 +22,7 @@ SpecWeave runs its own Python harness. The background worker uses the selected A
 
 1. The browser submits a message or confirms a decision. Confirming an answer and enqueueing its continuation happen in one transaction.
 2. The worker acquires the discussion lease and builds the next request from its saved answers, approved decisions, project profile and relevant notes. It validates the proposed question and allows only one open question in that discussion.
-3. Once there are at least three confirmed answers and the structured evaluation identifies no material unknowns, the worker prepares each requested draft independently. It retries a truncated or invalid draft once with tighter instructions. Existing and approved documents are preserved.
+3. Once the structured evaluation identifies no material unknowns and no question is pending, the worker prepares each requested draft independently. It retries a truncated or invalid draft once with tighter instructions. Existing and approved documents are preserved.
 4. A checkpoint records the exact draft before its atomic file write. If the worker dies before the database commit, the next claim can reconcile the matching file and register it once. The worker checks the Discovery inputs and verifies all requested files before marking the handoff ready for human review.
 
 ### Question history and changing an answer
@@ -72,7 +72,7 @@ Browser → FastAPI (ACL, enqueue, SSE replay)
 
 The worker chooses the actions it exposes by mode. Discovery uses structured responses and owns every write and handoff. Other modes expose a bounded set of project tools, with external research subject to project policy. Review uses the same model transport and a bounded JSON snapshot. API keys remain encrypted in PostgreSQL and are decrypted for the selected provider request. ChatGPT OAuth credentials reside in an encrypted local vault shared by web and worker.
 
-The native harness loads its trusted, application-owned English instructions from `source/harness_instructions/SYSTEM.md` and `AGENTS.md`; user-facing questions and drafts remain Vietnamese unless requested otherwise. Discovery planning and draft writing have no directly callable tools; ordinary conversations receive the tools allowed for their selected mode. Project files and external content remain reference data, not system instructions. A valid Discovery draft plan can include unresolved questions: they are retained in the handoff and added to drafts for human review, rather than silently treated as confirmed facts. The three-answer minimum and pending-question gate still apply. Live model verification remains necessary after deployment; prompting alone cannot guarantee model behavior.
+The native harness loads its trusted, application-owned English instructions from `source/harness_instructions/SYSTEM.md` and `AGENTS.md`; user-facing questions and drafts remain Vietnamese unless requested otherwise. Discovery planning and draft writing have no directly callable tools; ordinary conversations receive the tools allowed for their selected mode. Project files and external content remain reference data, not system instructions. If a proposed draft plan identifies unresolved issues, Discovery asks a further question instead of drafting or treating the issues as confirmed. Pending questions still block handoff. Live model verification remains necessary after deployment; prompting alone cannot guarantee model behavior.
 
 ## Quick start: External PostgreSQL
 
