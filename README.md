@@ -72,6 +72,8 @@ Browser → FastAPI (ACL, enqueue, SSE replay)
 
 The worker chooses the actions it exposes by mode. Discovery uses structured responses and owns every write and handoff. Other modes expose a bounded set of project tools, with external research subject to project policy. Review uses the same model transport and a bounded JSON snapshot. API keys remain encrypted in PostgreSQL and are decrypted for the selected provider request. ChatGPT OAuth credentials reside in an encrypted local vault shared by web and worker.
 
+The native harness loads its trusted, application-owned instructions from `source/harness_instructions/SYSTEM.md` and `AGENTS.md`. Discovery planning and draft writing state that those calls have no directly callable tools; ordinary conversations receive the tools allowed for their selected mode. Project files and external content remain reference data, not system instructions. These instruction changes and the expanded answer choices still require verification against a live model after deployment; they do not guarantee that every model will choose to finish Discovery.
+
 ## Quick start: External PostgreSQL
 
 Copy the configuration template:

@@ -279,6 +279,10 @@ def run(scratch):
             post(f'/api/projects/{pid}/planning/questions/suggest',{'discussion_id':did})
             a.reload()
             expect(a.locator('#planningQuestion')).to_be_visible()
+            option=a.locator('#planningQuestion .planning-option').first
+            expect(option.locator('.planning-option-copy')).to_have_text('Phương án kiểm thử.')
+            expect(option.locator('.planning-tradeoffs')).to_contain_text('Ưu điểm: Có lịch sử để kiểm tra.')
+            expect(option.locator('.planning-tradeoffs')).to_contain_text('Hạn chế: Cần dung lượng lưu trữ.')
             a.locator('#messageList').evaluate('(el)=>{el.scrollTop=100}')
             a.locator('#planningQuestion .planning-option').first.click()
             assert bottom()<5, 'Selecting an answer must resume following'
@@ -289,6 +293,8 @@ def run(scratch):
             expect(a.locator('.message-user').filter(has_text='Tôi chọn: Lưu đầy đủ')).to_have_count(0)
             a.reload()
             expect(a.locator('.qa-card .qa-answer-choice')).to_have_text('Lưu đầy đủ')
+            assert all(not text.startswith('Chờ xác nhận') for text in
+                       a.locator('.message-question').first.locator('.turn-activity > summary').all_text_contents())
             for width,height,label in ((1440,1000,'desktop'),(390,844,'mobile')):
                 a.set_viewport_size({'width':width,'height':height})
                 a.locator('.message-question').first.scroll_into_view_if_needed()

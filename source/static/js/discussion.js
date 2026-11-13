@@ -258,7 +258,11 @@
       runId=queued.run_id;
       setBusy(true,'Đang kết nối với SpecWeave…');
       answerAccepted=Boolean(answerQuestion&&!observing);
-      if(answerAccepted){renderPlanningQuestion(null);refreshDiscoveryProgress();refreshPlanningQuestion();}
+      if(answerAccepted){
+        panel.heading.textContent='Đã nhận câu trả lời · đang xử lý…';
+        setBusy(true,'Đang xử lý câu trả lời…');
+        renderPlanningQuestion(null);refreshDiscoveryProgress();refreshPlanningQuestion();
+      }
       const historyStatus=document.querySelector(`[data-run-status="${CSS.escape(runId)}"]`);
       const showStatus=(status,label)=>{
         terminalStatus=['completed','cancelled','error'].includes(status)?status:terminalStatus;
@@ -482,8 +486,7 @@
     panel.setAttribute('aria-label','Câu hỏi đang chờ xác nhận');
     panel.append(make('div','planning-dock-label','Câu hỏi đang chờ'));
     panel.append(make('h3','',q.question));
-    const explanation=make('details','planning-explanation');
-    explanation.append(make('summary','','Bối cảnh và so sánh phương án'));
+    const explanation=make('div','planning-explanation');
     panel.append(explanation);
     if(q.context)explanation.append(make('p','planning-description',q.context));
     const optHolder=make('div','planning-options');panel.append(optHolder);
@@ -496,13 +499,12 @@
       title.append(make('span','',opt.label));
       if(opt.id===q.recommended_id)title.append(make('span','planning-recommended','AI đề xuất'));
       body.append(title);
-      const comparison=make('section','planning-comparison');
-      comparison.append(make('strong','',opt.label));
-      if(opt.description)comparison.append(make('div','planning-option-copy',opt.description));
+      if(opt.description)body.append(make('div','planning-option-copy',opt.description));
       const trade=make('div','planning-tradeoffs');
-      if(opt.pros)trade.append(make('div','up','+ '+opt.pros));
-      if(opt.cons)trade.append(make('div','down','− '+opt.cons));
-      comparison.append(trade);explanation.append(comparison);row.append(body);optHolder.append(row);
+      if(opt.pros)trade.append(make('div','up','Ưu điểm: '+opt.pros));
+      if(opt.cons)trade.append(make('div','down','Hạn chế: '+opt.cons));
+      if(trade.childNodes.length)body.append(trade);
+      row.append(body);optHolder.append(row);
       row.addEventListener('click',()=>{
         if(controller)return;
         followIfNearBottom(true);
@@ -608,6 +610,12 @@
         if(generic)content.hidden=true;
       }
       body.querySelectorAll(':scope > p.small.text-secondary').forEach(node=>node.remove());
+      if(q.status!=='pending'){
+        const summary=body.querySelector(':scope > .turn-activity > summary');
+        if(summary)summary.textContent=summary.textContent.replace(/^Chờ xác nhận/, 'Đã xử lý');
+        const label=body.querySelector('.turn-live-label');
+        if(label?.textContent==='Chờ xác nhận')label.textContent='Đã xử lý';
+      }
       const previous=body.querySelector(':scope > .qa-card');
       const expanded=new Set([...previous?.querySelectorAll('details[open]')||[]].map(node=>node.dataset.section));
       const card=make('section','qa-card');card.setAttribute('aria-label','Câu hỏi và câu trả lời');

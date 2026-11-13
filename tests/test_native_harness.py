@@ -110,6 +110,9 @@ def test_discovery_rejects_premature_handoff_and_finishes_three_rounds(client, m
         job=client.post(f'/api/projects/{pid}/planning/questions/{qid}/answer-start',headers=csrf,
                         json={'selected_ids':['o1']}).json()
     assert len(requests)==10
+    assert 'không có công cụ gọi trực tiếp' in requests[0]['messages'][0]['content']
+    assert 'Không hỏi lại thông tin đã có' in requests[0]['messages'][0]['content']
+    assert 'không có công cụ gọi trực tiếp' in requests[-1]['messages'][0]['content']
     assert requests[6]['max_tokens']>=requests[5]['max_tokens']
     assert read_text(pid,'docs/drafts/PRD.md').strip()==DRAFT
 
